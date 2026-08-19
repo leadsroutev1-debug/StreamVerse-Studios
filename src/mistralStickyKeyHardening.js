@@ -9,18 +9,19 @@
  *       401 / 402 / 403 / 429.
  *   - 400/404/422 request-contract errors, malformed JSON, truncation,
  *     network errors and 5xx responses must NOT burn the current key.
- *   - The existing callers may still call markKeyStatus('exhausted') for
- *     generic failures; this preload normalizes that status using the actual
- *     HTTP failure observed by Axios so healthy keys remain sticky.
- *
- * This is intentionally a runtime policy layer so all existing Mistral
- * callers share the same behavior without duplicating rotation logic.
+ *   - 429 is treated as a temporary rate-limit cooldown, not a permanent
+ *     credential failure. The same key is not hammered while its cooldown is
+ *     active, and the retry path honors Retry-After when the provider sends it.
+ *   - If every key is rate-limited, the runtime waits for the earliest
+ *     cooldown instead of immediately cycling through the whole pool.
  */
 
 const Module = require('module');
 const originalLoad = Module._load;
 const PATCHED = Symbol.for('streamverse.mistral.sticky.hardened');
 const failureReasonByKey = new Map();
+const rateLimitUntilByKey = new Map();
+const rateLimitCountByKey = new Map();
 const mistralCursor = { index: 0 };
 
 function maskKey(key) {
@@ -37,9 +38,33 @@ function isRotationStatus(status) {
   return [401, 402, 403, 429].includes(Number(status));
 }
 
-function rememberFailure(key, status) {
+function isRateLimitedStatus(status) {
+  return Number(status) === 429;
+}
+
+function retryAfterMs(error, key) {
+  const header = error?.response?.headers?.['retry-after'] ?? error?.response?.headers?.['Retry-After'];
+  const seconds = Number(header);
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.min(120000, seconds * 1000);
+
+  const count = (rateLimitCountByKey.get(maskKey(key)) || 0) + 1;
+  rateLimitCountByKey.set(maskKey(key), count);
+  return Math.min(60000, 2000 * (2 ** Math.min(count - 1, 5)));
+}
+
+function rememberFailure(key, status, error) {
   if (!key) return;
-  failureReasonByKey.set(maskKey(key), isRotationStatus(status));
+  const label = maskKey(key);
+  const rotation = isRotationStatus(status);
+  failureReasonByKey.set(label, rotation);
+
+  if (isRateLimitedStatus(status)) {
+    const delay = retryAfterMs(error, key);
+    rateLimitUntilByKey.set(label, Date.now() + delay);
+  } else if (rotation) {
+    rateLimitUntilByKey.delete(label);
+    rateLimitCountByKey.delete(label);
+  }
 }
 
 function patchConfig(config) {
@@ -53,13 +78,15 @@ function patchConfig(config) {
       const label = maskKey(key);
       const actualFailureJustifiesRotation = failureReasonByKey.get(label);
 
-      // Existing callers historically treated generic failures as
-      // "exhausted". Do not let that silently rotate a healthy key.
       if (status === 'exhausted' && actualFailureJustifiesRotation === false) {
         status = 'active';
       }
 
-      if (status === 'active') failureReasonByKey.delete(label);
+      if (status === 'active') {
+        failureReasonByKey.delete(label);
+        rateLimitUntilByKey.delete(label);
+        rateLimitCountByKey.delete(label);
+      }
     }
 
     return originalMarkKeyStatus.call(this, pool, key, status);
@@ -72,31 +99,46 @@ function patchConfig(config) {
     }
 
     const health = config.keyHealth?.mistral || [];
+    const now = Date.now();
+    let earliestCooldown = Infinity;
+    let earliestIndex = mistralCursor.index % pool.length;
 
-    // Keep the cursor on the same key until its health explicitly becomes
-    // exhausted/rate-limited. This is deliberately not round-robin.
     for (let offset = 0; offset < pool.length; offset += 1) {
       const idx = (mistralCursor.index + offset) % pool.length;
       const key = pool[idx];
       const label = maskKey(key);
       const entry = health.find(item => item.label === label);
       const status = String(entry?.status || 'active').toLowerCase();
+      const cooldownUntil = rateLimitUntilByKey.get(label) || 0;
 
-      if (!['exhausted', 'rate-limited'].includes(status)) {
-        mistralCursor.index = idx;
-        return key;
+      if (status === 'exhausted') continue;
+      if (cooldownUntil > now) {
+        if (cooldownUntil < earliestCooldown) {
+          earliestCooldown = cooldownUntil;
+          earliestIndex = idx;
+        }
+        continue;
       }
+
+      if (status === 'rate-limited') {
+        // Cooldown expired: make the key usable again without pretending the
+        // credential itself was invalid.
+        if (config.markKeyStatus) config.markKeyStatus('mistral', key, 'active');
+      }
+
+      mistralCursor.index = idx;
+      return key;
     }
 
-    // Every key is unavailable. Preserve the old behavior as a last-resort
-    // attempt rather than silently throwing away the configured pool.
-    const key = pool[mistralCursor.index % pool.length];
-    mistralCursor.index = (mistralCursor.index + 1) % pool.length;
-    return key;
+    // All keys are temporarily unavailable. Keep the rotation sticky and
+    // return the earliest key; the Axios wrapper below will sleep until its
+    // cooldown expires before actually making the request.
+    mistralCursor.index = earliestIndex;
+    return pool[earliestIndex];
   };
 
   Object.defineProperty(config, PATCHED, { value: true, enumerable: false });
-  console.log('[MistralRotation] Sticky key policy enabled: rotate only on 401/402/403/429.');
+  console.log('[MistralRotation] Sticky key policy enabled: rotate only on 401/402/403/429, with 429 backoff.');
   return config;
 }
 
@@ -109,11 +151,26 @@ function patchAxios(axios) {
 
     const authorization = options?.headers?.Authorization || options?.headers?.authorization || '';
     const key = String(authorization).replace(/^Bearer\s+/i, '').trim();
+    const label = maskKey(key);
+    const cooldownUntil = rateLimitUntilByKey.get(label) || 0;
+    const waitMs = Math.max(0, cooldownUntil - Date.now());
+
+    if (waitMs > 0) {
+      console.warn(`[MistralRotation] ${label} is rate-limited; waiting ${waitMs}ms before retry.`);
+      await new Promise(resolve => setTimeout(resolve, waitMs));
+    }
 
     try {
-      return await originalPost(url, data, options, ...rest);
+      const response = await originalPost(url, data, options, ...rest);
+      rateLimitUntilByKey.delete(label);
+      rateLimitCountByKey.delete(label);
+      return response;
     } catch (error) {
-      rememberFailure(key, error?.response?.status);
+      rememberFailure(key, error?.response?.status, error);
+      if (isRateLimitedStatus(error?.response?.status)) {
+        const until = rateLimitUntilByKey.get(label) || Date.now();
+        console.warn(`[MistralRotation] ${label} received 429; cooldown until ${new Date(until).toISOString()}.`);
+      }
       throw error;
     }
   };
