@@ -7,7 +7,8 @@
 # main application in the FOREGROUND on $PORT (default 5000 — this is the
 # port Replit's autoscale deployment / port-forwarding watches).
 #
-# The Node process preloads the autonomous-agent runtime hardening layer.
+# The Node process preloads the autonomous-agent runtime hardening layer and
+# the shared sticky Mistral key-rotation policy.
 # ============================================================================
 set -e
 
@@ -43,4 +44,4 @@ for i in $(seq 1 30); do
 done
 
 echo "[start.sh] Starting StreamVerse Node backend on port ${PORT:-5000}..."
-exec node --require ./src/agentRuntimeHardening.js index.js
+exec node --require ./src/mistralStickyKeyHardening.js --require ./src/agentRuntimeHardening.js index.js
