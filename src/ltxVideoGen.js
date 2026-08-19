@@ -3,12 +3,13 @@
 /**
  * StreamVerse Studio — LTX-2.3 Image-to-Video control-plane integration.
  *
- * The final scene image is generated upstream, then LTX-2.3 receives that
- * image as the first-frame condition plus a motion/performance prompt.
- * Character references are never sent directly to LTX; identity is already
- * resolved in the scene image stage.
+ * The final FLUX scene image is the canonical visual frame. LTX receives
+ * that image unchanged as the first-frame condition plus a motion/
+ * performance prompt. We deliberately do NOT resize the cinematic frame in
+ * this layer: the production contract is 1024x1536 portrait input/output.
  */
 
+const sharp = require('sharp');
 const config = require('./config');
 const videoEngineClient = require('../services/videoEngineClient');
 
@@ -50,8 +51,6 @@ function _getPositiveNumber(value, fallback) {
 
 function _snapDimension(value, fallback) {
   const n = Math.floor(_getPositiveNumber(value, fallback));
-  // LTX requires width/height to be divisible by 32. Never silently send an
-  // invalid geometry to the Space.
   const snapped = Math.floor(n / 32) * 32;
   return Math.max(32, snapped || fallback);
 }
@@ -80,6 +79,33 @@ function _resolveDuration(shotMeta = {}) {
 }
 
 /**
+ * Validate the actual bytes handed to LTX. This is intentionally a hard
+ * validation, not a resize: silently scaling/cropping a 1024x1536 frame can
+ * destroy the carefully composed multi-character shot and make continuity
+ * failures harder to diagnose.
+ */
+async function _validateI2VFrame(imageBuffer, expectedWidth, expectedHeight) {
+  let metadata;
+  try {
+    metadata = await sharp(imageBuffer, { failOn: 'none' }).metadata();
+  } catch (err) {
+    throw new LTXGenerationError(`[LTXVideoGen] I2V frame is not a valid image: ${err.message}`);
+  }
+
+  if (metadata.width !== expectedWidth || metadata.height !== expectedHeight) {
+    throw new LTXGenerationError(
+      `[LTXVideoGen] Refusing to resize I2V frame ${metadata.width || '?'}x${metadata.height || '?'}; expected ${expectedWidth}x${expectedHeight}.`,
+    );
+  }
+
+  if (expectedWidth % 32 !== 0 || expectedHeight % 32 !== 0) {
+    throw new LTXGenerationError(`[LTXVideoGen] Invalid LTX geometry ${expectedWidth}x${expectedHeight}; dimensions must be divisible by 32.`);
+  }
+
+  return metadata;
+}
+
+/**
  * LTX-2.3's official guidance favors one flowing, present-tense prompt with
  * explicit motion, camera, performance and audio beats. I2V already receives
  * the visual starting state, so this function removes accidental formatting
@@ -102,11 +128,18 @@ async function submitVideoJob(imageBuffer, shotMeta = {}) {
 
   const duration = _resolveDuration(shotMeta);
   const { width, height } = _resolveResolution(shotMeta);
+
+  // Production portrait contract: preserve the generated FLUX frame exactly.
+  if (width !== HIGH_RES_WIDTH || height !== HIGH_RES_HEIGHT) {
+    throw new LTXGenerationError(`[LTXVideoGen] Production I2V requires ${HIGH_RES_WIDTH}x${HIGH_RES_HEIGHT}; received configured ${width}x${height}.`);
+  }
+  await _validateI2VFrame(imageBuffer, width, height);
+
   const seed = _resolveSeed(shotMeta);
   const randomizeSeed = Boolean(config.ltxRandomizeSeed);
   const enhancePrompt = Boolean(config.ltxEnhancePrompt) && !Boolean(shotMeta.lockPrompt);
 
-  console.log(`[LTXVideoGen] I2V submit duration=${duration}s resolution=${width}x${height} seed=${seed} randomize=${randomizeSeed} enhance=${enhancePrompt}`);
+  console.log(`[LTXVideoGen] I2V submit duration=${duration}s resolution=${width}x${height} seed=${seed} randomize=${randomizeSeed} enhance=${enhancePrompt} framePreserved=true`);
 
   try {
     const { jobId } = await videoEngineClient.submitJob({
