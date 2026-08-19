@@ -11,6 +11,7 @@ const WAIT_MS = Math.max(1000, Number(process.env.AGENT_MEDIA_WAIT_POLL_MS || 50
 const MAX_WAIT_MS = Math.max(WAIT_MS, Number(process.env.AGENT_MEDIA_WAIT_TIMEOUT_MS || 15 * 60 * 1000));
 const STALE_JOB_MS = Math.max(60_000, Number(process.env.AGENT_STALE_JOB_MS || 30 * 60 * 1000));
 const MISTRAL_RETRIES = Math.max(0, Math.min(2, Number(process.env.MISTRAL_AGENT_TRANSIENT_RETRIES || 1)));
+const MISTRAL_CONTRACT_RETRY = (process.env.MISTRAL_AGENT_400_RETRY || 'true').toLowerCase() === 'true';
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 function isMistralChatUrl(url) { return typeof url === 'string' && /api\.mistral\.ai\/v1\/chat\/completions/i.test(url); }
@@ -23,17 +24,56 @@ function retryDelay(error, attempt) {
   if (Number.isFinite(retryAfter) && retryAfter >= 0) return Math.min(10000, retryAfter * 1000);
   return Math.min(8000, 1000 * (2 ** attempt) + Math.floor(Math.random() * 250));
 }
+function summarizeMistralError(error) {
+  const status = Number(error?.response?.status || 0);
+  const data = error?.response?.data;
+  let detail = '';
+  try {
+    detail = typeof data === 'string' ? data : JSON.stringify(data || {});
+  } catch (_) { detail = String(data || ''); }
+  return `[Mistral] HTTP ${status || 'network'} ${detail.slice(0, 2000)}`;
+}
 function patchAxios(axios) {
   if (!axios || axios.__streamverseAgentHardening) return axios;
   const originalPost = axios.post.bind(axios);
   axios.post = async function hardenedPost(url, data, options, ...rest) {
     if (!isMistralChatUrl(url) || !data || typeof data !== 'object') return originalPost(url, data, options, ...rest);
+
+    // Preserve the production invariant: a request-contract error must never
+    // burn/rotate a healthy API key. First use the normal production payload.
     const body = { ...data, parallel_tool_calls: false };
     if (body.prompt_mode == null) body.prompt_mode = 'reasoning';
     let lastError;
+
     for (let attempt = 0; attempt <= MISTRAL_RETRIES; attempt++) {
-      try { return await originalPost(url, body, options, ...rest); }
-      catch (error) { lastError = error; if (attempt >= MISTRAL_RETRIES || !isTransient(error)) throw error; await sleep(retryDelay(error, attempt)); }
+      try {
+        return await originalPost(url, body, options, ...rest);
+      } catch (error) {
+        lastError = error;
+        const status = Number(error?.response?.status || 0);
+
+        // Mistral 400s are request-contract errors, not key failures. The
+        // current API supports prompt_mode, but compatibility can differ by
+        // deployed model/endpoint. Retry the SAME key once with only that
+        // optional field removed before surfacing the 400.
+        if (status === 400 && MISTRAL_CONTRACT_RETRY && body.prompt_mode != null) {
+          const compatibilityBody = { ...body };
+          delete compatibilityBody.prompt_mode;
+          try {
+            return await originalPost(url, compatibilityBody, options, ...rest);
+          } catch (compatError) {
+            lastError = compatError;
+            console.warn(summarizeMistralError(compatError));
+          }
+        } else {
+          console.warn(summarizeMistralError(error));
+        }
+
+        // Only provider/transient conditions are retried automatically.
+        // 400/404/422 deliberately do not rotate or retry indefinitely.
+        if (attempt >= MISTRAL_RETRIES || !isTransient(error)) throw lastError;
+        await sleep(retryDelay(error, attempt));
+      }
     }
     throw lastError;
   };
@@ -189,4 +229,4 @@ Module._load=function hardenedModuleLoad(request,parent,isMain){
   return loaded;
 };
 
-module.exports={WAIT_MS,MAX_WAIT_MS,STALE_JOB_MS,MISTRAL_RETRIES,classifyMediaRows};
+module.exports={WAIT_MS,MAX_WAIT_MS,STALE_JOB_MS,MISTRAL_RETRIES};
