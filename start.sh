@@ -7,9 +7,7 @@
 # main application in the FOREGROUND on $PORT (default 5000 — this is the
 # port Replit's autoscale deployment / port-forwarding watches).
 #
-# Using `exec` for the Node process means it becomes PID 1 in this script's
-# place, so Replit's deploy supervisor tracks it directly and only has to
-# watch a single process; the video engine is a child of this shell.
+# The Node process preloads the autonomous-agent runtime hardening layer.
 # ============================================================================
 set -e
 
@@ -18,7 +16,6 @@ VIDEO_ENGINE_PORT="${VIDEO_ENGINE_PORT:-8000}"
 
 echo "[start.sh] Installing Python video engine dependencies..."
 bash video_engine/install.sh
-
 echo "[start.sh] Starting Python Video Engine on ${VIDEO_ENGINE_HOST}:${VIDEO_ENGINE_PORT}..."
 bash video_engine/run.sh &
 VIDEO_ENGINE_PID=$!
@@ -46,4 +43,4 @@ for i in $(seq 1 30); do
 done
 
 echo "[start.sh] Starting StreamVerse Node backend on port ${PORT:-5000}..."
-exec node index.js
+exec node --require ./src/agentRuntimeHardening.js index.js
