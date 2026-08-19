@@ -4,8 +4,7 @@ LTX-2.3 provider — Lightricks/LTX-2-3 Hugging Face Space.
 Uses gradio_client (the known-good Python integration) instead of manually
 reproducing the Gradio HTTP/SSE protocol.
 
-CRITICAL — positional argument order (verified against the live Space's
-generate_btn.click() wiring):
+CRITICAL — positional argument order verified against the live official Space:
 
     1. image
     2. prompt
@@ -16,14 +15,15 @@ generate_btn.click() wiring):
     7. height
     8. width
 
-Do NOT reorder these. Do NOT swap height/width. See §17 of the refactor
-spec and test_param_order.py, which regression-tests this exact order.
+The official Space's high-resolution portrait preset is 1024x1536 (width x
+height), with 1–10 second duration, 24 fps output, and first-frame image
+conditioning at strength 1.0. StreamVerse therefore treats 1024x1536 as a
+hard production contract and never silently resizes the canonical FLUX frame.
 """
 from __future__ import annotations
 
 import inspect
 import logging
-import time
 import traceback
 from pathlib import Path
 
@@ -38,10 +38,11 @@ logger = logging.getLogger("video_engine.ltx")
 
 _client_cache: dict[str, Client] = {}
 
-# gradio_client renamed the Client() constructor's HF-token kwarg from
-# hf_token -> token in newer releases (both still appear in the wild
-# depending on what's pinned). Detect which one the installed version
-# actually accepts instead of hard-coding a name that can break on upgrade.
+PRODUCTION_WIDTH = 1024
+PRODUCTION_HEIGHT = 1536
+PRODUCTION_MIN_DURATION = 1.0
+PRODUCTION_MAX_DURATION = 10.0
+
 _TOKEN_KWARG = "token" if "token" in inspect.signature(Client.__init__).parameters else "hf_token"
 
 
@@ -65,13 +66,10 @@ def build_predict_args(
     height: int,
     width: int,
 ):
-    """Isolated so it can be unit-tested for positional-order regressions
-    without needing a live Gradio client / network access.
+    """Build the exact positional contract of the official LTX-2.3 Space.
 
-    handle_file() accepts a remote https:// URL directly (it's the same
-    helper gradio_client uses for local paths) — the Space fetches it
-    server-side, so this process never downloads or writes the input image
-    itself.
+    Kept isolated so tests can catch positional regressions without network
+    access. ``handle_file`` accepts the Cloudinary HTTPS URL directly.
     """
     return (
         handle_file(image_url),
@@ -82,6 +80,44 @@ def build_predict_args(
         randomize_seed,
         height,
         width,
+    )
+
+
+def _validate_generation_contract(width: int, height: int, duration: float) -> None:
+    if int(width) != PRODUCTION_WIDTH or int(height) != PRODUCTION_HEIGHT:
+        raise ProviderError(
+            f"Production LTX-2.3 I2V requires {PRODUCTION_WIDTH}x{PRODUCTION_HEIGHT}; received {width}x{height}",
+            category="validation",
+            detail={
+                "expected_width": PRODUCTION_WIDTH,
+                "expected_height": PRODUCTION_HEIGHT,
+                "received_width": width,
+                "received_height": height,
+            },
+        )
+    if not (PRODUCTION_MIN_DURATION <= float(duration) <= PRODUCTION_MAX_DURATION):
+        raise ProviderError(
+            f"LTX-2.3 Space duration must be {PRODUCTION_MIN_DURATION}–{PRODUCTION_MAX_DURATION}s; received {duration}",
+            category="validation",
+            detail={"duration": duration},
+        )
+    if PRODUCTION_WIDTH % 32 or PRODUCTION_HEIGHT % 32:
+        raise ProviderError("Internal LTX production geometry is not divisible by 32", category="validation")
+
+
+def _normalize_prompt(prompt: str) -> str:
+    """Normalize transport noise without rewriting the director's prompt.
+
+    LTX's official prompting guidance favors present-tense cinematic prose,
+    explicit action/camera/audio, and quoted dialogue. Those semantics are
+    authored upstream; this boundary must not paraphrase or invent them.
+    """
+    return (
+        str(prompt or '')
+        .replace('\x00', ' ')
+        .replace('\r\n', '\n')
+        .replace('\r', '\n')
+        .strip()
     )
 
 
@@ -101,8 +137,18 @@ class LTXProvider(VideoProvider):
         randomize_seed: bool,
         enhance_prompt: bool,
     ) -> GenerationResult:
-        duration = max(config.LTX_DURATION_MIN, min(config.LTX_DURATION_MAX, duration))
-        seed_value = seed if seed is not None else 0
+        # Do not clamp/repair dimensions. A repaired frame would violate the
+        # canonical FLUX→LTX contract; reject it and let the agent correct the
+        # source rather than producing a degraded shot.
+        _validate_generation_contract(width, height, duration)
+        duration = float(duration)
+        prompt = _normalize_prompt(prompt)
+        if not prompt:
+            raise ProviderError("LTX I2V prompt is empty", category="validation")
+
+        seed_value = int(seed) if seed is not None else 0
+        if seed_value < 0 or seed_value > 2**31 - 1:
+            raise ProviderError(f"Invalid LTX seed: {seed_value}", category="validation")
 
         last_error: ProviderError | None = None
         attempts = max(1, len(config.HF_TOKENS))
@@ -116,24 +162,15 @@ class LTXProvider(VideoProvider):
                     image_url,
                     prompt,
                     duration,
-                    enhance_prompt,
+                    bool(enhance_prompt),
                     seed_value,
-                    randomize_seed,
-                    height,
-                    width,
+                    bool(randomize_seed),
+                    PRODUCTION_HEIGHT,
+                    PRODUCTION_WIDTH,
                 )
                 result = client.predict(*args, api_name=config.LTX_API_NAME)
 
                 video_info, returned_seed = _unpack_result(result)
-
-                # This process never writes the generated clip to disk on
-                # purpose (Replit Autoscale gives no filesystem guarantee
-                # across instances/requests). Whether gradio_client hands
-                # back a hosted `url` or only a local temp path, both cases
-                # go straight to Cloudinary — from a URL server-side fetch
-                # in the first case, or a one-shot multipart upload of the
-                # temp file gradio_client itself created in the second
-                # (that file is never referenced again after this call).
                 hosted_url = _resolve_video_url(video_info)
                 public_id = f"{config.CLOUDINARY_SHOTS_ROOT}/tmp/ltx_{job_id}"
                 if hosted_url:
@@ -142,16 +179,27 @@ class LTXProvider(VideoProvider):
                     local_path = _resolve_video_path(video_info)
                     video_url = upload_video(public_id=public_id, file_path=str(local_path))
 
-                # Success — the token stays active for the NEXT shot too;
-                # we do not rotate it here.
                 token_manager.mark_active(token)
 
+                logger.info(
+                    "[LTX] completed job=%s token_slot=%s resolution=%sx%s duration=%ss randomize=%s enhance=%s",
+                    job_id, slot, PRODUCTION_WIDTH, PRODUCTION_HEIGHT, duration,
+                    bool(randomize_seed), bool(enhance_prompt),
+                )
                 return GenerationResult(
                     video_url=video_url,
                     seed=returned_seed,
-                    raw={"token_slot": slot},
+                    raw={
+                        "token_slot": slot,
+                        "width": PRODUCTION_WIDTH,
+                        "height": PRODUCTION_HEIGHT,
+                        "duration": duration,
+                        "frame_conditioning": "first_frame_strength_1.0",
+                    },
                 )
-            except Exception as exc:  # noqa: BLE001 — must inspect broadly to classify
+            except ProviderError:
+                raise
+            except Exception as exc:  # noqa: BLE001 — inspect broadly to classify
                 err_text = f"{exc}"
                 tb = traceback.format_exc()
                 category = _classify_error(exc, err_text)
@@ -168,7 +216,7 @@ class LTXProvider(VideoProvider):
                         category="quota",
                         detail={"token_slot": slot, "traceback": tb},
                     )
-                    continue  # try next token
+                    continue
                 if category == "auth":
                     token_manager.mark_invalid(token, err_text)
                     last_error = ProviderError(
@@ -176,10 +224,8 @@ class LTXProvider(VideoProvider):
                         category="auth",
                         detail={"token_slot": slot, "traceback": tb},
                     )
-                    continue  # try next token
+                    continue
 
-                # Ordinary failure (validation/model/network/HTTP 500, etc.)
-                # — do NOT mark the token exhausted. Surface the real error.
                 raise ProviderError(
                     err_text,
                     category=category,
@@ -191,11 +237,11 @@ class LTXProvider(VideoProvider):
                         "token_slot": slot,
                         "params": {
                             "duration": duration,
-                            "width": width,
-                            "height": height,
+                            "width": PRODUCTION_WIDTH,
+                            "height": PRODUCTION_HEIGHT,
                             "seed": seed_value,
-                            "randomize_seed": randomize_seed,
-                            "enhance_prompt": enhance_prompt,
+                            "randomize_seed": bool(randomize_seed),
+                            "enhance_prompt": bool(enhance_prompt),
                         },
                         "traceback": tb,
                     },
@@ -216,23 +262,13 @@ def _classify_error(exc: Exception, text: str) -> str:
         return "validation"
     if "500" in lowered or "internal server error" in lowered:
         return "model"
-    # The /gradio_api/call/{api_name} REST path (used by gradio_client under
-    # the hood) is known to drop session context on some Spaces and relay a
-    # blank or boilerplate SSE error instead of the real exception message —
-    # a plumbing quirk, not evidence the job actually failed for a real
-    # reason. Treat that specific shape as presumed-quota so the caller
-    # rotates to the next token and retries instead of surfacing a fatal
-    # alert for what is usually just a quota cutoff mid-stream. Any real,
-    # distinctly-worded error (network/validation/model/auth, matched above)
-    # is unaffected and still goes to the alert path.
     if is_blank_or_boilerplate_error(text):
         return "quota"
     return "unknown"
 
 
 def _unpack_result(result):
-    """The Space returns [output_video, seed]. output_video may be a dict
-    (FileData) or a plain path string depending on gradio_client version."""
+    """The official Space returns [output_video, seed]."""
     if isinstance(result, (list, tuple)):
         video_info = result[0]
         seed = result[1] if len(result) > 1 else None
@@ -245,22 +281,6 @@ def _unpack_result(result):
 
 
 def _resolve_video_url(video_info) -> str | None:
-    """Extract the hosted HTTP(S) URL for the generated clip from the
-    Space's FileData response, if one is present.
-
-    gradio_client's FileData dict shape is typically:
-        {"path": "/tmp/gradio/<hash>/tmp....mp4",
-         "url": "https://<space>.hf.space/gradio_api/file=/tmp/gradio/...",
-         ...}
-
-    `path` is a *local* path — either on the Space's own filesystem, or
-    (after gradio_client's automatic download) a local temp path on this
-    machine — never a fetchable URL. `url` is the actual hosted download
-    link. When present it's used for a server-side Cloudinary fetch
-    (fastest, no bytes pass through this process); when absent, `generate()`
-    falls back to uploading the local temp file's bytes to Cloudinary
-    directly instead.
-    """
     if isinstance(video_info, dict):
         url = video_info.get("url")
         if not url:
