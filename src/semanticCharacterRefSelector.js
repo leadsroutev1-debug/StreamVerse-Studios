@@ -17,17 +17,30 @@
  * Production invariant: an incomplete canonical reference set is a hard
  * generation blocker. We must never silently fall back to a single front
  * portrait and pretend a four-view identity package exists.
+ *
+ * Recovery invariant: CHARACTER_REFERENCE_INCOMPLETE is actionable. When a
+ * canonical angle is missing, the selector schedules a targeted regeneration
+ * through the pipeline's canonical character-reference path. The current shot
+ * remains blocked until a later retry observes the repaired reference set.
  */
 
 const ANGLES = Object.freeze(['front', 'three_quarter', 'profile', 'full_body']);
 
+// Character-reference repair is deliberately deduplicated in-process. A shot
+// can inspect the same character more than once while retrying; only one repair
+// job is allowed to run for a character at a time.
+const referenceRepairPromises = new Map();
+
 class CharacterReferenceIntegrityError extends Error {
-  constructor(characterName, missingAngles = []) {
+  constructor(characterName, missingAngles = [], repairPromise = null) {
     super(`Character reference set incomplete for ${characterName}: missing ${missingAngles.join(', ') || 'canonical angles'}`);
     this.name = 'CharacterReferenceIntegrityError';
     this.characterName = characterName;
     this.missingAngles = missingAngles;
     this.code = 'CHARACTER_REFERENCE_INCOMPLETE';
+    this.repairTriggered = !!repairPromise;
+    this.repairPromise = repairPromise;
+    this.retryable = true;
   }
 }
 
@@ -167,14 +180,65 @@ function getReferenceAngles(character) {
   return out;
 }
 
+function _repairKey(character) {
+  return String(character?.id || `${character?.storyline_id || 'unknown'}:${norm(character?.name)}`);
+}
+
+function triggerCanonicalReferenceRepair(character, missingAngles = []) {
+  const storylineId = character?.storyline_id || character?.storylineId;
+  if (!storylineId) {
+    console.warn(`[ReferenceSelector] Cannot auto-repair ${character?.name || 'unknown character'}: storyline_id is missing`);
+    return null;
+  }
+
+  const key = _repairKey(character);
+  const existing = referenceRepairPromises.get(key);
+  if (existing) return existing;
+
+  const promise = Promise.resolve().then(async () => {
+    console.warn(
+      `[ReferenceSelector] CHARACTER_REFERENCE_INCOMPLETE for ${character.name}: ` +
+      `missing=${missingAngles.join(', ') || 'canonical angles'} — triggering targeted canonical reference regeneration`
+    );
+
+    // Dynamic require avoids a module-load cycle: pipeline imports this selector,
+    // while the repair path is only invoked after the pipeline is already running.
+    const pipeline = require('./pipeline');
+    if (typeof pipeline.insertCharactersWithConsistency !== 'function') {
+      throw new Error('Canonical character-reference repair API is unavailable');
+    }
+
+    const repaired = await pipeline.insertCharactersWithConsistency(storylineId, [character]);
+    const repairedCharacter = Array.isArray(repaired) && repaired[0] ? repaired[0] : null;
+    const refs = repairedCharacter ? getReferenceAngles(repairedCharacter) : {};
+    const stillMissing = ANGLES.filter(angle => !refs[angle]);
+    if (stillMissing.length) {
+      throw new CharacterReferenceIntegrityError(character.name, stillMissing);
+    }
+
+    console.log(`[ReferenceSelector] ✓ Canonical reference repair completed for ${character.name}`);
+    return repairedCharacter;
+  }).catch(err => {
+    console.error(`[ReferenceSelector] Canonical reference repair failed for ${character?.name || 'unknown'}: ${err.message}`);
+    throw err;
+  }).finally(() => {
+    referenceRepairPromises.delete(key);
+  });
+
+  referenceRepairPromises.set(key, promise);
+  return promise;
+}
+
 function assertCompleteCanonicalReferences(character) {
   const references = getReferenceAngles(character);
   const missing = ANGLES.filter(angle => !references[angle]);
   if (missing.length) {
-    throw new CharacterReferenceIntegrityError(character?.name || 'unknown character', missing);
+    const repairPromise = triggerCanonicalReferenceRepair(character, missing);
+    throw new CharacterReferenceIntegrityError(character?.name || 'unknown character', missing, repairPromise);
   }
   if (character?.reference_status && character.reference_status !== 'locked') {
-    throw new CharacterReferenceIntegrityError(character?.name || 'unknown character', ['locked canonical reference status']);
+    const repairPromise = triggerCanonicalReferenceRepair(character, ANGLES);
+    throw new CharacterReferenceIntegrityError(character?.name || 'unknown character', ['locked canonical reference status'], repairPromise);
   }
   return references;
 }
@@ -221,8 +285,10 @@ function buildReferenceDecisionLedger({ characters, shot, stagingRows = [], prev
 
 module.exports = {
   ANGLES,
+  ANGLE_ALIASES,
   getReferenceAngles,
   assertCompleteCanonicalReferences,
+  triggerCanonicalReferenceRepair,
   selectCharacterReference,
   buildReferenceDecisionLedger,
   CharacterReferenceIntegrityError,
