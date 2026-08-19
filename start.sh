@@ -8,9 +8,9 @@
 # port Replit's autoscale deployment / port-forwarding watches).
 #
 # The Node process preloads the autonomous-agent runtime hardening layer,
-# shared sticky Mistral key rotation, and deterministic production-readiness
-# guards. The LLM may propose actions; readiness invariants decide whether
-# those actions are allowed to execute.
+# shared sticky Mistral key rotation, deterministic production-readiness
+# guards, and resumable character-reference recovery. The LLM may propose
+# actions; readiness invariants decide whether those actions are allowed.
 # ============================================================================
 set -e
 
@@ -50,4 +50,5 @@ exec node \
   --require ./src/mistralStickyKeyHardening.js \
   --require ./src/agentRuntimeHardening.js \
   --require ./src/productionReadinessGuard.js \
+  --require ./src/agentInitializationRecoveryGuard.js \
   index.js
