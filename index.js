@@ -24,6 +24,7 @@ const { v4: uuidv4 }  = require('uuid');
 const videoEngineClient = require('./services/videoEngineClient');
 const { safeJsonParse } = require('./src/util');
 const analytics = require('./src/analytics');
+const agentDashboard = require('./src/agentDashboard');
 const { searchCatalog } = require('./src/search');
 
 const app = express();
@@ -64,6 +65,34 @@ app.get('/dashboard', (req, res) => res.sendFile(path.join(__dirname, 'views', '
 // ──────────────────────────────────────────────────────────────────────────────
 // REST status snapshot
 // ──────────────────────────────────────────────────────────────────────────────
+
+
+// Agent observability — durable event log + live activity. This intentionally
+// exposes recorded decisions/action summaries, never hidden chain-of-thought.
+app.get('/api/agent/observability', async (req,res)=>{
+  try {
+    const data=await agentDashboard.getAgentObservability({
+      storylineId:req.query.storyline_id||null,
+      episodeId:req.query.episode_id||null,
+      runId:req.query.run_id||null,
+      limit:req.query.limit||200,
+    });
+    res.json(data);
+  } catch(err) { res.status(500).json({ok:false,error:err.message}); }
+});
+
+app.post('/api/agent/memory/prune', async (req,res)=>{
+  try {
+    const data=await agentDashboard.pruneAgentMemory({
+      storylineId:req.body?.storyline_id||null,
+      episodeId:req.body?.episode_id||null,
+      keepPriorityAtLeast:req.body?.keep_priority_at_least,
+      olderThanDays:req.body?.older_than_days,
+      dryRun:Boolean(req.body?.dry_run),
+    });
+    res.json(data);
+  } catch(err) { res.status(500).json({ok:false,error:err.message}); }
+});
 
 app.get('/api/status', (req, res) => {
   const s = state.getState();

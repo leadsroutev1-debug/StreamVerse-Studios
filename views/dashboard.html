@@ -1836,5 +1836,44 @@
   setInterval(loadHfTokens, 20000); // token pool status — cheap read-only poll
   connect();
 </script>
+
+<style>
+  #agent-observability{margin-top:16px}
+  .agent-toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+  .agent-log{height:430px;overflow:auto;background:#080a0e;border:1px solid var(--border);border-radius:8px;padding:8px;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:11px}
+  .agent-event{padding:8px;border-bottom:1px solid rgba(255,255,255,.05);white-space:pre-wrap;word-break:break-word}
+  .agent-event:last-child{border-bottom:0}.agent-event.fail{border-left:3px solid var(--danger)}.agent-event.ok{border-left:3px solid var(--success)}.agent-event.info{border-left:3px solid var(--accent2)}
+  .agent-time{color:var(--muted)}.agent-type{color:var(--accent2);font-weight:700}.agent-tool{color:var(--text);font-weight:700}.agent-detail{color:#94a3b8;margin-top:3px}
+  .agent-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;margin-bottom:12px}.agent-stat{background:rgba(255,255,255,.025);border:1px solid var(--border);border-radius:7px;padding:8px}.agent-stat b{display:block;font-size:18px;color:var(--text)}.agent-stat span{font-size:10px;color:var(--muted);text-transform:uppercase}
+  .memory-btn{background:rgba(239,68,68,.12);color:#f87171;border:1px solid rgba(239,68,68,.3);padding:7px 12px;border-radius:6px;cursor:pointer;font-size:11px;font-weight:600}
+</style>
+<section id="agent-observability" class="card accent-top">
+  <h3>Agent Command Log</h3>
+  <div class="agent-toolbar">
+    <button class="refresh-btn" id="agentLogRefresh">Refresh Log</button>
+    <button class="memory-btn" id="agentMemoryPrune">Prune Low-Priority Memory</button>
+    <span class="sub" id="agentLogNote">Live agent actions, decisions, failures, recovery and LLM statistics.</span>
+  </div>
+  <div class="agent-stats" id="agentStats"></div>
+  <div class="agent-log" id="agentLog"><div class="sub">Waiting for agent telemetry…</div></div>
+</section>
+<script>
+(()=>{
+  const $=id=>document.getElementById(id);
+  const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  function render(d){
+    const st=d.stats||{};
+    $('agentStats').innerHTML=[['Runs',st.runs],['Events',st.events],['Tool Events',st.toolEvents],['Failures',st.failures],['LLM Calls',st.llmCalls],['LLM Success',st.llmSuccesses],['Avg LLM ms',st.avgLlmMs],['Active Runs',st.activeRuns]].map(x=>`<div class="agent-stat"><b>${esc(x[1])}</b><span>${esc(x[0])}</span></div>`).join('');
+    const rows=(d.events||[]).slice(0,200).map(e=>{const p=e.payload||{};const failed=Boolean(p.error||p.result?.error||p.result?.ok===false);const tool=p.tool||p.name||'';const summary=p.summary||p.reason||p.decision||p.result?.reason||p.result?.error||'';return `<div class="agent-event ${failed?'fail':'info'}"><span class="agent-time">${esc(e.created_at)}</span> <span class="agent-type">${esc(e.event_type)}</span> ${tool?`<span class="agent-tool">${esc(tool)}</span>`:''}<div class="agent-detail">${esc(summary||JSON.stringify(p))}</div></div>`}).join('');
+    $('agentLog').innerHTML=rows||'<div class="sub">No agent events recorded yet.</div>';
+  }
+  async function load(){try{const r=await fetch('/api/agent/observability?limit=250');const d=await r.json();if(d.ok)render(d)}catch(e){$('agentLog').innerHTML='<div class="agent-event fail">Agent log unavailable: '+esc(e.message)+'</div>'}}
+  $('agentLogRefresh').onclick=load;
+  $('agentMemoryPrune').onclick=async()=>{if(!confirm('Prune low-priority agent memories older than 14 days? High-priority memories are retained.'))return;const b=$('agentMemoryPrune');b.disabled=true;try{const r=await fetch('/api/agent/memory/prune',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({older_than_days:14,keep_priority_at_least:70})});const d=await r.json();alert(d.ok?`Pruned ${d.pruned} memories.`:`Prune failed: ${d.error}`);await load()}finally{b.disabled=false}};
+  if(window.EventSource){try{const es=new EventSource('/api/sse');es.addEventListener('state',e=>{try{const s=JSON.parse(e.data);if(s.agentActivity)load()}catch{}})}catch{}}
+  load();setInterval(load,15000);
+})();
+</script>
+
 </body>
 </html>
