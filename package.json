@@ -5,7 +5,7 @@
   "main": "index.js",
   "scripts": {
     "start": "bash start.sh",
-    "start:node": "node index.js",
+    "start:node": "node --require ./src/agentRuntimeHardening.js index.js",
     "start:video": "bash video_engine/run.sh",
     "dev": "vite",
     "build": "vite build"
