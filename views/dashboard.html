@@ -1907,6 +1907,8 @@
   <div class="agent-toolbar">
     <button class="refresh-btn" id="agentLogRefresh">Refresh Log</button>
     <button class="memory-btn" id="agentMemoryPrune">Prune Low-Priority Memory</button>
+    <button id="agentResetBtn" class="memory-btn" onclick="openAgentResetModal()" title="Reset agent state without deleting production data">🧠 Reset Agent State</button>
+    <span id="AGENT_RESET_DASHBOARD_V2" style="display:none"></span>
     <span class="sub" id="agentLogNote">Live agent actions, decisions, failures, recovery and LLM statistics.</span>
   </div>
   <div class="agent-stats" id="agentStats"></div>
@@ -1930,5 +1932,59 @@
 })();
 </script>
 
+
+<script>
+(function(){
+  window.openAgentResetModal=function(){
+    const m=document.getElementById('agentResetModal');
+    if(!m)return;
+    document.getElementById('agentResetConfirmation').value='';
+    document.getElementById('agentResetResult').style.display='none';
+    const b=document.getElementById('agentResetConfirmBtn'); b.disabled=false; b.textContent='Reset Agent State';
+    m.style.display='flex'; document.body.style.overflow='hidden';
+  };
+  window.closeAgentResetModal=function(){
+    const m=document.getElementById('agentResetModal');
+    if(m)m.style.display='none'; document.body.style.overflow='';
+  };
+  window.confirmAgentReset=async function(){
+    const confirmation=document.getElementById('agentResetConfirmation').value.trim();
+    const result=document.getElementById('agentResetResult');
+    const btn=document.getElementById('agentResetConfirmBtn');
+    if(confirmation!=='RESET_AGENT_STATE'){
+      result.style.cssText='margin-top:10px;font-size:12px;display:block;color:#f87171';
+      result.textContent='✗ Type RESET_AGENT_STATE exactly to confirm'; return;
+    }
+    btn.disabled=true; btn.textContent='Resetting…';
+    try{
+      const r=await fetch('/api/agent/memory/reset',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirmation,include_events:true,include_llm_calls:true})});
+      const d=await r.json();
+      if(!r.ok||!d.ok)throw new Error(d.error||'Agent reset failed');
+      const x=d.deleted||{};
+      result.style.cssText='margin-top:10px;font-size:12px;display:block;color:#4ade80';
+      result.textContent='✓ Reset complete — '+(x.runs||0)+' runs, '+(x.memory||0)+' memories, '+(x.events||0)+' events, '+(x.llmCalls||0)+' LLM records removed. Production data untouched.';
+      btn.textContent='Done';
+      setTimeout(()=>{closeAgentResetModal(); location.reload();},1500);
+    }catch(e){
+      result.style.cssText='margin-top:10px;font-size:12px;display:block;color:#f87171';
+      result.textContent='✗ '+e.message; btn.disabled=false; btn.textContent='Reset Agent State';
+    }
+  };
+})();
+</script>
+
+<div id="agentResetModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.82);z-index:4000;align-items:center;justify-content:center;padding:18px">
+  <div class="card" style="max-width:520px;width:100%;border-color:rgba(239,68,68,.35)">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:12px"><h3 style="margin:0;color:var(--text)">🧠 Reset Agent State</h3><button class="refresh-btn" style="margin:0" onclick="closeAgentResetModal()">✕</button></div>
+    <p style="margin-top:12px;color:var(--muted);font-size:12px;line-height:1.6">This resets the agent's resumable runs, agent memory, event telemetry and LLM telemetry. <strong style="color:var(--text)">Production data is not deleted.</strong> Storylines, episodes, scripts, shots, characters and generated media remain intact.</p>
+    <div style="margin-top:12px;padding:10px;border:1px solid rgba(239,68,68,.25);border-radius:7px;background:rgba(239,68,68,.06);color:#fca5a5;font-size:11px">The agent will reassess the current studio state from scratch after the reset.</div>
+    <input id="agentResetConfirmation" class="sheet-input" placeholder="Type RESET_AGENT_STATE" autocomplete="off" style="width:100%;margin-top:14px">
+    <div id="agentResetResult" style="margin-top:10px;font-size:12px;display:none"></div>
+    <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:14px">
+      <button class="refresh-btn" style="margin:0" onclick="closeAgentResetModal()">Cancel</button>
+      <button id="agentResetConfirmBtn" class="memory-btn" style="margin:0" onclick="confirmAgentReset()">Reset Agent State</button>
+    </div>
+  </div>
+</div>
 </body>
 </html>
