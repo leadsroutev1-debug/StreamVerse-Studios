@@ -1,0 +1,183 @@
+name: Agent observability dashboard
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  observability:
+    if: ${{ !startsWith(github.event.head_commit.message, '[agent-observability]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Install observability module and wire dashboard
+        run: |
+          cat > src/agentDashboard.js <<'JS'
+          'use strict';
+          const db = require('./db');
+          const state = require('./state');
+
+          function json(v, fallback = {}) {
+            if (v == null) return fallback;
+            if (typeof v === 'object') return v;
+            try { return JSON.parse(v); } catch (_) { return fallback; }
+          }
+
+          async function getAgentObservability({ storylineId = null, episodeId = null, runId = null, limit = 200 } = {}) {
+            const safe = Math.min(500, Math.max(10, Number.parseInt(limit, 10) || 200));
+            const params = [];
+            const filters = [];
+            if (storylineId) { filters.push('storyline_id=?'); params.push(storylineId); }
+            if (episodeId) { filters.push('episode_id=?'); params.push(episodeId); }
+            if (runId) { filters.push('run_id=?'); params.push(runId); }
+            const where = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
+            const [runs, events, calls] = await Promise.all([
+              db.query(`SELECT * FROM agent_runs ${where} ORDER BY updated_at DESC LIMIT ${safe}`, params),
+              db.query(`SELECT * FROM agent_events ${where} ORDER BY created_at DESC LIMIT ${safe}`, params),
+              db.query(`SELECT * FROM agent_llm_calls ${where} ORDER BY created_at DESC LIMIT ${safe}`, params).catch(() => []),
+            ]);
+            const toolEvents = events.filter(e => ['production_tool_call','tool_call','tool_result','agent_decision','agent_diagnostic','agent_recovery'].includes(e.event_type));
+            const failed = toolEvents.filter(e => {
+              const p = json(e.payload, {}); return Boolean(p.error || p.result?.error || p.result?.ok === false);
+            }).length;
+            const durations = calls.map(c => Number(c.duration_ms || 0)).filter(Boolean);
+            const stats = {
+              runs: runs.length,
+              events: events.length,
+              toolEvents: toolEvents.length,
+              failures: failed,
+              llmCalls: calls.length,
+              llmSuccesses: calls.filter(c => c.status === 'success').length,
+              llmFailures: calls.filter(c => c.status !== 'success').length,
+              avgLlmMs: durations.length ? Math.round(durations.reduce((a,b)=>a+b,0) / durations.length) : 0,
+              activeRuns: runs.filter(r => ['running','paused'].includes(r.status)).length,
+            };
+            return {
+              ok: true,
+              live: state.getState().agentActivity || null,
+              stats,
+              runs: runs.map(r => ({...r, cursor_state:json(r.cursor_state,{}), last_decision:json(r.last_decision,{}), error_state:json(r.error_state,{})})),
+              events: events.map(e => ({...e, payload:json(e.payload,{})})),
+              llmCalls: calls,
+              note: 'Decision rationale shown here is the agent\'s recorded action/decision summary, not private chain-of-thought.',
+            };
+          }
+
+          async function pruneAgentMemory({ storylineId = null, episodeId = null, keepPriorityAtLeast = 70, olderThanDays = 14, dryRun = false } = {}) {
+            const clauses = [];
+            const params = [];
+            if (storylineId) { clauses.push('storyline_id=?'); params.push(storylineId); }
+            if (episodeId) { clauses.push('episode_id=?'); params.push(episodeId); }
+            clauses.push('priority < ?'); params.push(Math.max(0, Math.min(100, Number(keepPriorityAtLeast) || 70)));
+            clauses.push('updated_at < DATE_SUB(NOW(), INTERVAL ? DAY)'); params.push(Math.max(1, Number(olderThanDays) || 14));
+            const where = clauses.join(' AND ');
+            const countRows = await db.query(`SELECT COUNT(*) AS count FROM agent_memory WHERE ${where}`, params);
+            const count = Number(countRows[0]?.count || 0);
+            if (dryRun || count === 0) return { ok:true, dryRun:Boolean(dryRun), pruned:0, eligible:count };
+            const result = await db.execute(`DELETE FROM agent_memory WHERE ${where}`, params);
+            return { ok:true, dryRun:false, pruned:Number(result.affectedRows || 0), eligible:count };
+          }
+
+          module.exports = { getAgentObservability, pruneAgentMemory };
+          JS
+
+          python3 <<'PY'
+          from pathlib import Path
+
+          p=Path('index.js'); s=p.read_text(encoding='utf-8')
+          anchor="const analytics = require('./src/analytics');"
+          repl=anchor+"\nconst agentDashboard = require('./src/agentDashboard');"
+          if anchor not in s: raise SystemExit('index require anchor missing')
+          s=s.replace(anchor,repl,1)
+          route="""
+          // Agent observability — durable event log + live activity. This intentionally
+          // exposes recorded decisions/action summaries, never hidden chain-of-thought.
+          app.get('/api/agent/observability', async (req,res)=>{
+            try {
+              const data=await agentDashboard.getAgentObservability({
+                storylineId:req.query.storyline_id||null,
+                episodeId:req.query.episode_id||null,
+                runId:req.query.run_id||null,
+                limit:req.query.limit||200,
+              });
+              res.json(data);
+            } catch(err) { res.status(500).json({ok:false,error:err.message}); }
+          });
+
+          app.post('/api/agent/memory/prune', async (req,res)=>{
+            try {
+              const data=await agentDashboard.pruneAgentMemory({
+                storylineId:req.body?.storyline_id||null,
+                episodeId:req.body?.episode_id||null,
+                keepPriorityAtLeast:req.body?.keep_priority_at_least,
+                olderThanDays:req.body?.older_than_days,
+                dryRun:Boolean(req.body?.dry_run),
+              });
+              res.json(data);
+            } catch(err) { res.status(500).json({ok:false,error:err.message}); }
+          });
+          """
+          marker="app.get('/api/status', (req, res) => {"
+          if marker not in s: raise SystemExit('status route anchor missing')
+          s=s.replace(marker,route+"\n"+marker,1)
+          p.write_text(s,encoding='utf-8')
+
+          p=Path('views/dashboard.html'); s=p.read_text(encoding='utf-8')
+          block=r'''
+          <style>
+            #agent-observability{margin-top:16px}
+            .agent-toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+            .agent-log{height:430px;overflow:auto;background:#080a0e;border:1px solid var(--border);border-radius:8px;padding:8px;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:11px}
+            .agent-event{padding:8px;border-bottom:1px solid rgba(255,255,255,.05);white-space:pre-wrap;word-break:break-word}
+            .agent-event:last-child{border-bottom:0}.agent-event.fail{border-left:3px solid var(--danger)}.agent-event.ok{border-left:3px solid var(--success)}.agent-event.info{border-left:3px solid var(--accent2)}
+            .agent-time{color:var(--muted)}.agent-type{color:var(--accent2);font-weight:700}.agent-tool{color:var(--text);font-weight:700}.agent-detail{color:#94a3b8;margin-top:3px}
+            .agent-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;margin-bottom:12px}.agent-stat{background:rgba(255,255,255,.025);border:1px solid var(--border);border-radius:7px;padding:8px}.agent-stat b{display:block;font-size:18px;color:var(--text)}.agent-stat span{font-size:10px;color:var(--muted);text-transform:uppercase}
+            .memory-btn{background:rgba(239,68,68,.12);color:#f87171;border:1px solid rgba(239,68,68,.3);padding:7px 12px;border-radius:6px;cursor:pointer;font-size:11px;font-weight:600}
+          </style>
+          <section id="agent-observability" class="card accent-top">
+            <h3>Agent Command Log</h3>
+            <div class="agent-toolbar">
+              <button class="refresh-btn" id="agentLogRefresh">Refresh Log</button>
+              <button class="memory-btn" id="agentMemoryPrune">Prune Low-Priority Memory</button>
+              <span class="sub" id="agentLogNote">Live agent actions, decisions, failures, recovery and LLM statistics.</span>
+            </div>
+            <div class="agent-stats" id="agentStats"></div>
+            <div class="agent-log" id="agentLog"><div class="sub">Waiting for agent telemetry…</div></div>
+          </section>
+          <script>
+          (()=>{
+            const $=id=>document.getElementById(id);
+            const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+            function render(d){
+              const st=d.stats||{};
+              $('agentStats').innerHTML=[['Runs',st.runs],['Events',st.events],['Tool Events',st.toolEvents],['Failures',st.failures],['LLM Calls',st.llmCalls],['LLM Success',st.llmSuccesses],['Avg LLM ms',st.avgLlmMs],['Active Runs',st.activeRuns]].map(x=>`<div class="agent-stat"><b>${esc(x[1])}</b><span>${esc(x[0])}</span></div>`).join('');
+              const rows=(d.events||[]).slice(0,200).map(e=>{const p=e.payload||{};const failed=Boolean(p.error||p.result?.error||p.result?.ok===false);const tool=p.tool||p.name||'';const summary=p.summary||p.reason||p.decision||p.result?.reason||p.result?.error||'';return `<div class="agent-event ${failed?'fail':'info'}"><span class="agent-time">${esc(e.created_at)}</span> <span class="agent-type">${esc(e.event_type)}</span> ${tool?`<span class="agent-tool">${esc(tool)}</span>`:''}<div class="agent-detail">${esc(summary||JSON.stringify(p))}</div></div>`}).join('');
+              $('agentLog').innerHTML=rows||'<div class="sub">No agent events recorded yet.</div>';
+            }
+            async function load(){try{const r=await fetch('/api/agent/observability?limit=250');const d=await r.json();if(d.ok)render(d)}catch(e){$('agentLog').innerHTML='<div class="agent-event fail">Agent log unavailable: '+esc(e.message)+'</div>'}}
+            $('agentLogRefresh').onclick=load;
+            $('agentMemoryPrune').onclick=async()=>{if(!confirm('Prune low-priority agent memories older than 14 days? High-priority memories are retained.'))return;const b=$('agentMemoryPrune');b.disabled=true;try{const r=await fetch('/api/agent/memory/prune',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({older_than_days:14,keep_priority_at_least:70})});const d=await r.json();alert(d.ok?`Pruned ${d.pruned} memories.`:`Prune failed: ${d.error}`);await load()}finally{b.disabled=false}};
+            if(window.EventSource){try{const es=new EventSource('/api/sse');es.addEventListener('state',e=>{try{const s=JSON.parse(e.data);if(s.agentActivity)load()}catch{}})}catch{}}
+            load();setInterval(load,15000);
+          })();
+          </script>
+          '''
+          marker='</body>'
+          if marker not in s: raise SystemExit('dashboard body anchor missing')
+          if 'id="agent-observability"' not in s: s=s.replace(marker,block+'\n'+marker,1)
+          p.write_text(s,encoding='utf-8')
+          PY
+
+          node --check index.js
+          node --check src/agentDashboard.js
+          git diff --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add index.js src/agentDashboard.js views/dashboard.html
+          git commit -m "[agent-observability] Add live agent logs and memory pruning"
+          git push
