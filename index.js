@@ -94,6 +94,26 @@ app.post('/api/agent/memory/prune', async (req,res)=>{
   } catch(err) { res.status(500).json({ok:false,error:err.message}); }
 });
 
+// AGENT_RESET_ENDPOINT_V1
+app.post('/api/agent/memory/reset', async (req,res)=>{
+  try {
+    const confirmation = String(req.body?.confirmation || '').trim();
+    if (confirmation !== 'RESET_AGENT_STATE') {
+      return res.status(400).json({ ok:false, error:'Confirmation required: RESET_AGENT_STATE' });
+    }
+    const data = await agentDashboard.resetAgentState({
+      storylineId:req.body?.storyline_id||null,
+      episodeId:req.body?.episode_id||null,
+      includeEvents:req.body?.include_events !== false,
+      includeLlmCalls:req.body?.include_llm_calls !== false,
+    });
+    res.json(data);
+  } catch(err) {
+    console.error('[API /api/agent/memory/reset]', err.message);
+    res.status(500).json({ok:false,error:err.message});
+  }
+});
+
 app.get('/api/status', (req, res) => {
   const s = state.getState();
   s.keyHealth = config.keyHealth;

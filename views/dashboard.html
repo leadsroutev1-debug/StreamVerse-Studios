@@ -257,7 +257,9 @@
       </div>
       <div style="margin-top:10px;border-top:1px solid rgba(255,255,255,.07);padding-top:10px">
         <button onclick="openPruneModal()" style="background:rgba(239,68,68,.08);color:#f87171;border:1px solid rgba(239,68,68,.25);padding:5px 12px;border-radius:6px;font-size:12px;cursor:pointer;transition:opacity .2s" onmouseover="this.style.opacity='.75'" onmouseout="this.style.opacity='1'" title="Wipe all storylines, episodes, characters and shots from the database">🗑 Prune Database</button>
-      </div>
+      
+        <button id="agentResetBtn" onclick="openAgentResetModal()" style="background:rgba(239,68,68,.14);color:#fca5a5;border:1px solid rgba(239,68,68,.35);padding:5px 12px;border-radius:6px;font-size:12px;cursor:pointer;margin-left:6px" title="Reset agent memory, runs and telemetry without deleting production data">🧠 Reset Agent State</button>
+        <span id="AGENT_RESET_DASHBOARD_V1" style="display:none"></span></div>
     </div>
 
     <!-- Task Progress -->
@@ -573,6 +575,20 @@
 </div>
 
 <!-- Prune DB confirmation modal -->
+<div id="agentResetModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.82);z-index:2995;align-items:center;justify-content:center;padding:18px">
+  <div class="admin-login-panel" style="max-width:520px;width:100%">
+    <div style="display:flex;align-items:center;justify-content:space-between"><h3>🧠 Reset Agent State</h3><button class="modal-close" style="position:static" onclick="closeAgentResetModal()">✕</button></div>
+    <div style="margin-top:12px;color:var(--muted);font-size:12px;line-height:1.6">This clears the agent's resumable runs, agent memory, event telemetry and LLM telemetry. <strong style="color:var(--text)">Production data is untouched</strong>: storylines, episodes, scripts, shots, characters and generated media remain intact.</div>
+    <div style="margin-top:12px;padding:10px;border:1px solid rgba(239,68,68,.25);border-radius:7px;background:rgba(239,68,68,.06);color:#fca5a5;font-size:11px">This is a hard agent-state reset. The agent will reassess the current studio state from scratch after the next run.</div>
+    <input id="agentResetConfirmation" class="sheet-input" placeholder="Type RESET_AGENT_STATE" autocomplete="off" style="width:100%;margin-top:14px">
+    <div id="agentResetResult" style="margin-top:10px;font-size:12px;display:none"></div>
+    <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:14px">
+      <button class="refresh-btn" onclick="closeAgentResetModal()">Cancel</button>
+      <button id="agentResetConfirmBtn" style="background:linear-gradient(135deg,#b91c1c,#ef4444);color:#fff;border:none;padding:8px 16px;border-radius:7px;font-size:12px;font-weight:700;cursor:pointer" onclick="confirmAgentReset()">Reset Agent State</button>
+    </div>
+  </div>
+</div>
+
 <div id="pruneModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;align-items:center;justify-content:center;backdrop-filter:blur(4px)" onclick="closePruneModal(event)">
   <div onclick="event.stopPropagation()" style="background:#1a1a2e;border:1px solid rgba(239,68,68,.4);border-radius:12px;padding:28px 32px;max-width:400px;width:90%;box-shadow:0 20px 60px rgba(0,0,0,.6)">
     <div style="font-size:28px;margin-bottom:10px">⚠️</div>
@@ -596,6 +612,45 @@
 </div>
 
 <script>
+  // ── Agent state reset ─────────────────────────────────────────────────────
+  function openAgentResetModal(){
+    const m=document.getElementById('agentResetModal');
+    document.getElementById('agentResetConfirmation').value='';
+    document.getElementById('agentResetResult').style.display='none';
+    document.getElementById('agentResetConfirmBtn').disabled=false;
+    document.getElementById('agentResetConfirmBtn').textContent='Reset Agent State';
+    m.style.display='flex'; document.body.style.overflow='hidden';
+  }
+  function closeAgentResetModal(){
+    const m=document.getElementById('agentResetModal');
+    if(!m) return; m.style.display='none'; document.body.style.overflow='';
+  }
+  async function confirmAgentReset(){
+    const confirmation=document.getElementById('agentResetConfirmation').value.trim();
+    const result=document.getElementById('agentResetResult');
+    const btn=document.getElementById('agentResetConfirmBtn');
+    if(confirmation!=='RESET_AGENT_STATE'){
+      result.style.cssText='margin-top:10px;font-size:12px;display:block;color:#f87171';
+      result.textContent='✗ Type RESET_AGENT_STATE exactly to confirm';
+      return;
+    }
+    btn.disabled=true; btn.textContent='Resetting…'; result.style.display='none';
+    try{
+      const r=await fetch('/api/agent/memory/reset',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirmation,include_events:true,include_llm_calls:true})});
+      const d=await r.json();
+      if(!r.ok||!d.ok) throw new Error(d.error||'Agent reset failed');
+      const x=d.deleted||{};
+      result.style.cssText='margin-top:10px;font-size:12px;display:block;color:#4ade80';
+      result.textContent=`✓ Reset complete — ${x.runs||0} runs, ${x.memory||0} memories, ${x.events||0} events, ${x.llmCalls||0} LLM records removed. Production data untouched.`;
+      btn.textContent='Done';
+      document.getElementById('agentResetConfirmation').value='';
+      setTimeout(()=>{closeAgentResetModal(); if(typeof loadAgentObservability==='function') loadAgentObservability();},1800);
+    }catch(e){
+      result.style.cssText='margin-top:10px;font-size:12px;display:block;color:#f87171';
+      result.textContent='✗ '+e.message; btn.disabled=false; btn.textContent='Reset Agent State';
+    }
+  }
+
   // ── SSE ────────────────────────────────────────────────────────────────────
   let evtSource = null;
   let retryDelay = 2000;
