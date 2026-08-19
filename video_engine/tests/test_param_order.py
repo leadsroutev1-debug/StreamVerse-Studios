@@ -1,11 +1,7 @@
 """
-Regression test — LTX positional argument order.
+Regression tests for the official LTX-2.3 Space contract.
 
-This exists specifically to prevent reintroducing the old bug where
-width/height were swapped or enhance_prompt/seed/randomize_seed were
-placed in the wrong slots. See refactor spec §17.
-
-Correct order:
+Correct positional order:
     0 image
     1 prompt
     2 duration
@@ -14,34 +10,38 @@ Correct order:
     5 randomize_seed
     6 height
     7 width
+
+Production StreamVerse geometry:
+    width=1024, height=1536 (native 9:16 high-resolution preset)
 """
-from video_engine.providers.ltx import build_predict_args
+
+from video_engine.providers.ltx import (
+    PRODUCTION_HEIGHT,
+    PRODUCTION_WIDTH,
+    build_predict_args,
+)
 
 
 def test_ltx_positional_argument_order():
     args = build_predict_args(
-        "/tmp/scene.jpg",  # image_path
-        "cinematic push in",  # prompt
-        8.0,  # duration
-        False,  # enhance_prompt
-        123456,  # seed
-        False,  # randomize_seed
-        1536,  # height
-        1024,  # width
+        "/tmp/scene.jpg",
+        "cinematic push in",
+        8.0,
+        False,
+        123456,
+        False,
+        PRODUCTION_HEIGHT,
+        PRODUCTION_WIDTH,
     )
 
     assert len(args) == 8
-
-    # args[0] is a handle_file(...) FileData wrapper for the image path.
     assert args[1] == "cinematic push in"
     assert args[2] == 8.0
-    assert args[3] is False  # enhance_prompt
-    assert args[4] == 123456  # seed
-    assert args[5] is False  # randomize_seed
-    assert args[6] == 1536  # height
-    assert args[7] == 1024  # width
+    assert args[3] is False
+    assert args[4] == 123456
+    assert args[5] is False
+    assert args[6] == PRODUCTION_HEIGHT == 1536
+    assert args[7] == PRODUCTION_WIDTH == 1024
 
-    # Explicitly guard against the previously-reported wrong order:
-    # image, prompt, duration, WIDTH, HEIGHT, seed, randomize_seed, enhance_prompt
-    wrong_order_would_have = (args[6], args[7]) == (1024, 1536)
-    assert not wrong_order_would_have, "height/width appear swapped — regression!"
+    # Guard against the previously-reported width/height swap.
+    assert (args[6], args[7]) != (1024, 1536)
