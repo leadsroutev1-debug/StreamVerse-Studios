@@ -1,34 +1,29 @@
 'use strict';
 
 const crypto = require('crypto');
-/**
- * Cloudflare Worker AI — Image generation via custom multipart Worker.
- *
- * Worker protocol:
- *   POST  multipart/form-data
- *     prompt         : string
- *     input_image_0  : binary file  (optional, up to 4 reference images)
- *     …
- *     input_image_3  : binary file
- *   Auth: Bearer <CF_WORKER_KEYS>
- *
- * Success response : binary image (JPEG/PNG/WebP), Content-Type: image/jpeg
- * Error response   : JSON { error: "…" }, HTTP 500
- *
- * Known error codes:
- *   4006 — daily free-tier quota exhausted → rotate to next CF_WORKER_URL
- *   3030 — output flagged by content policy → throw CFSafetyRefusalError
- *
- * CF_WORKER_URL : comma-separated list of worker deployment URLs.
- *                 Rotated round-robin; advances to next on 4006 quota error.
- * CF_WORKER_KEYS: comma-separated auth tokens (Bearer).
- *                 Rotated round-robin; skipped on 429/401/403.
- */
-const axios    = require('axios');
+const axios = require('axios');
 const FormData = require('form-data');
-const config   = require('./config');
+const sharp = require('sharp');
+const config = require('./config');
 
-// ── Typed error for content policy refusals ───────────────────────────────────
+/**
+ * Cloudflare Workers AI — FLUX.2 [klein] 9B image generation/editing.
+ *
+ * Production contract:
+ *   - prompt is the cinematic scene-image prompt
+ *   - input_image_0..3 are binary reference images
+ *   - reference images are resized to <=512x512 before transmission
+ *   - output is a 9:16 high-resolution image for the LTX I2V stage
+ *   - seed and guidance are passed through for reproducibility/control
+ *   - characterMap is metadata used by the custom Worker to bind reference
+ *     indices to character identities
+ *
+ * FLUX.2 klein 9B supports up to four reference images, but the reference
+ * inputs must be named explicitly and kept below 512x512. The model's
+ * distilled sampler has fixed steps, so this client deliberately does not
+ * expose or invent a steps parameter.
+ */
+
 class CFSafetyRefusalError extends Error {
   constructor(message) {
     super(message);
@@ -36,60 +31,46 @@ class CFSafetyRefusalError extends Error {
   }
 }
 
-// ── Parse an error body (arraybuffer or string) into a plain string ───────────
 function _parseErrorBody(data) {
   if (!data) return null;
   try {
-    const text = Buffer.isBuffer(data) ? data.toString('utf8')
-               : (data instanceof ArrayBuffer ? Buffer.from(data).toString('utf8')
-               : String(data));
+    const text = Buffer.isBuffer(data)
+      ? data.toString('utf8')
+      : (data instanceof ArrayBuffer ? Buffer.from(data).toString('utf8') : String(data));
     const trimmed = text.trim();
     if (trimmed.startsWith('{')) {
       const parsed = JSON.parse(trimmed);
       return parsed.error || trimmed;
     }
     return trimmed;
-  } catch { return null; }
+  } catch {
+    return null;
+  }
 }
 
-// ── Check if a successful (2xx) response body is actually a JSON error ─────────
-// The worker should return non-2xx on error, but guard against it anyway.
 function _checkNotJsonError(buf) {
-  if (!buf || buf.length < 2) return;
-  // If first byte is '{' this is likely JSON, not image data
-  if (buf[0] !== 0x7B) return; // not '{'
+  if (!buf || buf.length < 2 || buf[0] !== 0x7B) return;
   try {
-    const text   = buf.toString('utf8').slice(0, 600);
-    const parsed = JSON.parse(text);
-    if (parsed.error) {
-      throw new Error(`CF Worker returned JSON error: ${parsed.error}`);
-    }
+    const parsed = JSON.parse(buf.toString('utf8').slice(0, 600));
+    if (parsed.error) throw new Error(`CF Worker returned JSON error: ${parsed.error}`);
   } catch (e) {
     if (e.message?.startsWith('CF Worker returned JSON error')) throw e;
-    // JSON parse failed — not JSON, ignore
   }
 }
 
 /**
- * Generate an image via the Cloudflare Worker AI endpoint.
- *
- * @param {string}   prompt              Full image prompt
- * @param {string[]} referenceImageUrls  Character reference portrait URLs (up to 4)
- * @param {number|null} seed             Unused — worker handles internally
- * @param {string|null} negativePrompt   Unused — not supported by worker protocol
- * @param {Array<{name:string, reference_index:number, position?:string, action?:string}>} [characterMap]
- *   Dynamic reference-index → character identity mapping, built by the caller
- *   from whichever characters are actually present in the current scene (no
- *   fixed cast, no hardcoded names/count). Forwarded to the Worker as the
- *   `characters` field so it can build its REFERENCE IMAGE N = <name>
- *   identity-preservation instructions. Optional — omitted safely if empty.
- * @returns {Buffer} Raw image bytes (JPEG/PNG/WebP)
+ * Resize a reference image to the Workers AI multi-reference limit without
+ * changing its semantic framing. Contain preserves the whole character
+ * reference and pads transparent/empty areas rather than cropping faces.
+ * JPEG is used because the Worker only needs a compact binary reference.
  */
-// Single-flight registry: identical image-generation requests made concurrently
-// share ONE Cloudflare request. This protects CF tokens from duplicate in-flight
-// submissions caused by overlapping retry/resume/UI paths. The entry is removed
-// as soon as the request settles, so this is not a persistent image cache.
-const _inFlightGenerations = new Map();
+async function _prepareReferenceImage(buffer) {
+  return sharp(buffer, { failOn: 'none' })
+    .rotate()
+    .resize(512, 512, { fit: 'contain', withoutEnlargement: true })
+    .jpeg({ quality: 92, mozjpeg: true })
+    .toBuffer();
+}
 
 function _generationFingerprint(prompt, referenceImageUrls, seed, negativePrompt, characterMap) {
   return crypto.createHash('sha256').update(JSON.stringify({
@@ -98,149 +79,126 @@ function _generationFingerprint(prompt, referenceImageUrls, seed, negativePrompt
     seed: seed ?? null,
     negativePrompt: String(negativePrompt || ''),
     characterMap: Array.isArray(characterMap) ? characterMap : [],
-    width: 768,
-    height: 1365,
+    width: Number(process.env.CF_IMAGE_WIDTH || 1024),
+    height: Number(process.env.CF_IMAGE_HEIGHT || 1536),
+    guidance: Number(process.env.CF_IMAGE_GUIDANCE || 3.5),
   })).digest('hex');
 }
 
-async function _generateImageOnce(prompt, referenceImageUrls = [], seed = null, negativePrompt = null, characterMap = []) {
+function _resolveGuidance() {
+  const value = Number(process.env.CF_IMAGE_GUIDANCE || 3.5);
+  return Number.isFinite(value) ? Math.max(0, Math.min(20, value)) : 3.5;
+}
 
+function _resolveDimension(name, fallback) {
+  const value = Number(process.env[name] || fallback);
+  return Number.isFinite(value) && value >= 256 && value <= 1920 ? Math.floor(value) : fallback;
+}
+
+async function _generateImageOnce(prompt, referenceImageUrls = [], seed = null, negativePrompt = null, characterMap = []) {
   const urlCount = config.cfWorkerUrls.length;
   const keyCount = config.cfWorkerKeys.length;
-
   if (urlCount === 0) throw new Error('[CFImageGen] No Cloudflare Worker URLs configured (CF_WORKER_URL)');
   if (keyCount === 0) throw new Error('[CFImageGen] No Cloudflare Worker keys configured (CF_WORKER_KEYS)');
 
-  // Pre-fetch reference images as buffers (up to 4, failures are non-fatal)
+  const width = _resolveDimension('CF_IMAGE_WIDTH', 1024);
+  const height = _resolveDimension('CF_IMAGE_HEIGHT', 1536);
+  const guidance = _resolveGuidance();
+
   const refBuffers = [];
   for (const url of (referenceImageUrls || []).slice(0, 4)) {
     try {
       const r = await axios.get(url, { responseType: 'arraybuffer', timeout: 20000 });
-      refBuffers.push(Buffer.from(r.data));
+      refBuffers.push(await _prepareReferenceImage(Buffer.from(r.data)));
     } catch (e) {
-      console.warn(`[CFImageGen] Skipping reference image (fetch failed): ${e.message}`);
+      console.warn(`[CFImageGen] Skipping reference image (fetch/resize failed): ${e.message}`);
     }
   }
 
   let lastError;
-
-  // Outer loop: rotate through worker URLs on quota exhaustion
   for (let urlAttempt = 0; urlAttempt < urlCount; urlAttempt++) {
     const workerUrl = config.getNextCfUrl();
-
-    // Inner loop: rotate through auth keys on 429/401/403
     for (let keyAttempt = 0; keyAttempt < keyCount; keyAttempt++) {
       const key = config.getNextCfKey();
-
       try {
         const form = new FormData();
-        form.append('prompt', prompt);
-        // Vertical 9:16 portrait — matches CF Worker flux-2-klein-9b native resolution
-        form.append('width',        '768');
-        form.append('height',       '1365');
-        form.append('aspect_ratio', '9:16');
-        // Dynamic reference→character identity mapping (0..N characters — never
-        // hardcoded). Only sent when the caller actually supplied one; the
-        // Worker treats a missing/empty `characters` field as "no metadata".
+        form.append('prompt', String(prompt || '').trim());
+        form.append('width', String(width));
+        form.append('height', String(height));
+        form.append('guidance', String(guidance));
+        if (Number.isInteger(Number(seed)) && Number(seed) >= 0) {
+          form.append('seed', String(Math.min(2147483647, Number(seed))));
+        }
         if (Array.isArray(characterMap) && characterMap.length > 0) {
           form.append('characters', JSON.stringify(characterMap));
         }
         for (let i = 0; i < refBuffers.length; i++) {
           form.append(`input_image_${i}`, refBuffers[i], {
-            filename:    `ref_${i}.jpg`,
+            filename: `ref_${i}.jpg`,
             contentType: 'image/jpeg',
           });
         }
 
         const resp = await axios.post(workerUrl, form, {
-          headers: {
-            ...form.getHeaders(),
-            'Authorization': `Bearer ${key}`,
-          },
+          headers: { ...form.getHeaders(), Authorization: `Bearer ${key}` },
           responseType: 'arraybuffer',
-          timeout:      90000,
+          timeout: 120000,
         });
 
         const buf = Buffer.from(resp.data);
-
-        // Guard: 2xx but body is a JSON error
         _checkNotJsonError(buf);
-
-        if (buf.length < 100) {
-          throw new Error(`CF Worker returned suspiciously small response (${buf.length} bytes)`);
-        }
+        if (buf.length < 100) throw new Error(`CF Worker returned suspiciously small response (${buf.length} bytes)`);
 
         config.markKeyStatus('cf', key, 'active');
-        console.log(`[CFImageGen] Image generated (${buf.length} bytes, ${refBuffers.length} ref image(s))`);
+        console.log(`[CFImageGen] Image generated (${buf.length} bytes, ${refBuffers.length} prepared refs, ${width}x${height}, guidance=${guidance})`);
         return buf;
-
       } catch (err) {
         lastError = err;
-
-        // ── JSON error embedded in a thrown message (from _checkNotJsonError) ──
         if (err.message?.startsWith('CF Worker returned JSON error')) {
           const errText = err.message;
-          if (errText.includes('3030')) {
-            throw new CFSafetyRefusalError(`CF Worker content flagged (3030): ${errText}`);
-          }
+          if (errText.includes('3030')) throw new CFSafetyRefusalError(`CF Worker content flagged (3030): ${errText}`);
           if (errText.includes('4006')) {
             config.markKeyStatus('cfurl', workerUrl, 'exhausted');
             console.warn(`[CFImageGen] Quota exhausted (4006) on ${workerUrl} — rotating to next URL`);
-            break; // break key loop → outer loop tries next URL
+            break;
           }
-          // Other JSON error — propagate
           throw err;
         }
-
-        // ── HTTP error response ────────────────────────────────────────────────
         if (err.response) {
-          const status  = err.response.status;
+          const status = err.response.status;
           const errText = _parseErrorBody(err.response.data) || '';
-
-          // Content flagged (3030) — don't retry; caller should rewrite prompt
-          if (errText.includes('3030')) {
-            throw new CFSafetyRefusalError(`CF Worker content flagged (3030): ${errText}`);
-          }
-
-          // Quota exhausted (4006) — rotate to next URL (key stays active for other URLs)
+          if (errText.includes('3030')) throw new CFSafetyRefusalError(`CF Worker content flagged (3030): ${errText}`);
           if (errText.includes('4006')) {
             config.markKeyStatus('cfurl', workerUrl, 'exhausted');
             console.warn(`[CFImageGen] Quota exhausted (4006) on ${workerUrl} — rotating to next URL`);
-            break; // break key loop → outer loop tries next URL
+            break;
           }
-
-          // Auth / rate-limit — rotate key
           if (status === 429) {
             config.markKeyStatus('cf', key, 'rate-limited');
-            console.warn(`[CFImageGen] Key rate-limited (429), rotating...`);
             continue;
           }
           if (status === 401 || status === 403) {
             config.markKeyStatus('cf', key, 'exhausted');
-            console.warn(`[CFImageGen] Key invalid/forbidden (${status}), rotating...`);
             continue;
           }
-
           console.warn(`[CFImageGen] HTTP ${status} from ${workerUrl}: ${errText.slice(0, 200)}`);
-          throw err; // unexpected HTTP error — propagate
+          throw err;
         }
-
-        // Network / timeout error — propagate immediately (no rotation helps)
         throw err;
       }
     }
-    // URL exhausted all keys — log and try next URL
-    console.warn(`[CFImageGen] All keys failed for ${workerUrl}, trying next URL...`);
   }
 
   throw new Error(`[CFImageGen] All CF Worker URLs and keys exhausted. Last error: ${lastError?.message}`);
 }
 
+const _inFlightGenerations = new Map();
+
 async function generateImage(prompt, referenceImageUrls = [], seed = null, negativePrompt = null, characterMap = []) {
   const fingerprint = _generationFingerprint(prompt, referenceImageUrls, seed, negativePrompt, characterMap);
   const existing = _inFlightGenerations.get(fingerprint);
   if (existing) {
-    console.warn(`[CFImageGen] Reusing identical in-flight generation ${fingerprint.slice(0, 12)} — duplicate CF request suppressed`);
+    console.warn(`[CFImageGen] Reusing identical in-flight generation ${fingerprint.slice(0, 12)} — duplicate request suppressed`);
     return Buffer.from(await existing);
   }
 
