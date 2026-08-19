@@ -1,8 +1,9 @@
 """In-process job store + background execution.
 
-Node submits a job and gets an immediate ack; it polls
-GET /internal/video/jobs/{job_id} for status instead of blocking on one
-long synchronous HTTP request.
+Node submits a job and gets an immediate ack; the engine runs the generation
+asynchronously. The video-engine boundary enforces the same production media
+contract as Node so a malformed or stale caller cannot silently submit a
+wrong-resolution I2V request.
 """
 from __future__ import annotations
 
@@ -11,8 +12,8 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field, asdict
-from typing import Any, Optional
+from dataclasses import dataclass, field
+from typing import Optional
 
 from .providers.base import ProviderError
 from .providers.ltx import LTXProvider
@@ -22,6 +23,11 @@ logger = logging.getLogger("video_engine.jobs")
 _PROVIDERS = {
     "ltx": LTXProvider(),
 }
+
+# LTX-2.3 production portrait contract used by StreamVerse. This is deliberately
+# fixed here as a second boundary check; callers cannot override it accidentally.
+PRODUCTION_LTX_WIDTH = 1024
+PRODUCTION_LTX_HEIGHT = 1536
 
 _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="video-job")
 
@@ -100,7 +106,32 @@ class JobStore:
         provider_name = params.get("provider", "ltx")
         provider = _PROVIDERS.get(provider_name)
         if provider is None:
-            self._update(job_id, status="failed", error={"message": f"Unknown provider '{provider_name}'"})
+            self._update(job_id, status="failed", error={"message": f"Unknown provider '{provider_name}'", "category": "validation"})
+            return
+
+        # Hard production boundary. The Node client already validates the
+        # source image bytes; this prevents stale/manual callers from changing
+        # the LTX geometry downstream.
+        try:
+            width = int(params.get("width", PRODUCTION_LTX_WIDTH))
+            height = int(params.get("height", PRODUCTION_LTX_HEIGHT))
+        except (TypeError, ValueError) as exc:
+            self._update(job_id, status="failed", error={"message": f"Invalid LTX dimensions: {exc}", "category": "validation"})
+            return
+
+        if provider_name == "ltx" and (width != PRODUCTION_LTX_WIDTH or height != PRODUCTION_LTX_HEIGHT):
+            self._update(
+                job_id,
+                status="failed",
+                error={
+                    "message": f"Production LTX I2V requires {PRODUCTION_LTX_WIDTH}x{PRODUCTION_LTX_HEIGHT}; received {width}x{height}",
+                    "category": "validation",
+                    "expected_width": PRODUCTION_LTX_WIDTH,
+                    "expected_height": PRODUCTION_LTX_HEIGHT,
+                    "received_width": width,
+                    "received_height": height,
+                },
+            )
             return
 
         self._update(job_id, status="submitting")
@@ -114,8 +145,8 @@ class JobStore:
                 image_url=params["image_url"],
                 prompt=params["prompt"],
                 duration=float(params.get("duration", 5.0)),
-                width=int(params.get("width", 1024)),
-                height=int(params.get("height", 1536)),
+                width=width,
+                height=height,
                 seed=params.get("seed"),
                 randomize_seed=bool(params.get("randomize_seed", False)),
                 enhance_prompt=bool(params.get("enhance_prompt", False)),
