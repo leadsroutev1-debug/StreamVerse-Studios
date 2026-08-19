@@ -9,22 +9,27 @@ const config = require('./config');
 /**
  * Cloudflare Workers AI — FLUX.2 [klein] 9B image generation/editing.
  *
- * Production contract:
- *   - prompt is the cinematic scene-image prompt
- *   - input_image_0..3 are binary reference images
- *   - ONLY reference inputs are normalized to the Cloudflare multi-reference
- *     limit (<512x512); the generated scene image is NEVER resized here
- *   - generated scene output defaults to 1024x1536 (9:16) for LTX I2V
- *   - seed and guidance are passed through for reproducibility/control
- *   - characterMap is metadata used by the custom Worker to bind reference
- *     indices to character identities
+ * Production media contract:
+ *   - input_image_0..3 are binary character/style references only.
+ *   - ONLY those reference inputs are normalized for Cloudflare's documented
+ *     multi-reference constraint: BOTH dimensions must be strictly < 512px.
+ *   - The generated cinematic frame is NEVER resized, cropped, padded or
+ *     recompressed after generation.
+ *   - The canonical generated scene frame is ALWAYS exactly 1024x1536.
+ *   - seed/guidance are explicit and deterministic where supplied.
  *
- * Cloudflare's FLUX.2 klein 9B API supports up to four named reference
- * inputs and requires each reference image to be smaller than 512x512.
- * That restriction applies to the INPUT references, not the requested
- * OUTPUT dimensions. StreamVerse therefore preserves the full 1024x1536
- * generated frame for the downstream LTX-2.3 I2V stage.
+ * Cloudflare documents up to four named reference inputs, with each input
+ * image smaller than 512x512. The output width/height are independent model
+ * parameters and support 256..1920. StreamVerse deliberately fixes the
+ * production output at 1024x1536 because that frame is the canonical first
+ * frame handed to LTX-2.3 I2V.
  */
+
+const CF_OUTPUT_WIDTH = 1024;
+const CF_OUTPUT_HEIGHT = 1536;
+// Cloudflare says reference images must be *smaller than* 512x512, therefore
+// 512x512 itself is not a safe value. 511 is the maximum dimension we send.
+const CF_MAX_REFERENCE_DIMENSION = 511;
 
 class CFSafetyRefusalError extends Error {
   constructor(message) {
@@ -69,15 +74,19 @@ function _checkNotJsonError(buf) {
 }
 
 /**
- * Prepare ONLY a reference image for FLUX.2's documented multi-reference
- * input constraint. This must never be used on the generated scene frame.
- * Contain preserves the complete character reference and avoids face/body
- * cropping. No enlargement is performed.
+ * Prepare ONLY a reference image for FLUX.2's multi-reference input
+ * constraint. Preserve the entire reference with aspect-ratio-safe scaling.
+ * Never use this helper on the generated cinematic frame.
  */
 async function _prepareReferenceImage(buffer) {
   return sharp(buffer, { failOn: 'none' })
     .rotate()
-    .resize(512, 512, { fit: 'contain', withoutEnlargement: true })
+    .resize({
+      width: CF_MAX_REFERENCE_DIMENSION,
+      height: CF_MAX_REFERENCE_DIMENSION,
+      fit: 'inside',
+      withoutEnlargement: true,
+    })
     .jpeg({ quality: 92, mozjpeg: true })
     .toBuffer();
 }
@@ -89,8 +98,8 @@ function _generationFingerprint(prompt, referenceImageUrls, seed, negativePrompt
     seed: seed ?? null,
     negativePrompt: String(negativePrompt || ''),
     characterMap: Array.isArray(characterMap) ? characterMap : [],
-    width: Number(process.env.CF_IMAGE_WIDTH || 1024),
-    height: Number(process.env.CF_IMAGE_HEIGHT || 1536),
+    width: CF_OUTPUT_WIDTH,
+    height: CF_OUTPUT_HEIGHT,
     guidance: Number(process.env.CF_IMAGE_GUIDANCE || 3.5),
   })).digest('hex');
 }
@@ -100,12 +109,7 @@ function _resolveGuidance() {
   return Number.isFinite(value) ? Math.max(0, Math.min(20, value)) : 3.5;
 }
 
-function _resolveDimension(name, fallback) {
-  const value = Number(process.env[name] || fallback);
-  return Number.isFinite(value) && value >= 256 && value <= 1920 ? Math.floor(value) : fallback;
-}
-
-async function _validateGeneratedSceneImage(buf, expectedWidth, expectedHeight) {
+async function _validateGeneratedSceneImage(buf) {
   let metadata;
   try {
     metadata = await sharp(buf, { failOn: 'none' }).metadata();
@@ -113,10 +117,10 @@ async function _validateGeneratedSceneImage(buf, expectedWidth, expectedHeight) 
     throw new CFOutputValidationError(`Generated CF image is not a decodable image: ${err.message}`);
   }
 
-  if (metadata.width !== expectedWidth || metadata.height !== expectedHeight) {
+  if (metadata.width !== CF_OUTPUT_WIDTH || metadata.height !== CF_OUTPUT_HEIGHT) {
     throw new CFOutputValidationError(
-      `Cloudflare returned ${metadata.width || '?'}x${metadata.height || '?'}; expected ${expectedWidth}x${expectedHeight}. Refusing to resize/crop the cinematic frame before LTX I2V.`,
-      { actualWidth: metadata.width, actualHeight: metadata.height, expectedWidth, expectedHeight },
+      `Cloudflare returned ${metadata.width || '?'}x${metadata.height || '?'}; expected ${CF_OUTPUT_WIDTH}x${CF_OUTPUT_HEIGHT}. Refusing to resize/crop the cinematic frame before LTX I2V.`,
+      { actualWidth: metadata.width, actualHeight: metadata.height, expectedWidth: CF_OUTPUT_WIDTH, expectedHeight: CF_OUTPUT_HEIGHT },
     );
   }
 
@@ -129,22 +133,24 @@ async function _generateImageOnce(prompt, referenceImageUrls = [], seed = null, 
   if (urlCount === 0) throw new Error('[CFImageGen] No Cloudflare Worker URLs configured (CF_WORKER_URL)');
   if (keyCount === 0) throw new Error('[CFImageGen] No Cloudflare Worker keys configured (CF_WORKER_KEYS)');
 
-  const width = _resolveDimension('CF_IMAGE_WIDTH', 1024);
-  const height = _resolveDimension('CF_IMAGE_HEIGHT', 1536);
+  // Production output geometry is intentionally NOT configurable. Allowing
+  // an environment override here can silently create a frame the downstream
+  // LTX I2V contract cannot accept.
+  const width = CF_OUTPUT_WIDTH;
+  const height = CF_OUTPUT_HEIGHT;
   const guidance = _resolveGuidance();
-
-  // The image stage is the canonical visual frame for LTX. Keep the output
-  // portrait geometry explicit and reject accidental configuration drift.
-  if (width !== 1024 || height !== 1536) {
-    console.warn(`[CFImageGen] Non-production output geometry requested: ${width}x${height}. Production LTX I2V expects 1024x1536 portrait frames.`);
-  }
 
   const refs = (referenceImageUrls || []).slice(0, 4);
   const refBuffers = [];
   for (const url of refs) {
     try {
       const r = await axios.get(url, { responseType: 'arraybuffer', timeout: 20000 });
-      refBuffers.push(await _prepareReferenceImage(Buffer.from(r.data)));
+      const prepared = await _prepareReferenceImage(Buffer.from(r.data));
+      const meta = await sharp(prepared, { failOn: 'none' }).metadata();
+      if (!meta.width || !meta.height || meta.width >= 512 || meta.height >= 512) {
+        throw new Error(`prepared reference is ${meta.width || '?'}x${meta.height || '?'}; both dimensions must be <512`);
+      }
+      refBuffers.push(prepared);
     } catch (e) {
       console.warn(`[CFImageGen] Skipping reference image (fetch/preparation failed): ${e.message}`);
     }
@@ -184,10 +190,12 @@ async function _generateImageOnce(prompt, referenceImageUrls = [], seed = null, 
         _checkNotJsonError(buf);
         if (buf.length < 100) throw new Error(`CF Worker returned suspiciously small response (${buf.length} bytes)`);
 
-        await _validateGeneratedSceneImage(buf, width, height);
+        // Hard boundary: the actual cinematic frame must be exactly the
+        // production geometry. Never silently repair it here.
+        await _validateGeneratedSceneImage(buf);
 
         config.markKeyStatus('cf', key, 'active');
-        console.log(`[CFImageGen] Image generated (${buf.length} bytes, ${refBuffers.length}/${refs.length} refs prepared, output=${width}x${height}, guidance=${guidance})`);
+        console.log(`[CFImageGen] Image generated (${buf.length} bytes, ${refBuffers.length}/${refs.length} refs prepared, references<512=true, output=${width}x${height}, guidance=${guidance})`);
         return buf;
       } catch (err) {
         lastError = err;
