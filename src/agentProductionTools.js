@@ -21,7 +21,7 @@ function num(v, fallback = 0) {
 
 async function getDraftAny() {
   const row = await db.queryOne(`
-    SELECT e.*, s.title, s.genre, s.storyline_id AS slid
+    SELECT e.*, s.title, s.genre, e.storyline_id AS slid
     FROM episodes e JOIN storylines s ON s.id=e.storyline_id
     WHERE e.status IN ('draft','paused','ready','generating','error')
     ORDER BY e.updated_at DESC LIMIT 1
@@ -106,7 +106,6 @@ async function initializeSeries({ genre = null } = {}) {
   } else {
     await db.execute(`UPDATE storylines SET title=?,genre=?,status='active',character_bible=?,plot_summary=?,full_story_simulation=?,central_theme=?,tone_manifesto=?,visual_language=?,season_arcs=?,engagement_hook=?,premiere_announcement=?,logline=?,updated_at=NOW() WHERE id=?`, [storyMap.title, storyMap.genre, JSON.stringify(lockedCast || []), storyMap.plot_summary || storyMap.comprehensive_summary || null, JSON.stringify(storyMap.full_story_simulation || {}), storyMap.central_theme || null, storyMap.tone_manifesto || null, JSON.stringify(storyMap.visual_language || {}), JSON.stringify(storyMap.season_arcs || []), storyMap.engagement_hook || null, storyMap.premiere_announcement || null, storyMap.logline || null, storylineId]);
   }
-  // Character images are part of the tool, not the orchestrator.
   const pipeline = require('./pipeline');
   if (typeof pipeline.insertCharactersWithConsistency === 'function') await pipeline.insertCharactersWithConsistency(storylineId, lockedCast || []);
   storyline = await db.queryOne(`SELECT * FROM storylines WHERE id=?`, [storylineId]);
@@ -197,6 +196,7 @@ async function writeEpisodeBlueprintAndShotSimulation({ episode_id } = {}) {
     isSeriesMovie:false,
     targetMinutes,
     narrativeSimulation:narrative,
+    masterSimulation:full,
     existingScript:draftScript,
     checkpoint:async ({stage,sceneNumber,script})=>{
       const merged={...script,checkpoint_state:{...(script.checkpoint_state||{}),stage,last_scene_number:sceneNumber,updated_at:new Date().toISOString()}};
