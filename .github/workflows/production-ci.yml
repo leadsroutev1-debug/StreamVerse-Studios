@@ -1,0 +1,47 @@
+name: StreamVerse production regression
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Node dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Syntax check production entrypoints
+        run: |
+          node --check index.js
+          node --check src/db.js
+          node --check src/agentOrchestrator.js
+          node --check src/agentProductionTools.js
+          node --check src/agentRuntimeHardening.js
+          node --check src/ltxVideoGen.js
+
+      - name: Agent lifecycle regression tests
+        run: node --test test/agent_runtime_hardening.test.js
+
+      - name: Verify LTX production geometry contract
+        run: |
+          node - <<'NODE'
+          const fs = require('fs');
+          const src = fs.readFileSync('src/ltxVideoGen.js', 'utf8');
+          for (const needle of ['HIGH_RES_WIDTH = 1024', 'HIGH_RES_HEIGHT = 1536', 'framePreserved=true', 'Refusing to resize I2V frame']) {
+            if (!src.includes(needle)) throw new Error(`Missing LTX production invariant: ${needle}`);
+          }
+          console.log('LTX 1024x1536 no-resize invariant verified');
+          NODE
