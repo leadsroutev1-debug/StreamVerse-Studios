@@ -19,7 +19,7 @@ async function getAgentObservability({ storylineId = null, episodeId = null, run
   const [runs, events, calls] = await Promise.all([
     db.query(`SELECT * FROM agent_runs ${where} ORDER BY updated_at DESC LIMIT ${safe}`, params),
     db.query(`SELECT * FROM agent_events ${where} ORDER BY created_at DESC LIMIT ${safe}`, params),
-    db.query(`SELECT * FROM agent_llm_calls ${where} ORDER BY created_at DESC LIMIT ${safe}`, params).catch(() => []),
+    db.query(`SELECT * FROM agent_llm_calls ${where} ORDER BY created_at DESC LIMIT ${safe}`).catch(() => []),
   ]);
   const toolEvents = events.filter(e => ['production_tool_call','tool_call','tool_result','agent_decision','agent_diagnostic','agent_recovery'].includes(e.event_type));
   const failed = toolEvents.filter(e => {
@@ -63,4 +63,41 @@ async function pruneAgentMemory({ storylineId = null, episodeId = null, keepPrio
   return { ok:true, dryRun:false, pruned:Number(result.affectedRows || 0), eligible:count };
 }
 
-module.exports = { getAgentObservability, pruneAgentMemory };
+/**
+ * Reset agent state without touching studio production data.
+ * This removes the agent's resumable runs, episodic memory and telemetry.
+ * Storylines, episodes, scripts, shots, characters and media are deliberately
+ * left intact so the agent can rediscover the current production state.
+ */
+async function resetAgentState({ storylineId = null, episodeId = null, includeEvents = true, includeLlmCalls = true } = {}) {
+  const scope = [];
+  const params = [];
+  if (storylineId) { scope.push('storyline_id=?'); params.push(storylineId); }
+  if (episodeId) { scope.push('episode_id=?'); params.push(episodeId); }
+  const where = scope.length ? `WHERE ${scope.join(' AND ')}` : '';
+
+  return db.transaction(async (conn) => {
+    const deleted = { runs: 0, memory: 0, events: 0, llmCalls: 0 };
+    const [runsResult] = await conn.execute(`DELETE FROM agent_runs ${where}`, params);
+    deleted.runs = Number(runsResult.affectedRows || 0);
+    const [memoryResult] = await conn.execute(`DELETE FROM agent_memory ${where}`, params);
+    deleted.memory = Number(memoryResult.affectedRows || 0);
+    if (includeEvents) {
+      const [eventsResult] = await conn.execute(`DELETE FROM agent_events ${where}`, params);
+      deleted.events = Number(eventsResult.affectedRows || 0);
+    }
+    if (includeLlmCalls) {
+      try {
+        const [llmResult] = await conn.execute(`DELETE FROM agent_llm_calls ${where}`, params);
+        deleted.llmCalls = Number(llmResult.affectedRows || 0);
+      } catch (err) {
+        // Older deployments may not have the optional LLM telemetry table.
+        if (!/doesn't exist|unknown table|ER_NO_SUCH_TABLE/i.test(String(err.message || ''))) throw err;
+      }
+    }
+    try { state.setAgentActivity(null); } catch (_) {}
+    return { ok: true, scope: { storylineId, episodeId }, deleted, productionDataUntouched: true };
+  });
+}
+
+module.exports = { getAgentObservability, pruneAgentMemory, resetAgentState };
