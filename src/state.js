@@ -22,7 +22,7 @@ const STATES = {
 };
 
 let _state = {
-  status:       STATES.IDLE,
+  status: STATES.IDLE,
   runStartedAt: null,
   progress: { current: 0, total: 0, label: '' },
   shotsDone: 0,
@@ -39,7 +39,7 @@ function setState(partial) { Object.assign(_state, partial); emitter.emit('updat
 
 function setStatus(status, label = '') {
   _state.status = status;
-  if (status !== STATES.IDLE && !_state.runStartedAt) _state.runStartedAt = new Date().toISOString();
+  if (status !== STATES.IDLE && ! _state.runStartedAt) _state.runStartedAt = new Date().toISOString();
   if (status === STATES.IDLE || status === STATES.ERROR) _state.progress = { current: 0, total: 0, label: '' };
   if (label) _state.progress.label = label;
   emitter.emit('update', getState());
@@ -76,32 +76,64 @@ function _agentStatusForTool(tool) {
 }
 
 let _syncBusy = false;
-let _lastAgentEventId = null;
+let _lastAgentFingerprint = null;
 
 async function syncDurableAgentActivity() {
   if (_syncBusy) return;
   _syncBusy = true;
   try {
     const db = require('./db');
-    const run = await db.queryOne(`SELECT id, storyline_id, episode_id, season_number, episode_number, phase, status, started_at, updated_at FROM agent_runs ORDER BY updated_at DESC LIMIT 1`);
+    const run = await db.queryOne(`
+      SELECT ar.id, ar.storyline_id, ar.episode_id, ar.season_number, ar.episode_number,
+             ar.phase, ar.status, ar.started_at, ar.updated_at,
+             s.title AS storyline_title,
+             e.id AS episode_row_id, e.episode_number AS episode_row_number,
+             e.season_number AS episode_row_season
+      FROM agent_runs ar
+      LEFT JOIN storylines s ON s.id=ar.storyline_id
+      LEFT JOIN episodes e ON e.id=ar.episode_id
+      ORDER BY ar.updated_at DESC LIMIT 1
+    `);
     if (!run) return;
-    const event = await db.queryOne(`SELECT id, event_type, payload, created_at FROM agent_events WHERE run_id=? ORDER BY created_at DESC LIMIT 1`, [run.id]);
+
+    const event = await db.queryOne(`
+      SELECT id, event_type, payload, created_at
+      FROM agent_events WHERE run_id=? ORDER BY created_at DESC LIMIT 1
+    `, [run.id]);
+
     let payload = {};
     try { payload = typeof event?.payload === 'object' ? event.payload : JSON.parse(event?.payload || '{}'); } catch (_) {}
+
     const tool = payload?.tool || null;
     const label = TOOL_LABELS[tool] || (tool ? `Agent: ${tool}` : `Agent phase: ${run.phase}`);
     const active = run.status === 'running';
     const terminalError = run.status === 'failed';
-    const status = terminalError ? STATES.ERROR : active ? _agentStatusForTool(tool) : (run.status === 'paused' ? STATES.PAUSED : STATES.IDLE);
-    const episode = run.episode_id ? { id: run.episode_id, episodeNumber: run.episode_number, seasonNumber: run.season_number } : null;
-    const eventId = event?.id || null;
-    if (active || terminalError || eventId !== _lastAgentEventId) {
-      _lastAgentEventId = eventId;
+    const status = terminalError
+      ? STATES.ERROR
+      : active
+        ? _agentStatusForTool(tool)
+        : (run.status === 'paused' ? STATES.PAUSED : STATES.IDLE);
+
+    const episodeId = run.episode_id || run.episode_row_id || null;
+    const episodeNumber = run.episode_number ?? run.episode_row_number ?? null;
+    const seasonNumber = run.season_number ?? run.episode_row_season ?? null;
+    const episode = episodeId ? {
+      id: episodeId,
+      title: run.storyline_title ? `${run.storyline_title} S${seasonNumber || 1}E${episodeNumber || 0}` : '',
+      episodeNumber,
+      seasonNumber,
+      draftEpisodeId: episodeId,
+    } : null;
+
+    const fingerprint = `${run.id}:${run.status}:${event?.id || 0}:${run.updated_at || ''}`;
+    if (active || terminalError || fingerprint !== _lastAgentFingerprint) {
+      _lastAgentFingerprint = fingerprint;
       _state.status = status;
       _state.currentEpisode = episode;
       _state.runStartedAt = active ? (run.started_at ? new Date(run.started_at).toISOString() : _state.runStartedAt) : null;
       _state.progress = { current: active ? 1 : 0, total: active ? 1 : 0, label: terminalError ? 'Agent failed' : label };
       if (terminalError) _state.lastError = { message: payload?.result?.error || 'Autonomous agent run failed', at: new Date().toISOString() };
+      if (!terminalError && !active) _state.lastError = null;
       emitter.emit('update', getState());
     }
   } catch (_) {
