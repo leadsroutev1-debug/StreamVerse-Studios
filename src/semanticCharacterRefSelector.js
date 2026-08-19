@@ -41,6 +41,10 @@ class CharacterReferenceIntegrityError extends Error {
     this.repairTriggered = !!repairPromise;
     this.repairPromise = repairPromise;
     this.retryable = true;
+    // The reference repair, not the LLM director, owns this recovery path.
+    // Prevent generic shot repair from rewriting a perfectly valid shot while
+    // the missing canonical identity asset is being regenerated.
+    this.skipDirectorRepair = true;
   }
 }
 
@@ -79,7 +83,6 @@ function scoreAngle(angle, shot, char, stagingRow, previousSelection = null) {
   const action = textOf(shot?.dialogue_or_action, shot?.pose_state, stagingRow?.pose, stagingRow?.action, shot?.image_prompt);
   const facing = textOf(stagingRow?.facing, stagingRow?.eyeline, shot?.character_positions);
   const speaker = textOf(shot?.dialogue_or_action, shot?.speaker, shot?.speaking_character);
-  const combined = `${framing} | ${camera} | ${action} | ${facing}`;
 
   let score = 0;
   const reasons = [];
@@ -215,6 +218,12 @@ function triggerCanonicalReferenceRepair(character, missingAngles = []) {
     if (stillMissing.length) {
       throw new CharacterReferenceIntegrityError(character.name, stillMissing);
     }
+
+    // The shot pipeline retains the same in-memory character objects across
+    // retry attempts. Mutate that object with the repaired canonical fields so
+    // the very next retry sees the new angle URLs without requiring a full cast
+    // reload from MySQL.
+    if (repairedCharacter) Object.assign(character, repairedCharacter);
 
     console.log(`[ReferenceSelector] ✓ Canonical reference repair completed for ${character.name}`);
     return repairedCharacter;
