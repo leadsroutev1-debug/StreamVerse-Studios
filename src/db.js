@@ -419,7 +419,10 @@ async function initSchema() {
     );
     if (!exists) {
       try { await execute(ddl); console.log(`[DB] Added column ${table}.${col}`); }
-      catch (e) { console.warn(`[DB] Could not add ${table}.${col}:`, e.message); }
+      catch (e) {
+        console.error(`[DB] CRITICAL schema migration failed for ${table}.${col}:`, e.message);
+        throw Object.assign(new Error(`Required schema migration failed for ${table}.${col}: ${e.message}`), { code:'DB_SCHEMA_MIGRATION_FAILED', cause:e });
+      }
     }
   }
 

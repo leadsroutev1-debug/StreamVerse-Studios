@@ -170,7 +170,8 @@ async function simulateEpisodeScenes({ episode_id } = {}) {
   if (!complete) {
     return {ok:false,pending:true,reason:'Episode scene simulation is not complete',simulation:current,expected_scene_count:expected,actual_scene_count:scenePlan.length};
   }
-  return {ok:true,simulation:current};
+  await db.execute(`UPDATE episodes SET status='scenes_simulated', scene_count=?, updated_at=NOW() WHERE id=?`, [scenePlan.length, episode.id]);
+  return {ok:true,simulation:current,scene_count:scenePlan.length,status:'scenes_simulated'};
 }
 
 async function writeEpisodeBlueprintAndShotSimulation({ episode_id } = {}) {
@@ -204,7 +205,11 @@ async function writeEpisodeBlueprintAndShotSimulation({ episode_id } = {}) {
   });
   const payload={...finalScript,checkpoint_state:{...(finalScript.checkpoint_state||{}),stage:'shot_writing',updated_at:new Date().toISOString()}};
   await db.execute(`UPDATE episodes SET script=?,scene_count=?,shot_count=?,updated_at=NOW() WHERE id=?`,[JSON.stringify(payload),Array.isArray(payload.scenes)?payload.scenes.length:0,Array.isArray(payload.shot_simulation?.shots)?payload.shot_simulation.shots.length:0,episode.id]);
-  return {ok:true,script:payload,scene_count:payload.scenes?.length||0,shot_count:payload.shot_simulation?.shots?.length||0};
+  const sceneCount = payload.scenes?.length || 0;
+  const shotCount = payload.shot_simulation?.shots?.length || 0;
+  if (!sceneCount || !shotCount) throw new Error(`Script/shot simulation incomplete: scenes=${sceneCount}, shots=${shotCount}`);
+  await db.execute(`UPDATE episodes SET status='script_ready', scene_count=?, shot_count=?, updated_at=NOW() WHERE id=?`, [sceneCount, shotCount, episode.id]);
+  return {ok:true,script:payload,scene_count:sceneCount,shot_count:shotCount,status:'script_ready'};
 }
 
 function flattenShots(script) {
@@ -216,11 +221,24 @@ async function prepareShotRows({ episode_id } = {}) {
   if (!episode) throw new Error('Episode not found');
   const script = json(episode.script, {});
   const shots = flattenShots(script);
+  const simulatedShots = Array.isArray(script.shot_simulation?.shots) ? script.shot_simulation.shots : [];
+  const expectedShots = simulatedShots.length;
+  if (!expectedShots) {
+    return {ok:false,pending:true,reason:'Shot simulation is empty; prepare_shot_rows cannot manufacture production work',expected_shots:0,shots:0};
+  }
+  if (shots.length !== expectedShots) {
+    return {ok:false,pending:true,reason:`Shot materialization mismatch: ${shots.length}/${expectedShots}`,expected_shots:expectedShots,shots:shots.length};
+  }
   for (const shot of shots) {
     await db.execute(`INSERT INTO shots (id,episode_id,scene_number,shot_index,status) VALUES (?,?,?,?,?) ON DUPLICATE KEY UPDATE updated_at=NOW()`,[randomUUID(),episode_id,Number(shot.scene_number),Number(shot.shot_index),'pending']);
   }
-  await db.execute(`UPDATE episodes SET shot_count=? WHERE id=?`,[shots.length,episode_id]);
-  return {ok:true,shots:shots.length};
+  await db.execute(`UPDATE episodes SET shot_count=?, status='shots_ready', updated_at=NOW() WHERE id=?`,[shots.length,episode_id]);
+  const persisted = await db.queryOne(`SELECT COUNT(*) AS count FROM shots WHERE episode_id=?`, [episode_id]);
+  const persistedCount = Number(persisted?.count || 0);
+  if (persistedCount !== shots.length) {
+    return {ok:false,pending:true,reason:`Shot persistence verification failed: ${persistedCount}/${shots.length}`,expected_shots:shots.length,persisted_shots:persistedCount};
+  }
+  return {ok:true,shots:shots.length,persisted_shots:persistedCount,status:'shots_ready'};
 }
 
 async function generateMedia({ episode_id, scene_number = null, shot_index = null } = {}) {

@@ -195,6 +195,9 @@ function buildTools({ storylineId, episodeId, runId }) {
       const w = Object.entries(where||{});
       const u = Object.entries(updates||{});
       if (!w.length || !u.length) throw new Error('db_update_fields requires non-empty where and updates');
+      if (['episodes','shots','storylines'].includes(table) && u.some(([c]) => c === 'status')) {
+        throw Object.assign(new Error(`Direct status mutation is forbidden for ${table}; use the validated production tool for the owning transition.`), { code:'AGENT_STATUS_MUTATION_FORBIDDEN' });
+      }
       const sql = `UPDATE ${table} SET ${u.map(([c])=>`${c}=?`).join(', ')} WHERE ${w.map(([c])=>`${c}=?`).join(' AND ')}`;
       const result = await db.execute(sql,[...u.map(([,v])=>v),...w.map(([,v])=>v)]);
       return {ok:true,affectedRows:result.affectedRows || 0};
@@ -1037,7 +1040,7 @@ async function runProductionAgent({ storyline = null, episode = null, maxSteps =
   let lastDecision = null;
   let lastToolFingerprint = null;
   let blockedAfterFailure = false;
-  const diagnosticTools = new Set(['production_state','classify_error','trace_root_cause','diagnose_provider_failure','validate_all_invariants','find_stuck_work','find_invalid_transitions','find_orphaned_work','find_skipped_work','find_out_of_order_work','detect_retry_loop','detect_timeout_loop','detect_rate_limit_loop','detect_provider_degradation','build_recovery_plan','checkpoint_production']);
+  const diagnosticTools = new Set(['production_state','classify_error','trace_root_cause','diagnose_provider_failure','validate_all_invariants','find_stuck_work','find_invalid_transitions','find_orphaned_work','find_skipped_work','find_out_of_order_work','detect_retry_loop','detect_timeout_loop','detect_rate_limit_loop','detect_provider_degradation','build_recovery_plan']);
   const productionToolNames = new Set(['initialize_series','simulate_season','ensure_episode_draft','simulate_episode_scenes','write_episode_script','prepare_shot_rows','generate_episode_media','compile_episode','validate_episode','publish_episode']);
   try {
     for (let step = 0; step < limit; step++) {
