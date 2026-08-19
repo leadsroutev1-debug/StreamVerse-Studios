@@ -54,7 +54,6 @@ function wrapProductionTools(original) {
   if (wrapped) return wrapped;
   const out = { ...original };
   const db = previousLoad(path.join(__dirname, 'db.js'), module, false);
-  const pipeline = previousLoad(path.join(__dirname, 'pipeline.js'), module, false);
 
   const originalInitialize = original.initializeSeries;
   out.initializeSeries = async (args = {}) => {
@@ -84,6 +83,8 @@ function wrapProductionTools(original) {
     if (!refs.ok) {
       console.log(`[ProductionGuard] CHARACTER_REFERENCE_INCOMPLETE — targeted canonical-angle regeneration before season simulation (${refs.missing.length} missing).`);
       try {
+        // Lazy-load to avoid a preload-time circular dependency with agentOrchestrator.
+        const pipeline = previousLoad(path.join(__dirname, 'pipeline.js'), module, false);
         if (typeof pipeline.ensureCharacterConsistency !== 'function') throw new Error('Character consistency engine is not available');
         await pipeline.ensureCharacterConsistency(storylineId);
       } catch (err) {
