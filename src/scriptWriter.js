@@ -1,0 +1,4012 @@
+'use strict';
+/**
+ * StreamVerse Studios — AI Director & Writer Engine
+ *
+ * Mistral acts as a genuine auteur director. Every decision — framing, light,
+ * pacing, colour, performance — exists to serve THEME and EMOTION, not just
+ * plot mechanics. The output must read like it came from a person who has
+ * watched 10,000 films and knows exactly why each shot works.
+ *
+ * ── Cast-First Architecture ──
+ * Before any episode is written, the pipeline calls writeSeriesSummary() to
+ * simulate the entire show internally, then writeCastBible() to generate and
+ * lock every character with: visual metadata + seed, Deepgram voice ID, and
+ * a permanent visual anchor. Characters are the foundational layer — episodes
+ * reference locked cast metadata, never re-derive identity.
+ */
+const axios  = require('axios');
+const config = require('./config');
+const { safeJsonParse } = require('./util');
+const globalContinuity = require('./globalContinuity');
+const db = require('./db');
+const shotStaging = require('./shotStaging');
+// FIX (2025-08-18): _ensureSpeechForScene() and _writeSceneShotsSequential()
+// both call ttsGen.extractStrictSpokenDialogue(...) to validate that a scene's
+// realized shots contain actual spoken dialogue. This module never imported
+// ttsGen, causing a ReferenceError at runtime the first time a scene with
+// characters_present reached that validation step (see pipeline crash log:
+// "ReferenceError: ttsGen is not defined" at scriptWriter.js:2340 / :2880-2881).
+const ttsGen = require('./ttsGen');
+
+// Bounded semantic retries. Provider-level retries happen inside callLLM; these
+// retries handle structurally valid but semantically invalid scene shot sequences.
+const SCENE_SHOT_MAX_ATTEMPTS = Math.max(1, Math.min(5, Number(process.env.SCENE_SHOT_MAX_ATTEMPTS || 3)));
+const SCENE_REPAIR_MAX_ATTEMPTS = Math.max(1, Math.min(3, Number(process.env.SCENE_REPAIR_MAX_ATTEMPTS || 2)));
+const SCENE_RETRY_BASE_DELAY_MS = Math.max(250, Number(process.env.SCENE_RETRY_BASE_DELAY_MS || 1200));
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Deepgram Aura voice pools — human-like, expressive voices
+// Assigned at cast creation and locked per-character for all episodes.
+// ─────────────────────────────────────────────────────────────────────────────
+const FEMALE_VOICES = [
+  'aura-athena-en',    // clear, articulate, professional — best for leads
+  'aura-stella-en',    // bright, expressive, emotive
+  'aura-luna-en',      // soft, intimate, warm — good for quiet/internal moments
+  'aura-hera-en',      // confident, authoritative — good for antagonists
+];
+const MALE_VOICES = [
+  'aura-helios-en',    // clear, warm, conversational — best for leads
+  'aura-orion-en',     // deep, calm, trustworthy
+  'aura-arcas-en',     // natural, smooth, neutral
+  'aura-zeus-en',      // deep, authoritative — good for antagonists/authority
+];
+
+/**
+ * Derive a stable integer hash from a string (character name).
+ * Used for both voice selection and image generation seed.
+ */
+function _nameHash(name) {
+  if (!name) return 0;
+  let h = 5381;
+  for (let i = 0; i < name.length; i++) {
+    h = ((h << 5) + h) ^ name.charCodeAt(i);
+    h = h >>> 0;
+  }
+  return h;
+}
+
+/**
+ * Assign a deterministic Deepgram voice ID to a character based on gender + name hash.
+ * Same character → same voice across all episodes. Different characters → different voices.
+ */
+function assignVoiceForCharacter(character) {
+  const gender = (character.gender || character.visual_profile?.gender || '').toLowerCase();
+  const pool = gender === 'male' ? MALE_VOICES
+             : gender === 'female' ? FEMALE_VOICES
+             : FEMALE_VOICES;
+  const idx = _nameHash(character.name) % pool.length;
+  return pool[idx];
+}
+
+/**
+ * Derive a deterministic image generation seed for a character.
+ * The seed is what makes the CF worker produce the exact same person every time.
+ */
+function assignSeedForCharacter(character) {
+  return _nameHash(character.name) % 9999999;
+}
+
+/**
+ * Derive a deterministic shot-level seed from episode + scene + shot indices.
+ * Used for non-character shots (environments, inserts) so the same shot
+ * description produces a consistent image across retries.
+ */
+function assignShotSeed(episodeNumber, sceneNumber, shotIndex) {
+  return ((episodeNumber * 1000 + sceneNumber) * 100 + shotIndex) % 9999999;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FFmpeg Effects & Tools Catalog — injected into every script prompt so the
+// LLM knows exactly which cinematic effects, transitions, and layouts it can
+// request. The pipeline maps these names directly to the FFmpeg service.
+// ─────────────────────────────────────────────────────────────────────────────
+// The active video backend name is read once at startup from config.videoProvider
+// (LTX by default; Magic Hour only when VIDEO_PROVIDER=magichour) so this prompt
+// text always matches whichever model is actually generating the clips.
+const _VIDEO_BACKEND_NAME =
+  config.videoProvider === 'magichour' ? 'Magic Hour' : 'LTX';
+
+const FFMPEG_EFFECTS_CATALOG = `
+═══ VIDEO EFFECTS (handled by ${_VIDEO_BACKEND_NAME} — NOT FFmpeg) ═══
+
+All visual effects — motion, color grading, overlays, atmospheric styling — are
+applied during video generation by ${_VIDEO_BACKEND_NAME}'s AI model. The FFmpeg
+service is used ONLY for basic concatenation of clips and simple fade transitions
+between scenes during final merge.
+
+DO NOT specify any of the following in your script:
+  - "clip_motion_effect", "clip_color_grade", "clip_overlays" (removed — ${_VIDEO_BACKEND_NAME} handles these)
+  - "ffmpeg_effects" block (removed — no longer needed)
+  - "composition" layout (removed — all scenes use basic "cut" concatenation)
+
+The visual style of each shot is conveyed through the "image_prompt" field, which
+${_VIDEO_BACKEND_NAME}'s video model interprets during generation. Focus on describing the
+cinematic look, camera movement, lighting, and atmosphere in the image_prompt.`;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Multi-Scene Narrative Continuity Schema
+// Enforces character memory, location stability, and temporal coherence
+// across all scenes in an episode. Injected into every episode script prompt.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const NARRATIVE_CONTINUITY_SCHEMA = `
+═══ MULTI-SCENE NARRATIVE CONTINUITY SCHEMA (mandatory — violations break the story) ═══
+
+You are writing a SEQUENTIAL, COHERENT story. Scenes are NOT independent units — each one
+is a direct continuation of the last. Apply this schema before writing any scene:
+
+You will receive a "narrative_context_history" array containing the previous scenes' shot
+configurations, locations, emotional states, and image prompts. You MUST read this history
+before writing the next scene. Consecutive visual scenes must maintain ABSOLUTE contextual
+progression — no overlapping concepts, no mixed environmental concepts, no teleporting
+characters. Each scene builds on what the last established.
+
+SCENE HANDOFF RULES (apply between every scene):
+  1. LOCATION CONTINUITY — if Scene 2 starts in a different location from Scene 1, you must
+     show or imply the transition. Characters do not teleport. Time must pass or movement must occur.
+  2. CHARACTER MEMORY — every character remembers everything that happened in all prior scenes
+     of THIS episode. They cannot "forget" a revelation, conflict, or emotional moment just
+     because the scene changed. Reference what was said or done earlier through body language,
+     dialogue subtext, or physical reaction.
+  3. EMOTIONAL STATE CARRY-FORWARD — a character's emotional state at the end of Scene N is
+     their STARTING emotional state in Scene N+1 (unless time has passed, in which case explain
+     why they have shifted). Never reset a character to neutral between scenes.
+  4. OBJECT AND PROP CONTINUITY — if a character is holding something, wearing something, or
+     has been physically injured, that persists. A glass of wine doesn't vanish between shots.
+     A bloody lip stays bloody until tended to.
+  5. TIME COHERENCE — establish whether consecutive scenes are simultaneous (parallel action),
+     immediately sequential, or have a time gap. If a time gap exists, signal it: "LATER",
+     "THAT NIGHT", "THREE HOURS LATER" in the scene_description.
+  6. NO CONCEPT OVERLAP — do not repeat the same visual concept, framing, or environmental
+     setup in consecutive scenes. Each scene must introduce a NEW visual idea or evolve the
+     previous one. If Scene 1 was a tight close-up in a lab, Scene 2 must change angle,
+     distance, or location — never repeat the same composition.
+
+DIALOGUE MANDATE (absolute — zero exceptions):
+  Every character-led scene must contain at least one meaningful audible speech beat. Characters should
+  receive spoken dialogue whenever the scene naturally supports it; when spoken dialogue would be
+  unnatural, use a contextual internal voice-over from a character present in the scene. If a character
+  is silent in a particular shot, describe what they visibly do — never turn that action into quoted text.
+
+QUOTATION MARKS = SPOKEN WORDS ONLY (absolute — never violate this):
+  QUOTATION MARKS may contain ONLY words that a human actor would literally say out loud.
+  Examples that are VALID:
+    DR. JANE: "I know what happened."
+    DR. JANE: "Wait." (voice barely above a whisper, eyes fixed on the phone)
+  Examples that are INVALID and MUST NEVER be produced:
+    "Dr. Jane looks at her phone"
+    "She looks frightened"
+    "Dr. Jane turns toward the door"
+    "Her hands tremble"
+    "(nervous)"
+    "camera slowly pushes in"
+  Actions, emotions, expressions, posture, movement, subtext, tone notes, environment, and camera
+  language are ALWAYS written as ordinary unquoted prose. A silent/action shot therefore contains
+  no quotation marks at all. The video/audio model may voice quoted material, so quoting an action
+  is functionally equivalent to telling an actor to say that action aloud.
+
+INTERNAL MONOLOGUE: use tts_mode=internal_monologue and write NAME (V.O.): exact thought words
+without quotation marks when that thought is intentionally audible. The thought must remain clearly
+identified as voice-over so LTX does not confuse it with narration or visible action.
+
+
+CLIFFHANGER HOOK MANDATE (final scene only):
+  The LAST scene of EVERY episode must end with an intense, narrative Cliffhanger Hook.
+  The hook must:
+    a) Introduce an irresolvable threat, revelation, or impossible choice at maximum tension.
+    b) Directly create the desire to see the next episode IMMEDIATELY.
+    c) End on an unresolved note — DO NOT resolve what the hook opens.
+    d) Be reflected in the final shot's "dialogue_or_action" field — the last spoken line or
+       action must BE the hook, not narrate it.
+`;
+
+/**
+ * Dynamic Contextual Pacing Rules — replaces the old static-time-block system.
+ * Shot durations are calculated from spoken text length, narrative complexity,
+ * semantic/environmental context, and temporal progression. LTX shots target 8–10 seconds.
+ */
+const PACING_RULES = `
+═══ SEMANTIC LTX SHOT RULES (mandatory) ═══
+
+You are directing for LTX-2.3. Every shot MUST fit the provider's temporal canvas and MUST be planned at 6–10 seconds, never above 10 seconds. The duration is decided by the pre-generation shot simulation and then treated as locked production metadata.
+
+Every shot is a COMPLETE MICRO-SCENE, not a split idea. Design a visible temporal arc inside the shot: setup/state → development/change → meaningful visual outcome. The environment is an active storytelling element, not wallpaper. Weather, light, objects, distant activity, room details, spatial relationships, time-of-day cues, or environmental changes should reinforce the episode's current narrative meaning.
+
+DURATION RULES (simulation-owned):
+  1. The shot simulation MUST assign a concrete duration from 6.0 to 10.0 seconds.
+  2. Use the full 10 seconds when the shot needs dialogue, reaction, camera travel, environmental reveal, or a richer causal beat; use 6–8 seconds for simpler beats.
+  3. Spoken duration is one planning input, not a text-truncation rule. Never shorten, clip, summarize, or rewrite spoken words merely to fit a duration. If the line is too dense for the selected duration, the simulation must choose a better duration within 6–10 seconds or split the dramatic beat into another shot.
+  4. Downstream rendering must NOT recalculate or silently rewrite the simulated duration.
+
+SEMANTIC DENSITY RULES:
+  - Never create a shot whose only meaningful content is a character saying one sentence. Let the environment reveal, react, constrain, foreshadow, or contextualize the dialogue.
+  - Use the beginning of the shot to establish the visible state, the middle to develop the emotional/physical event, and the ending to land on a readable story image.
+  - A silent environmental beat can be as important as a character beat: a phone vibrating on a table, a storm approaching the windows, a hallway light failing, distant emergency lights washing across the room, a kettle reaching a boil, or a door left open into an unexpected space — always tied to this episode's actual context.
+  - Do not pad. Every second must contain meaningful visual information or meaningful anticipation.
+
+END-FRAME CONTINUITY RULES:
+  - Every shot MUST end on a deliberate visual state that creates a meaningful handoff into the next shot.
+  - Use one of these contextual handoff ideas when appropriate: match-on-action, eyeline continuation, object/prop match, environmental movement, sound-led bridge, spatial reveal, lighting change, time shift, or a purposeful hard cut.
+  - Describe the handoff as something visible or audible in the story world, never as an instruction to an editor.
+  - The next shot must clearly inherit at least one fact from the previous shot's end state: gaze direction, body position, prop position, environmental change, sound source, lighting state, spatial discovery, or unresolved action.
+  - Avoid generic "cut to next shot" language. The handoff description should explain WHY the next image feels causally connected.
+
+SHOT COUNT:
+  Let semantic completeness decide shot count. Fewer, richer 8–10 second shots are preferred over many thin 2–4 second fragments.
+
+OPENING:
+  The first scene should still establish a compelling hook, but the hook must be a rich 8–10 second visual event, not a 2-second montage fragment.
+
+INTER-SCENE HOOK:
+  End each scene with a meaningful unresolved visual or narrative turn that can live inside the full temporal canvas: revelation, decision, threat, silence, reversal, arrival, discovery, or environmental change.
+
+FORBIDDEN:
+  - Do not use 4–5 second fallback durations for LTX shots. The simulation contract is 6–10 seconds, with 10 seconds as the hard ceiling.
+  - Do not make every shot a close-up of a speaking character. Use environment, objects, architecture, background action, and spatial geography.
+  - Do not repeat the same environmental detail across consecutive shots unless continuity requires it.
+`;
+
+const DIRECTOR_PERSONA = `You are the lead director and showrunner for StreamVerse Studios.
+
+Your directorial identity is a synthesis of:
+- Barry Jenkins' emotional intimacy and painterly frames (Moonlight, If Beale Street Could Talk)
+- Park Chan-wook's formal precision and thematic obsession (Oldboy, The Handmaiden)  
+- Shonda Rhimes' addictive plot architecture and character voice (Grey's Anatomy, Scandal)
+- Wong Kar-wai's non-linear atmosphere and time as an emotional texture (In the Mood for Love)
+- Ryan Coogler's cultural specificity and kinetic energy (Black Panther, Fruitvale Station)
+
+Your rules as a director:
+1. THEME first. Every shot, line, and lighting choice must serve the episode's central theme.
+2. The camera is a character. Where it looks, how it moves, and what it refuses to show are directorial choices.
+3. Emotion over event. What a character FEELS in a moment matters more than what they DO.
+4. Subtext is the script. The best dialogue says one thing and means another.
+5. Colour is language. Every palette decision is a statement about internal states.
+6. Silence and stillness are as powerful as action and noise.
+7. The audience should feel something uncomfortable, true, and specific — not safe or generic.
+8. DIALOGUE IS A PRIMARY DRAMATIC ENGINE. These movies should be highly engaging and
+   dialogue-forward: characters should speak frequently when the scene naturally supports it.
+   Prefer meaningful exchanges, objections, revelations, questions, interruptions, confessions,
+   decisions, and subtext over long stretches of people silently staring. Do not force dialogue
+   into shots that are genuinely visual or atmospheric, but do not underwrite dialogue merely
+   to keep scenes short. The audience should learn, feel, or anticipate something through what
+   characters say. Every scene should contain substantive spoken dialogue whenever its context
+   supports a speaking character, while still giving the environment and physical action room
+   to carry story.
+9. MULTI-CHARACTER DIALOGUE IS ALLOWED IN THE SAME SHOT. LTX can receive the complete
+   composition plus multiple speaker lines in chronological order. Do NOT split a natural exchange
+   merely to force one speaker per shot. When two or more characters speak in one shot, identify every
+   visible speaker, give each a precise screen position and role, and keep their spoken lines in
+   chronological order. The still image remains one frozen instant; spoken words belong only to
+   dialogue_or_action and the downstream LTX prompt.
+
+You always respond with valid JSON only.`;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MULTI-SPEAKER LTX DIALOGUE — hard continuity/staging rules injected into every script prompt
+// ─────────────────────────────────────────────────────────────────────────────
+const MULTI_SPEAKER_LTX_RULES = `
+═══ MULTI-SPEAKER LTX DIALOGUE ═══
+
+Multiple characters MAY speak in the same shot when the scene naturally supports a shared composition.
+Do not split an exchange merely because more than one person has dialogue.
+
+1. SPEAKER ORDER
+   - Keep every spoken line in chronological order.
+   - Each spoken line must identify the character who says it.
+   - Actual audible words use quotation marks; staging, emotion and actions remain unquoted.
+
+2. VISUAL STAGING — MASTER SPATIAL CONTRACT
+   - characters_in_shot must include every visible speaking and listening character.
+   - character_staging must contain exactly one row for every visible character. Each row must specify:
+     screen_position, depth, facing/facing_toward, action/observable_action, pose, eyeline/gaze,
+     interaction, speaking, and a short visual_identity disambiguator.
+   - Build the frozen opening image from character_staging. The image_prompt must visibly realize the exact
+     same screen position, depth, pose, eyeline, facing direction and interaction for every character.
+   - The downstream LTX prompt MUST reuse this same character_staging map. Do not invent a second spatial layout.
+   - character_positions is only a readable summary of character_staging and must mention every visible character.
+
+3. CONTINUITY
+   - start_frame_state is the exact opening visual state of the shot.
+   - end_frame_state is the exact terminal visual state at the shot's final frame.
+   - A continuation shot must begin from the previous shot's terminal pose, screen geography, hands/props,
+     gaze, expression, lighting and framing before any new movement begins.
+   - When the context genuinely changes, establish the new geography and causal transition; characters do not teleport.
+
+4. STILL / VIDEO BOUNDARY
+   - image_prompt = one exact frozen visual opening frame.
+   - dialogue_or_action, subject_motion, camera_movement, end-frame progression and ambience belong downstream.
+   - Only spoken words are quoted. All descriptive staging remains unquoted.
+`;
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LLM transport helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function _mistralPost(systemPrompt, userPrompt, maxTokens, key, temperature = 0.92) {
+  const resp = await axios.post(
+    'https://api.mistral.ai/v1/chat/completions',
+    {
+      model:           'mistral-large-latest',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user',   content: userPrompt   },
+      ],
+      temperature,
+      response_format: { type: 'json_object' },
+    },
+    {
+      headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+      timeout: 600000,
+    }
+  );
+  const choice = resp.data?.choices?.[0];
+  return { content: choice?.message?.content, finishReason: choice?.finish_reason };
+}
+
+async function _mistralStream(systemPrompt, userPrompt, maxTokens, key, temperature = 0.92) {
+  const resp = await axios.post(
+    'https://api.mistral.ai/v1/chat/completions',
+    {
+      model:           'mistral-large-latest',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user',   content: userPrompt   },
+      ],
+      temperature,
+      response_format: { type: 'json_object' },
+      stream:          true,
+    },
+    {
+      headers:      { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+      timeout:      600000,
+      responseType: 'stream',
+    }
+  );
+
+  return new Promise((resolve, reject) => {
+    let fullContent  = '';
+    let finishReason = null;
+    let buf          = '';
+
+    resp.data.on('data', (chunk) => {
+      buf += chunk.toString();
+      const lines = buf.split('\n');
+      buf = lines.pop();
+
+      for (const line of lines) {
+        const t = line.trim();
+        if (!t || !t.startsWith('data: ')) continue;
+        const payload = t.slice(6).trim();
+        if (payload === '[DONE]') continue;
+        try {
+          const parsed = JSON.parse(payload);
+          const delta  = parsed.choices?.[0]?.delta?.content;
+          if (delta) fullContent += delta;
+          const fr = parsed.choices?.[0]?.finish_reason;
+          if (fr) finishReason = fr;
+        } catch (_) { /* partial chunk — skip */ }
+      }
+    });
+
+    resp.data.on('end', () =>
+      resolve({ content: fullContent, finishReason: finishReason || 'stop' }));
+    resp.data.on('error', reject);
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LLM call — Mistral primary / Groq fallback, both with key rotation
+// ─────────────────────────────────────────────────────────────────────────────
+
+function _retryDelayMs(err, fallbackMs = 1200) {
+  const retryAfter = err?.response?.headers?.['retry-after'];
+  const seconds = Number.parseFloat(retryAfter);
+  if (Number.isFinite(seconds)) return Math.min(Math.max(seconds * 1000, 250), 30000);
+
+  const status = err?.response?.status;
+  if (status === 429) return 2500;
+  if (status >= 500) return fallbackMs;
+  if (['ECONNRESET', 'ECONNABORTED', 'ETIMEDOUT', 'EAI_AGAIN', 'ENETUNREACH'].includes(err?.code)) {
+    return fallbackMs;
+  }
+  return 0;
+}
+
+async function _sleepForRetry(err, fallbackMs = 1200) {
+  const delay = _retryDelayMs(err, fallbackMs);
+  if (delay > 0) {
+    console.warn(`[LLM] transient provider failure; waiting ${delay}ms before retry/rotation`);
+    await new Promise(resolve => setTimeout(resolve, delay));
+  }
+}
+
+async function callLLM(systemPrompt, userPrompt, maxTokens = undefined, opts = {}) {
+  // maxTokens is intentionally not forwarded to providers: application-level output caps are disabled.
+  const { useStream = false, temperature = 0.92 } = opts;
+  const requestChars = (systemPrompt?.length || 0) + (userPrompt?.length || 0);
+  const approxInputTokens = Math.ceil(requestChars / 4);
+  const timeoutMs = 600000;
+  if (requestChars > 40000) {
+    console.warn(`[LLM] LARGE REQUEST WARNING | inputChars=${requestChars} approxInputTokens=${approxInputTokens} maxOutputTokens=provider-default temperature=${temperature}`);
+  }
+  console.log(`[LLM] Structured completion: provider/model limits apply | inputChars=${requestChars} approxInputTokens=${approxInputTokens} maxOutputTokens=provider-default temperature=${temperature} timeoutMs=${timeoutMs}`);
+
+  const transientCodes = new Set(['ECONNRESET', 'ECONNABORTED', 'ETIMEDOUT', 'EAI_AGAIN', 'ENETUNREACH']);
+  const retrySameKey = async (err, provider, key, attempt, maxAttempts = 2) => {
+    if (attempt >= maxAttempts) return false;
+    const status = err?.response?.status;
+    const code = err?.code;
+    const delay = _retryDelayMs(err, attempt === 1 ? 1000 : 2000);
+    console.warn(`[LLM] ${provider} failure on current key (${code || `HTTP ${status || 'unknown'}`}); ` +
+      `retry ${attempt + 1}/${maxAttempts} after ${delay}ms`);
+    if (delay) await new Promise(resolve => setTimeout(resolve, delay));
+    return true;
+  };
+
+  // PRIMARY: exhaust every Mistral key before handing the exact same request
+  // to Groq. No Mistral error is allowed to escape this loop prematurely.
+  for (let i = 0; i < config.mistralKeys.length; i++) {
+    const key = config.getNextMistralKey();
+    if (!key) continue;
+
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const requestStartedAt = Date.now();
+        console.log(`[LLM] Mistral request started | keyIndex=${i + 1}/${config.mistralKeys.length} attempt=${attempt}/2 stream=${useStream} inputChars=${requestChars} approxInputTokens=${approxInputTokens}`);
+        const { content, finishReason } = useStream
+          ? await _mistralStream(systemPrompt, userPrompt, maxTokens, key, temperature)
+          : await _mistralPost(systemPrompt, userPrompt, maxTokens, key, temperature);
+
+        if (!content) throw new Error('Empty Mistral response');
+        if (finishReason === 'length') {
+          const e = new Error('[LLM] Mistral provider truncated the response at its model limit');
+          e.llmTruncated = true;
+          throw e;
+        }
+
+        let parsed;
+        try {
+          parsed = JSON.parse(content);
+        } catch (jsonErr) {
+          throw new Error('[LLM] Mistral non-JSON: ' + jsonErr.message);
+        }
+
+        console.log(`[LLM] Mistral request succeeded | durationMs=${Date.now() - requestStartedAt} finishReason=${finishReason || 'n/a'} outputChars=${content.length}`);
+        config.markKeyStatus('mistral', key, 'active');
+        return parsed;
+      } catch (err) {
+        const durationMs = typeof requestStartedAt === 'number' ? Date.now() - requestStartedAt : undefined;
+        const status = err?.response?.status;
+        const code = err?.code;
+        const detail = err?.response?.data?.message ||
+          err?.response?.data?.error?.message ||
+          err?.message ||
+          'unknown Mistral error';
+        console.warn(`[LLM] Mistral request failed | durationMs=${durationMs ?? 'n/a'} inputChars=${requestChars} approxInputTokens=${approxInputTokens} status=${status || 'n/a'} code=${code || 'n/a'} detail=${detail}`);
+
+        // Authentication, quota, endpoint/model, malformed-request, schema,
+        // parse, truncation, and every other failure are key/request failures
+        // for this attempt. The request must never terminate before all
+        // configured Mistral keys have had their chance.
+        if (status === 401 || status === 402 || status === 403 || status === 429) {
+          config.markKeyStatus('mistral', key, status === 429 ? 'rate-limited' : 'exhausted');
+          console.warn(`[LLM] Mistral key failed (${status}), rotating...`);
+          await _sleepForRetry(err, 1500);
+          break;
+        }
+
+        if (await retrySameKey(err, 'Mistral', key, attempt)) continue;
+
+        config.markKeyStatus('mistral', key, 'exhausted');
+        console.warn(`[LLM] Mistral key exhausted after ${attempt}/2 attempts; rotating. ` +
+          `status=${status || 'n/a'} code=${code || 'n/a'} reason=${detail}`);
+        await _sleepForRetry(err, 1500);
+        break;
+      }
+    }
+  }
+
+  console.warn(`[LLM] All Mistral keys exhausted; falling back to Groq`);
+
+  // FALLBACK: once Mistral is exhausted, Groq is always attempted with the
+  // exact same structured request, including after unusual/unknown Mistral
+  // errors such as 404, 400, invalid JSON, truncation, or endpoint failures.
+  for (let i = 0; i < config.groqKeys.length; i++) {
+    const key = config.getNextGroqKey();
+    if (!key) continue;
+
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const requestStartedAt = Date.now();
+        console.log(`[LLM] Groq request started | keyIndex=${i + 1}/${config.groqKeys.length} attempt=${attempt}/2 inputChars=${requestChars} approxInputTokens=${approxInputTokens}`);
+        const resp = await axios.post('https://api.groq.com/openai/v1/chat/completions', {
+          model: config.groqModel,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt },
+          ],
+          temperature,
+              response_format: { type: 'json_object' },
+        }, {
+          headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+          timeout: 600000,
+        });
+
+        const choice = resp.data?.choices?.[0];
+        const content = choice?.message?.content;
+        if (!content) throw new Error('Empty Groq response');
+        if (choice.finish_reason === 'length') {
+          const e = new Error('[LLM] Groq provider truncated the response at its model limit');
+          e.llmTruncated = true;
+          throw e;
+        }
+
+        let parsed;
+        try {
+          parsed = JSON.parse(content);
+        } catch (jsonErr) {
+          throw new Error('[LLM] Groq non-JSON: ' + jsonErr.message);
+        }
+
+        console.log(`[LLM] Groq request succeeded | durationMs=${Date.now() - requestStartedAt} finishReason=${choice.finish_reason || 'n/a'} outputChars=${content.length}`);
+        config.markKeyStatus('groq', key, 'active');
+        return parsed;
+      } catch (err) {
+        const durationMs = typeof requestStartedAt === 'number' ? Date.now() - requestStartedAt : undefined;
+        const status = err?.response?.status;
+        const code = err?.code;
+        const detail = err?.response?.data?.error?.message ||
+          err?.response?.data?.message ||
+          err?.message ||
+          'unknown Groq error';
+        console.warn(`[LLM] Groq request failed | durationMs=${durationMs ?? 'n/a'} inputChars=${requestChars} approxInputTokens=${approxInputTokens} status=${status || 'n/a'} code=${code || 'n/a'} detail=${detail}`);
+
+        if (status === 401 || status === 402 || status === 403 || status === 429) {
+          config.markKeyStatus('groq', key, status === 429 ? 'rate-limited' : 'exhausted');
+          console.warn(`[LLM] Groq key failed (${status}), rotating...`);
+          await _sleepForRetry(err, 1500);
+          break;
+        }
+
+        if (await retrySameKey(err, 'Groq', key, attempt)) continue;
+
+        config.markKeyStatus('groq', key, 'exhausted');
+        console.warn(`[LLM] Groq key exhausted after ${attempt}/2 attempts; rotating. ` +
+          `status=${status || 'n/a'} code=${code || 'n/a'} reason=${detail}`);
+        await _sleepForRetry(err, 1500);
+        break;
+      }
+    }
+  }
+
+  const e = new Error('[LLM] All Mistral and Groq keys exhausted');
+  e.llmExhausted = true;
+  throw e;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CAST-FIRST ARCHITECTURE
+//
+// Step 1: writeSeriesSummary() — simulate the full movie internally
+// Step 2: writeCastBible() — generate every character with metadata + seed + voice
+// Step 3: writeEpisodeScript() — uses locked cast + series summary as global context
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Step 1: Comprehensive Series Summary
+ *
+ * The master plan is generated once, but episode trajectories are generated in
+ * bounded, resumable chunks so a large series can never depend on one giant
+ * structured completion. The merged result remains one canonical
+ * full_story_simulation for every downstream stage.
+ */
+async function writeSeriesSummary(
+  genre,
+  {
+    episodesPerSeason = 8,
+    seasonsPerSeries = 4,
+    initialSimulation = null,
+    onCheckpoint = null,
+    generateEpisodeTrajectories = false,
+  } = {}
+) {
+  const systemPrompt = `${DIRECTOR_PERSONA}
+
+You are the showrunner planning a complete ${genre} series for StreamVerse Studios.
+Before a single episode is written, you must understand the ENTIRE series —
+every character, every arc, the beginning and the ending. This is the master
+document that governs all episode generation.
+
+Do NOT generate episode-by-episode trajectories in this completion. They will be
+generated separately in validated continuity chunks after the master plan is locked.`;
+
+  const userPrompt = `Create a comprehensive ${genre} series master plan.
+
+You must know exactly how the series begins and how it ends. Simulate the full
+story internally — every character's role, what they will be doing across the
+entire series, and how every thread resolves.
+
+Return JSON with these exact fields:
+{
+  "title": "Series title — distinctive, thematic, not generic",
+  "genre": "${genre}",
+  "logline": "One precise, emotionally devastating sentence capturing what the show is REALLY about",
+  "central_theme": "The philosophical or psychological question at the core of the entire series",
+  "tone_manifesto": "2-3 sentences describing the emotional register: how does this show feel?",
+  "visual_language": {
+    "primary_palette": "The dominant colour temperature and specific hues",
+    "recurring_motifs": ["3-5 visual symbols that repeat across episodes"],
+    "camera_philosophy": "How the camera moves and what that movement means emotionally"
+  },
+  "comprehensive_summary": "5-8 paragraph master summary of the ENTIRE series. Each paragraph covers one season. Be specific about what CHANGES in each character's inner life. This is the global context every episode writer will read before writing any episode. It must contain: the opening state of the world, how each season escalates, the central conflicts, the climax, and the resolution. Name every character and their role in the arc.",
+  "season_arcs": [
+    "Season 1 arc",
+    "Season 2 arc",
+    "Season 3 arc",
+    "Season 4 arc"
+  ],
+  "full_story_simulation": {
+    "opening_state": "",
+    "inciting_event": "",
+    "season_endpoints": [
+      {
+        "season": 1,
+        "beginning": "",
+        "turning_points": ["","",""],
+        "ending": ""
+      }
+    ],
+    "episode_trajectory": [],
+    "finale_resolution": "",
+    "unresolved_threads": []
+  },
+  "character_bible": [
+    {
+      "name": "Character name",
+      "role": "protagonist|antagonist|supporting",
+      "gender": "male|female",
+      "description": "Their psychology, wound, desire, fear, and the contradiction they live in",
+      "arc": "Where they begin emotionally vs where they end 4 seasons later",
+      "performance_note": "One sentence a director would whisper to the actor",
+      "visual_profile": {
+        "gender": "male|female",
+        "hair": "Exact shade, texture, length, style",
+        "eyes": "Exact colour, shape, intensity",
+        "skin": "Exact tone, undertone, texture",
+        "build": "Height, frame, posture",
+        "signature_clothing": "Their default aesthetic and one signature piece",
+        "distinguishing_features": "Specific marks, mannerisms, or physical tells"
+      }
+    }
+  ],
+  "engagement_hook": "The single existential question the audience will argue about",
+  "premiere_announcement": "The Discord/social post copy announcing this series premiere — maximum hype. 2-3 sentences + 6-8 hashtags."
+}
+
+Generate 4-6 main characters. Generate EVERY character the series needs — protagonist,
+antagonist, and supporting cast. Each character must have a clear role in the full series arc.
+
+There are ${seasonsPerSeries} seasons with ${episodesPerSeason} episodes each.
+Populate exactly ${seasonsPerSeries} season_endpoints. Leave episode_trajectory as an
+empty array; it is filled in continuity-preserving chunks immediately after this
+master response is validated.
+
+Make every field specific and surprising — no generic TV tropes.`;
+
+  let result;
+  let sim;
+  const stored = initialSimulation && typeof initialSimulation === 'object' ? initialSimulation : null;
+
+  if (stored?.season_endpoints?.length === seasonsPerSeries && stored?.opening_state) {
+    sim = stored;
+    result = {
+      title: stored.title || 'StreamVerse Series',
+      genre: stored.genre || genre,
+      logline: stored.logline || '',
+      central_theme: stored.central_theme || '',
+      tone_manifesto: stored.tone_manifesto || '',
+      visual_language: stored.visual_language || {},
+      comprehensive_summary: stored.comprehensive_summary || '',
+      plot_summary: stored.plot_summary || stored.comprehensive_summary || '',
+      season_arcs: stored.season_arcs || [],
+      character_bible: stored.character_bible || [],
+      engagement_hook: stored.engagement_hook || '',
+      premiere_announcement: stored.premiere_announcement || '',
+    };
+    console.log('[ScriptWriter] ↺ Resuming persisted master series simulation from DB checkpoint');
+  } else {
+    result = await callLLM(systemPrompt, userPrompt, 7000);
+    sim = result?.full_story_simulation;
+  }
+
+  const expectedEpisodes = seasonsPerSeries * episodesPerSeason;
+  if (!sim) {
+    throw new Error('[ScriptWriter] Full series simulation invalid: master simulation object missing');
+  }
+  if (!Array.isArray(sim.season_endpoints) || sim.season_endpoints.length !== seasonsPerSeries) {
+    throw new Error(`[ScriptWriter] Full series simulation invalid: expected ${seasonsPerSeries} season endpoints`);
+  }
+  for (let i = 0; i < sim.season_endpoints.length; i++) {
+    if (Number(sim.season_endpoints[i]?.season) !== i + 1) {
+      throw new Error(
+        `[ScriptWriter] Full series simulation invalid: season endpoint at position ${i + 1} ` +
+        `must be season ${i + 1}`
+      );
+    }
+  }
+
+  // New production architecture: the master series plan is durable, but
+  // episode trajectories are generated on demand in a rolling 3–5 episode
+  // horizon immediately before production of the current episode. The legacy
+  // full-series chunk generator remains available through generateEpisodeTrajectories
+  // for backwards compatibility, but is OFF by default.
+  const storedTrajectories = Array.isArray(sim.episode_trajectory) ? sim.episode_trajectory : [];
+  if (generateEpisodeTrajectories) {
+    const expectedEpisodes = episodesPerSeason * seasonsPerSeries;
+    const initialTrajectories = storedTrajectories.filter(ep => ep && ep.season && ep.episode);
+    const masterCheckpoint = {
+      ...result,
+      full_story_simulation: {
+        ...sim,
+        episode_trajectory: initialTrajectories,
+        simulation_status: initialTrajectories.length >= expectedEpisodes ? 'complete' : 'in_progress',
+        simulation_total_episodes: expectedEpisodes,
+        simulation_completed_episodes: initialTrajectories.length,
+        simulation_window_start: initialTrajectories.length ? Math.min(...initialTrajectories.map(e => Number(e.global_episode) || 0)) : null,
+        simulation_window_end: initialTrajectories.length ? Math.max(...initialTrajectories.map(e => Number(e.global_episode) || 0)) : null,
+      },
+    };
+    if (onCheckpoint) {
+      await onCheckpoint({
+        stage: 'master',
+        seriesData: masterCheckpoint,
+        fullStorySimulation: masterCheckpoint.full_story_simulation,
+        completedTrajectories: initialTrajectories,
+      });
+    }
+    const episodeTrajectory = await buildSeriesEpisodeTrajectories({
+      masterSimulation: masterCheckpoint.full_story_simulation,
+      storyline: {
+        ...result,
+        title: result.title,
+        genre: result.genre,
+        logline: result.logline,
+        central_theme: result.central_theme,
+        comprehensive_summary: result.comprehensive_summary,
+        plot_summary: result.plot_summary || result.comprehensive_summary,
+        season_arcs: result.season_arcs,
+      },
+      characters: result.character_bible || [],
+      episodesPerSeason,
+      seasonsPerSeries,
+      initialTrajectories,
+      onChunkLocked: onCheckpoint ? async ({ trajectories, completedChunks, totalChunks: chunks }) => {
+        const fullStorySimulation = {
+          ...sim,
+          episode_trajectory: trajectories,
+          simulation_status: 'in_progress',
+          simulation_total_episodes: expectedEpisodes,
+          simulation_completed_episodes: trajectories.length,
+          simulation_completed_chunks: completedChunks,
+          simulation_total_chunks: chunks,
+        };
+        await onCheckpoint({
+          stage: 'chunk',
+          seriesData: { ...masterCheckpoint, full_story_simulation: fullStorySimulation },
+          fullStorySimulation,
+          completedTrajectories: trajectories,
+          completedChunks,
+          totalChunks: chunks,
+        });
+      } : null,
+    });
+    result.full_story_simulation = {
+      ...sim,
+      episode_trajectory: episodeTrajectory,
+      simulation_status: 'complete',
+      simulation_total_episodes: expectedEpisodes,
+      simulation_completed_episodes: episodeTrajectory.length,
+    };
+  } else {
+    result.full_story_simulation = {
+      ...sim,
+      episode_trajectory: storedTrajectories,
+      simulation_status: 'master_only',
+      simulation_total_episodes: episodesPerSeason * seasonsPerSeries,
+      simulation_completed_episodes: storedTrajectories.length,
+      simulation_completed_chunks: 0,
+      simulation_total_chunks: 0,
+      simulation_window_start: storedTrajectories.length ? Math.min(...storedTrajectories.map(e => Number(e.global_episode) || 0)) : null,
+      simulation_window_end: storedTrajectories.length ? Math.max(...storedTrajectories.map(e => Number(e.global_episode) || 0)) : null,
+    };
+    if (onCheckpoint) {
+      await onCheckpoint({
+        stage: 'master',
+        seriesData: result,
+        fullStorySimulation: result.full_story_simulation,
+        completedTrajectories: storedTrajectories,
+      });
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Generate the complete episode trajectory using bounded continuity chunks.
+ * Every successfully locked chunk is returned through onChunkLocked so the
+ * caller can durably checkpoint it before the next provider call begins.
+ */
+async function buildSeriesEpisodeTrajectories({
+  masterSimulation,
+  storyline,
+  characters,
+  episodesPerSeason = 8,
+  seasonsPerSeries = 4,
+  initialTrajectories = [],
+  onChunkLocked = null,
+  targetStartGlobalEpisode = null,
+  targetEndGlobalEpisode = null,
+}) {
+  const expectedEpisodes = episodesPerSeason * seasonsPerSeries;
+  const chunkSize = Math.min(5, episodesPerSeason);
+  const trajectories = Array.isArray(initialTrajectories)
+    ? initialTrajectories.map(ep => ({ ...ep, season: Number(ep.season), episode: Number(ep.episode), global_episode: Number(ep.global_episode) }))
+    : [];
+  const seen = new Set(trajectories.map(ep => `${ep.season}:${ep.episode}`));
+
+  const orderedChunks = [];
+  const totalSeriesEpisodes = episodesPerSeason * seasonsPerSeries;
+  const rangeStart = Math.max(1, Number(targetStartGlobalEpisode) || 1);
+  const rangeEnd = Math.min(
+    totalSeriesEpisodes,
+    Math.max(rangeStart, Number(targetEndGlobalEpisode) || totalSeriesEpisodes)
+  );
+
+  let globalEpisode = rangeStart;
+  while (globalEpisode <= rangeEnd) {
+    const chunkEndGlobal = Math.min(rangeEnd, globalEpisode + chunkSize - 1);
+    const startSeason = Math.floor((globalEpisode - 1) / episodesPerSeason) + 1;
+    const startEpisode = ((globalEpisode - 1) % episodesPerSeason) + 1;
+    const endSeason = Math.floor((chunkEndGlobal - 1) / episodesPerSeason) + 1;
+    const endEpisode = ((chunkEndGlobal - 1) % episodesPerSeason) + 1;
+
+    // Never cross a season boundary inside one provider request.
+    const safeEndGlobal = startSeason !== endSeason
+      ? Math.min(chunkEndGlobal, startSeason * episodesPerSeason)
+      : chunkEndGlobal;
+    const safeEndEpisode = ((safeEndGlobal - 1) % episodesPerSeason) + 1;
+
+    orderedChunks.push({
+      season: startSeason,
+      startEpisode,
+      endEpisode: safeEndEpisode,
+      expectedKeys: Array.from(
+        { length: safeEndEpisode - startEpisode + 1 },
+        (_, i) => `${startSeason}:${startEpisode + i}`
+      ),
+    });
+
+    globalEpisode = safeEndGlobal + 1;
+  }
+
+  for (let chunkIndex = 0; chunkIndex < orderedChunks.length; chunkIndex++) {
+    const chunk = orderedChunks[chunkIndex];
+    if (chunk.expectedKeys.every(key => seen.has(key))) {
+      console.log(`[ScriptWriter] ↺ Series trajectory chunk ${chunkIndex + 1}/${orderedChunks.length} already checkpointed: S${chunk.season}E${chunk.startEpisode}-E${chunk.endEpisode}`);
+      continue;
+    }
+
+    let generated = false;
+    let lastValidationError = null;
+    let pendingKeys = chunk.expectedKeys.filter(key => !seen.has(key));
+    const chunkByKey = new Map();
+    for (const ep of trajectories.filter(ep => chunk.expectedKeys.includes(`${ep.season}:${ep.episode}`))) {
+      chunkByKey.set(`${ep.season}:${ep.episode}`, ep);
+    }
+
+    const MAX_CHUNK_ATTEMPTS = 5;
+    for (let attempt = 1; attempt <= MAX_CHUNK_ATTEMPTS && pendingKeys.length; attempt++) {
+      try {
+        const requestedKeys = [...pendingKeys];
+        const previous = trajectories.slice(-5);
+        const requestedCoordinates = requestedKeys.map(key => {
+          const [s, e] = key.split(':');
+          const globalEpisode = (Number(s) - 1) * episodesPerSeason + Number(e);
+          return `  S${s}E${e} (global_episode ${globalEpisode})`;
+        }).join('\n');
+
+        const systemPrompt = `${DIRECTOR_PERSONA}
+You are the continuity showrunner for StreamVerse Studios.
+Generate ONLY the requested missing episode trajectories for the specified coordinates.
+These trajectories are authoritative and must connect to prior locked episodes and preserve
+all locked series facts. If repairing an incomplete episode, preserve all already-valid
+fields and complete the missing fields without changing established canon. Return JSON only.`;
+
+        const userPrompt = `SERIES: "${storyline.title}" (${storyline.genre})
+LOGLINE: ${storyline.logline || ''}
+THEME: ${storyline.central_theme || ''}
+SEASONS: ${seasonsPerSeries}
+EPISODES PER SEASON: ${episodesPerSeason}
+
+MASTER SERIES SUMMARY:
+${storyline.comprehensive_summary || storyline.plot_summary || ''}
+
+SEASON ARCS:
+${JSON.stringify(storyline.season_arcs || [])}
+
+LOCKED SERIES SIMULATION:
+${JSON.stringify({
+  opening_state: masterSimulation.opening_state || '',
+  inciting_event: masterSimulation.inciting_event || '',
+  season_endpoints: masterSimulation.season_endpoints || [],
+  finale_resolution: masterSimulation.finale_resolution || '',
+  unresolved_threads: masterSimulation.unresolved_threads || [],
+})}
+
+CAST:
+${(characters || []).map(c => `${c.name}: ${c.role}; ${c.description}; arc=${c.arc || ''}`).join('\n')}
+
+REQUESTED / REPAIR TRAJECTORIES (${requestedKeys.length}):
+${requestedCoordinates}
+
+PREVIOUS LOCKED TRAJECTORIES:
+${JSON.stringify(previous)}
+
+ALREADY LOCKED WITHIN THIS CURRENT RANGE:
+${JSON.stringify([...chunkByKey.values()])}
+
+Return exactly one trajectory object for EACH requested coordinate and no others.
+For each requested episode, EVERY field below is mandatory and must be non-empty:
+opening, inciting, middle_turn, climax, ending, next_hook, character_changes (non-empty array).
+Do not alter coordinates. Do not omit fields. Do not return placeholder text.
+${requestedKeys.length === 1 ? 'This is a targeted repair. Focus on completing this one episode completely and coherently.' : ''}
+
+JSON shape:
+{
+  "episode_trajectory": [
+    {
+      "global_episode": 1,
+      "season": 1,
+      "episode": 1,
+      "opening": "",
+      "inciting": "",
+      "middle_turn": "",
+      "climax": "",
+      "ending": "",
+      "next_hook": "",
+      "character_changes": [""]
+    }
+  ]
+}`;
+
+        const result = await callLLM(systemPrompt, userPrompt, 3500, { useStream: false });
+        const raw = Array.isArray(result?.episode_trajectory) ? result.episode_trajectory : [];
+        const requestedSet = new Set(requestedKeys);
+        const seenReturned = new Set();
+
+        if (!raw.length) throw new Error(`no trajectory objects returned for ${requestedKeys.join(', ')}`);
+
+        for (const rawEp of raw) {
+          const ep = {
+            ...rawEp,
+            season: Number(rawEp.season),
+            episode: Number(rawEp.episode),
+            global_episode: Number(rawEp.global_episode),
+          };
+          const key = `${ep.season}:${ep.episode}`;
+          if (!requestedSet.has(key)) throw new Error(`chunk returned unexpected trajectory ${key}`);
+          if (seenReturned.has(key) || seen.has(key)) throw new Error(`chunk returned duplicate trajectory ${key}`);
+          const expectedGlobal = (ep.season - 1) * episodesPerSeason + ep.episode;
+          if (ep.global_episode !== expectedGlobal) throw new Error(`trajectory ${key} has global_episode=${ep.global_episode}, expected ${expectedGlobal}`);
+
+          const complete = !!ep.opening && !!ep.inciting && !!ep.middle_turn && !!ep.climax &&
+            !!ep.ending && !!ep.next_hook && Array.isArray(ep.character_changes) && ep.character_changes.length > 0;
+          if (complete) {
+            chunkByKey.set(key, ep);
+            seenReturned.add(key);
+          } else {
+            console.warn(`[ScriptWriter] Trajectory ${key} returned incomplete; preserving any valid siblings and repairing ${key} only.`);
+          }
+        }
+
+        pendingKeys = chunk.expectedKeys.filter(key => !chunkByKey.has(key) && !seen.has(key));
+        if (pendingKeys.length) {
+          lastValidationError = new Error(`incomplete/missing trajectory: ${pendingKeys.join(', ')}`);
+          console.warn(`[ScriptWriter] Series trajectory chunk ${chunkIndex + 1}/${orderedChunks.length} attempt ${attempt}/${MAX_CHUNK_ATTEMPTS} requires targeted repair: ${pendingKeys.join(', ')}`);
+          if (attempt < MAX_CHUNK_ATTEMPTS) await _sleepForRetry(lastValidationError, Math.min(5000, 900 * attempt));
+        } else {
+          const chunkOutput = chunk.expectedKeys.map(key => chunkByKey.get(key)).filter(Boolean);
+          for (const ep of chunkOutput) {
+            const key = `${ep.season}:${ep.episode}`;
+            if (!seen.has(key)) {
+              seen.add(key);
+              trajectories.push(ep);
+            }
+          }
+
+          console.log(`[ScriptWriter] Series trajectory chunk ${chunkIndex + 1}/${orderedChunks.length} locked: S${chunk.season}E${chunk.startEpisode}-E${chunk.endEpisode} (${chunkOutput.length} episodes)`);
+          if (onChunkLocked) {
+            await onChunkLocked({
+              trajectories: [...trajectories].sort((a, b) => Number(a.global_episode) - Number(b.global_episode)),
+              completedChunks: orderedChunks.filter(c => c.expectedKeys.every(key => seen.has(key))).length,
+              totalChunks: orderedChunks.length,
+              chunkIndex,
+              chunk,
+            });
+          }
+          generated = true;
+        }
+      } catch (err) {
+        lastValidationError = err;
+        console.warn(`[ScriptWriter] Series trajectory chunk ${chunkIndex + 1}/${orderedChunks.length} attempt ${attempt}/${MAX_CHUNK_ATTEMPTS} failed: ${err.message}`);
+        if (attempt < MAX_CHUNK_ATTEMPTS) await _sleepForRetry(err, Math.min(5000, 900 * attempt));
+      }
+    }
+
+    if (!generated) {
+      const error = new Error(`[ScriptWriter] Full series simulation invalid: could not lock trajectory chunk S${chunk.season}E${chunk.startEpisode}-E${chunk.endEpisode} after ${MAX_CHUNK_ATTEMPTS} attempts: ${lastValidationError?.message || 'unknown error'}`);
+      error.cause = lastValidationError;
+      throw error;
+    }
+  }
+
+  const missingAll = [];
+  for (const chunk of orderedChunks) {
+    for (const key of chunk.expectedKeys) {
+      if (!seen.has(key)) missingAll.push(key);
+    }
+  }
+  if (missingAll.length) {
+    throw new Error(`[ScriptWriter] Episode trajectory window invalid: missing ${missingAll.length} requested trajectories (${missingAll.join(', ')})`);
+  }
+
+  const windowOnly = targetStartGlobalEpisode != null
+    ? trajectories
+        .filter(ep => Number(ep.global_episode) >= rangeStart && Number(ep.global_episode) <= rangeEnd)
+        .sort((a, b) => Number(a.global_episode) - Number(b.global_episode))
+    : trajectories.sort((a, b) => Number(a.global_episode) - Number(b.global_episode));
+
+  return windowOnly;
+}
+
+
+/**
+ * Simulate one complete season from beginning to end. This is the authoritative
+ * season-level bridge between the series master plan and individual episode work.
+ * It is chunked for provider reliability, but the returned object represents the
+ * entire season and is durably checkpointable after every chunk.
+ */
+async function simulateSeasonStory({
+  storyline,
+  characters,
+  seasonNumber,
+  episodesPerSeason = 8,
+  masterSimulation,
+  existingSeasonSimulation = null,
+  previousSeasonSimulation = null,
+  onCheckpoint = null,
+}) {
+  const seasonNo = Number(seasonNumber);
+  if (!Number.isInteger(seasonNo) || seasonNo < 1) throw new Error('Invalid season number');
+  const master = masterSimulation || {};
+  const endpoint = Array.isArray(master.season_endpoints)
+    ? master.season_endpoints.find(s => Number(s?.season) === seasonNo) || {}
+    : {};
+  const existing = existingSeasonSimulation && typeof existingSeasonSimulation === 'object' ? existingSeasonSimulation : {};
+  const existingEpisodes = Array.isArray(existing.episode_trajectory)
+    ? existing.episode_trajectory.slice().sort((a,b) => Number(a.episode)-Number(b.episode)) : [];
+  const byEpisode = new Map(existingEpisodes.map(ep => [Number(ep.episode), ep]));
+  const chunkSize = Math.min(4, Math.max(1, Number(process.env.SEASON_SIMULATION_CHUNK_SIZE || 4)));
+
+  for (let start = 1; start <= episodesPerSeason; start += chunkSize) {
+    const end = Math.min(episodesPerSeason, start + chunkSize - 1);
+    const expected = Array.from({length: end - start + 1}, (_, i) => start + i);
+    if (expected.every(n => byEpisode.has(n))) {
+      console.log(`[ScriptWriter] ↺ Season simulation chunk already locked: S${seasonNo}E${start}-E${end}`);
+      continue;
+    }
+
+    const requested = expected.filter(n => !byEpisode.has(n));
+    const priorLocked = [...byEpisode.values()].sort((a,b) => Number(a.episode)-Number(b.episode)).slice(-4);
+    const systemPrompt = `${DIRECTOR_PERSONA}\nYou are the season showrunner for StreamVerse. Simulate ONE COMPLETE SEASON from its opening state through its final episode and ending. You are working on requested episode coordinates only, but every returned episode must connect causally to prior locked episodes and toward the season endpoint. Do not rewrite already-locked episodes. Return JSON only.`;
+    const userPrompt = `
+SERIES: ${storyline.title} (${storyline.genre})
+SEASON: ${seasonNo} of ${master.season_endpoints?.length || '?'}
+EPISODES IN SEASON: ${episodesPerSeason}
+
+MASTER SERIES ENDPOINT:
+${JSON.stringify(endpoint)}
+
+MASTER OPENING / FINALE CONTEXT:
+${JSON.stringify({ opening_state: master.opening_state || '', finale_resolution: master.finale_resolution || '', unresolved_threads: master.unresolved_threads || [] })}
+
+PREVIOUS SEASON END STATE:
+${JSON.stringify(previousSeasonSimulation?.ending_state || endpoint?.beginning || '')}
+
+RECENT LOCKED EPISODES IN THIS SEASON:
+${JSON.stringify(priorLocked)}
+
+CAST:
+${(characters || []).map(c => `${c.name}: ${c.role}; ${c.description || ''}; arc=${c.arc || ''}`).join('\n')}
+
+REQUESTED EPISODES:
+${requested.map(n => `S${seasonNo}E${n}`).join(', ')}
+
+Return one object for each requested episode with: opening, inciting, middle_turn, climax, ending, next_hook, character_changes (non-empty array), scene_seed (the concrete dramatic situation from which its scenes will later be simulated). Never introduce a new episode number, never skip an index, and do not change the season endpoint. Each episode must materially advance the previous episode; do not repeat the same beat or location unless there is a new causal reason. The final requested episode must point toward the locked season ending.
+
+JSON shape:
+{"episode_trajectory":[{"season":${seasonNo},"episode":1,"global_episode":1,"opening":"","inciting":"","middle_turn":"","climax":"","ending":"","next_hook":"","character_changes":[],"scene_seed":""}]}`;
+
+    let ok = false;
+    let lastErr = null;
+    for (let attempt = 1; attempt <= 4 && !ok; attempt++) {
+      try {
+        const result = await callLLM(systemPrompt, userPrompt, 4500, { useStream: false, temperature: 0.25 });
+        const raw = Array.isArray(result?.episode_trajectory) ? result.episode_trajectory : [];
+        const returned = new Map();
+        for (const epRaw of raw) {
+          const epNo = Number(epRaw?.episode);
+          if (!requested.includes(epNo)) throw new Error(`unexpected season episode ${epRaw?.episode}`);
+          const complete = !!epRaw.opening && !!epRaw.inciting && !!epRaw.middle_turn && !!epRaw.climax && !!epRaw.ending && !!epRaw.next_hook && !!epRaw.scene_seed && Array.isArray(epRaw.character_changes) && epRaw.character_changes.length;
+          if (!complete) throw new Error(`incomplete S${seasonNo}E${epNo}`);
+          returned.set(epNo, { ...epRaw, season: seasonNo, episode: epNo, global_episode: (seasonNo - 1) * episodesPerSeason + epNo });
+        }
+        if (returned.size !== requested.length) throw new Error(`expected ${requested.length} trajectories, got ${returned.size}`);
+        for (const n of requested) byEpisode.set(n, returned.get(n));
+        ok = true;
+      } catch (err) {
+        lastErr = err;
+        if (attempt < 4) await _sleepForRetry(err, Math.min(5000, 1000 * attempt));
+      }
+    }
+    if (!ok) throw new Error(`[ScriptWriter] Season S${seasonNo} simulation chunk S${seasonNo}E${start}-E${end} failed: ${lastErr?.message || 'unknown error'}`);
+
+    const partial = {
+      season: seasonNo,
+      opening_state: existing.opening_state || endpoint?.beginning || '',
+      ending_state: byEpisode.get(episodesPerSeason)?.ending || endpoint?.ending || '',
+      episode_trajectory: Array.from(byEpisode.values()).sort((a,b) => Number(a.episode)-Number(b.episode)),
+      season_endpoint: endpoint,
+      simulation_status: byEpisode.size >= episodesPerSeason ? 'complete' : 'in_progress',
+      completed_episode_numbers: Array.from(byEpisode.keys()).sort((a,b) => a-b),
+      total_episode_numbers: episodesPerSeason,
+    };
+    if (typeof onCheckpoint === 'function') await onCheckpoint({ seasonNumber: seasonNo, completedEpisodes: partial.completed_episode_numbers, simulation: partial });
+    console.log(`[Pipeline] 💾 Season simulation checkpoint persisted: S${seasonNo} ${byEpisode.size}/${episodesPerSeason} episodes`);
+  }
+
+  return {
+    season: seasonNo,
+    opening_state: existing.opening_state || endpoint?.beginning || '',
+    ending_state: byEpisode.get(episodesPerSeason)?.ending || endpoint?.ending || '',
+    episode_trajectory: Array.from(byEpisode.values()).sort((a,b) => Number(a.episode)-Number(b.episode)),
+    season_endpoint: endpoint,
+    simulation_status: 'complete',
+    completed_episode_numbers: Array.from(byEpisode.keys()).sort((a,b) => a-b),
+    total_episode_numbers: episodesPerSeason,
+  };
+}
+
+/**
+ * Generate only the next rolling episode trajectory horizon.
+ * The master series plan remains canonical; detailed episode trajectories are
+ * generated immediately ahead of production and stored durably.
+ */
+async function simulateEpisodeTrajectoryWindow({
+  storyline,
+  characters,
+  startGlobalEpisode,
+  windowSize = 5,
+}) {
+  const master = storyline?.full_story_simulation
+    ? (typeof storyline.full_story_simulation === 'string'
+      ? safeJsonParse(storyline.full_story_simulation, {})
+      : storyline.full_story_simulation)
+    : {};
+
+  const episodesPerSeason = Number(storyline?.episodes_per_season) || 20;
+  const seasonsPerSeries = Number(storyline?.seasons_per_series) || 4;
+  const totalEpisodes = episodesPerSeason * seasonsPerSeries;
+  const start = Math.max(1, Number(startGlobalEpisode) || 1);
+  const size = Math.max(3, Math.min(5, Number(windowSize) || 5));
+  const end = Math.min(totalEpisodes, start + size - 1);
+
+  const existing = Array.isArray(master.episode_trajectory)
+    ? master.episode_trajectory.filter(ep =>
+        Number(ep?.global_episode) >= start &&
+        Number(ep?.global_episode) <= end
+      )
+    : [];
+
+  const generated = await buildSeriesEpisodeTrajectories({
+    masterSimulation: master,
+    storyline,
+    characters,
+    episodesPerSeason,
+    seasonsPerSeries,
+    initialTrajectories: existing,
+    targetStartGlobalEpisode: start,
+    targetEndGlobalEpisode: end,
+  });
+
+  const byGlobal = new Map(generated.map(ep => [Number(ep.global_episode), ep]));
+  const ordered = [];
+  for (let globalEpisode = start; globalEpisode <= end; globalEpisode++) {
+    const ep = byGlobal.get(globalEpisode);
+    if (!ep) {
+      throw new Error(`[ScriptWriter] Rolling trajectory window missing global episode ${globalEpisode}`);
+    }
+    ordered.push(ep);
+  }
+
+  console.log(`[ScriptWriter] Rolling trajectory window locked: E${start}-E${end} (${ordered.length} episodes)`);
+  return ordered;
+}
+
+/**
+ * Step 2: Cast Bible — Lock every character with visual metadata, seed, and voice ID.
+ *
+ * Takes the raw character_bible from writeSeriesSummary and enriches each character
+ * with:
+ *   - visual_anchor (comma-separated tag-lock for CF worker prompt injection)
+ *   - seed (deterministic integer for reproducible image generation)
+ *   - voice_id (Deepgram Aura voice assigned by gender + name hash)
+ *
+ * This is the FIRST thing that happens when starting a new series — characters are
+ * generated and locked BEFORE any episode script is written.
+ */
+async function writeCastBible(seriesSummary) {
+  const rawCharacters = seriesSummary.character_bible || [];
+  if (!rawCharacters.length) {
+    throw new Error('[ScriptWriter] writeCastBible: series summary has no character_bible');
+  }
+
+  const cast = [];
+  for (const char of rawCharacters) {
+    const visualAnchor = await generateCharacterVisualAnchor(char);
+    const seed = assignSeedForCharacter(char);
+    const voiceId = assignVoiceForCharacter(char);
+
+    cast.push({
+      ...char,
+      visual_anchor:  visualAnchor,
+      seed:           seed,
+      voice_id:       voiceId,
+      visual_profile: char.visual_profile || {},
+    });
+    console.log(`[ScriptWriter] Cast locked: ${char.name} → seed=${seed}, voice=${voiceId}`);
+  }
+
+  return cast;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Character Visual Anchor — immutable physical identity lock
+// Now also outputs structured visual_metadata with seed for CF worker.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Rewrite a character reference-portrait prompt after a provider content-policy refusal.
+ *
+ * This is deliberately stricter than the general shot rewriter: the output must be a
+ * benign casting/reference photograph containing one adult fictional character, with
+ * immutable physical identity details preserved but without sexualized, violent, medical,
+ * criminal, or other context that can accidentally trigger a safety classifier.
+ */
+async function rewriteCharacterPortraitPrompt({ character, visualAnchor, angle = 'front', failedPrompt = '', reason = '', attempt = 1, maxRetries = 5 }) {
+  const safeCharacter = character && typeof character === 'object' ? character : {};
+  const name = safeCharacter.name || 'fictional character';
+  const gender = safeCharacter.gender || safeCharacter.visual_profile?.gender || 'adult person';
+  const role = safeCharacter.role || 'fictional film character';
+  const angleSpec = {
+    front: 'front-facing head-and-shoulders casting portrait',
+    three_quarter: 'three-quarter head-and-shoulders casting portrait, approximately 45 degrees',
+    profile: 'clean left side-profile head-and-shoulders casting portrait',
+    full_body: 'full-length neutral standing casting portrait, both hands visible',
+  }[angle] || 'front-facing casting portrait';
+
+  const systemPrompt = `${DIRECTOR_PERSONA}
+
+You are the senior casting photographer and visual continuity supervisor for a fictional film studio.
+A character-reference image request was rejected by an automated image-safety filter. Rewrite the prompt into
+an exceptionally clear, ordinary, professional casting photograph that is unlikely to be misclassified.
+
+HARD RULES:
+- The subject is ONE fictional ADULT PERSON only. Never mention minors or ambiguous age.
+- Preserve immutable identity traits: hair, eyes, skin tone/undertone, facial structure, build, posture, and signature wardrobe item.
+- Remove all story context that is not visibly necessary: violence, weapons, injury, blood, death, crime, sexuality, nudity, drugs, medical procedures, captivity, abuse, supernatural harm, or threatening behavior.
+- No romance, seduction, suggestive posing, exposed body areas, fetish language, or emotionally charged physical interaction.
+- Do not mention safety filters, policies, rejection codes, bypassing, moderation, or prompt engineering.
+- Describe only visible wardrobe, body posture, facial expression, hairstyle, neutral studio environment, lighting, camera framing, and photorealistic image quality.
+- Keep the requested camera angle exactly.
+- The image must read like a professional actor headshot / casting reference photograph.
+- Use concise, concrete cinematic language. No narrative prose.
+
+Return JSON only with exactly one field: {"rewritten_prompt":"..."}.`;
+
+  const userPrompt = `Character: ${name}
+Role: ${role}
+Gender: ${gender}
+Immutable visual anchor: ${visualAnchor || safeCharacter.description || ''}
+Required framing: ${angleSpec}
+Retry: ${attempt}/${maxRetries}
+Provider refusal reason: ${String(reason || 'content-policy refusal').slice(0, 500)}
+Previous prompt:
+${String(failedPrompt || '').slice(0, 5000)}
+
+Produce a replacement prompt that keeps the character's immutable identity while making the request a plain,
+professional, non-sensitive adult casting portrait. Include 9:16 vertical portrait framing, one person only,
+neutral dark studio background, neutral/resting expression, natural closed-mouth pose, soft studio key/fill lighting,
+sharp facial detail, realistic skin and hair texture, and no other people, props, text, logos, watermarks, or panels.`;
+
+  const result = await callLLM(systemPrompt, userPrompt, 900, { useStream: false });
+  const rewritten = result?.rewritten_prompt;
+  if (!rewritten || typeof rewritten !== 'string' || rewritten.trim().length < 40) {
+    throw new Error('Director returned no usable character portrait rewrite');
+  }
+  return rewritten.trim();
+}
+
+async function generateCharacterVisualAnchor(character) {
+  const systemPrompt = `${DIRECTOR_PERSONA}
+
+You are also the head of the casting department and visual effects supervisor.
+Your job: lock down a character's permanent, unwavering physical identity for AI image generation.
+Every time this character appears on screen across 80 episodes, they must look EXACTLY the same.
+
+CRITICAL FORMAT RULE: You must output a comma-separated attribute TAG LIST — NOT prose sentences.
+Diffusion image models tokenize comma-separated tags individually, giving each trait proper weight.
+A prose sentence buries traits in syntax and causes identity drift.`;
+
+  const userPrompt = `Create a permanent visual identity tag-lock for:
+
+Name: ${character.name}
+Role: ${character.role || 'unknown'}
+Gender: ${character.gender || character.visual_profile?.gender || 'unknown'}
+Description: ${character.description}
+Visual profile: ${JSON.stringify(character.visual_profile || {})}
+
+Return JSON with one field:
+{
+  "visual_anchor": "A comma-separated tag list of ONLY immutable physical traits. Under 80 words total. Format: [hair shade + texture + length], [eye colour + shape], [skin tone + undertone], [jaw shape], [cheekbone prominence], [nose shape], [height + build], [posture], [one always-worn signature item]. Use cinematographer-precise language — not 'brown hair' but 'deep espresso-brown loose-wave shoulder-length hair'. Every tag is a direct instruction to an image model — no filler words, no conjunctions, no backstory."
+}
+
+FORBIDDEN: prose sentences, personality traits, emotions, backstory, context, conjunctions.
+REQUIRED: comma-separated tags only, physical traits only, each tag self-contained.`;
+
+  const result = await callLLM(systemPrompt, userPrompt, 400);
+  return result.visual_anchor || `${character.name}: ${character.description}`;
+}
+
+
+/**
+ * Materialize a character that was introduced by a persisted story/scene
+ * simulation after the original cast was locked.
+ *
+ * This is intentionally separate from writeCastBible(): the normal cast pass
+ * happens once, while this path is a durable, deterministic late-cast expansion.
+ */
+async function createCharacterFromSceneContext({
+  name,
+  scene = {},
+  storyline = {},
+  characters = [],
+  episodeTrajectory = null,
+}) {
+  const safeName = String(name || '').trim();
+  if (!safeName) throw new Error('Cannot materialize a character without a name');
+
+  const existing = (characters || []).find(
+    c => String(c?.name || '').trim().toLowerCase() === safeName.toLowerCase()
+  );
+  if (existing) return existing;
+
+  const castSummary = (characters || [])
+    .map(c => `${c.name}: ${_compactLLMText(c.description || '', 260)}`)
+    .join('\n');
+
+  const systemPrompt = `${DIRECTOR_PERSONA}
+You are the showrunner's casting department and continuity supervisor.
+A persisted story simulation has introduced a named character that was not present
+in the original locked cast. Materialize ONLY that exact fictional character so the
+pipeline can create a permanent visual/audio identity before rendering.
+Return JSON only. Do not rename the character. Do not create aliases. Do not invent
+connections that contradict the supplied story context.`;
+
+  const userPrompt = `
+CHARACTER TO MATERIALIZE: ${safeName}
+
+SERIES:
+Title: ${storyline.title || ''}
+Genre: ${storyline.genre || ''}
+Tone: ${storyline.tone_manifesto || ''}
+Summary: ${_compactLLMText(storyline.comprehensive_summary || storyline.plot_summary || '', 1800)}
+
+CURRENT SCENE:
+${JSON.stringify(scene || {}).slice(0, 6000)}
+
+EPISODE TRAJECTORY:
+${JSON.stringify(_compactEpisodeTrajectoryForLLM(episodeTrajectory)).slice(0, 4500)}
+
+EXISTING LOCKED CAST:
+${castSummary || '(none)'}
+
+Create exactly one new cast entry. Its identity must be concrete enough for a
+reference portrait and consistent across every future episode.
+
+Return exactly:
+{
+  "name": "${safeName}",
+  "role": "protagonist|antagonist|supporting",
+  "gender": "male|female|nonbinary|unknown",
+  "description": "Concise psychology, role in the story, desire, fear, and contradiction.",
+  "visual_profile": {
+    "age_range": "adult age range",
+    "appearance": "Immutable physical appearance details",
+    "wardrobe_signature": "One durable wardrobe/signature item",
+    "performance_note": "Voice/personality performance note"
+  }
+}
+
+Rules:
+- name MUST be exactly "${safeName}".
+- Adult fictional character only.
+- No references to actors, real people, or copyrighted characters.
+- Keep identity details stable and production-ready.
+- Do not include visual_anchor, seed, or voice_id; the pipeline assigns those deterministically.
+`;
+
+  const result = await callLLM(
+    systemPrompt,
+    userPrompt,
+    1000,
+    { useStream: false, temperature: 0.1 }
+  );
+
+  const candidate = result?.character && typeof result.character === 'object'
+    ? result.character
+    : result;
+
+  if (!candidate || typeof candidate !== 'object') {
+    throw new Error(`Character materialization returned no object for "${safeName}"`);
+  }
+
+  const normalized = {
+    name: safeName,
+    role: String(candidate.role || 'supporting').trim(),
+    gender: String(candidate.gender || 'unknown').trim(),
+    description: _compactLLMText(candidate.description || `A supporting character named ${safeName}.`, 1200),
+    visual_profile: candidate.visual_profile && typeof candidate.visual_profile === 'object'
+      ? candidate.visual_profile
+      : {},
+  };
+
+  // Sanitize enum-like fields without changing the identity.
+  if (!['protagonist', 'antagonist', 'supporting'].includes(normalized.role)) {
+    normalized.role = 'supporting';
+  }
+  if (!['male', 'female', 'nonbinary', 'unknown'].includes(normalized.gender)) {
+    normalized.gender = 'unknown';
+  }
+
+  return {
+    ...normalized,
+    visual_anchor: await generateCharacterVisualAnchor(normalized),
+    seed: assignSeedForCharacter(normalized),
+    voice_id: assignVoiceForCharacter(normalized),
+    visual_profile: normalized.visual_profile || {},
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Episode Script — the director's craft at full depth
+// Now receives: locked cast (with voice_id + seed), series comprehensive_summary
+// as global context, and builds a narrative_context_history array across scenes.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Build/repair a complete beginning-to-end story simulation for an existing series. */
+async function simulateSeriesStory({ storyline, characters, episodesPerSeason = 8, seasonsPerSeries = 4 }) {
+  const stored = storyline?.full_story_simulation
+    ? (typeof storyline.full_story_simulation === 'string' ? safeJsonParse(storyline.full_story_simulation, {}) : storyline.full_story_simulation)
+    : {};
+  const storedTrajectory = Array.isArray(stored.episode_trajectory) ? stored.episode_trajectory : [];
+
+  let master = stored?.opening_state && Array.isArray(stored?.season_endpoints)
+    ? stored
+    : null;
+
+  if (!master) {
+    const systemPrompt = `${DIRECTOR_PERSONA}
+You are the continuity showrunner.
+Build the series-level continuity frame before episode generation.
+Do NOT generate episode-by-episode trajectories in this completion; those are
+generated separately in bounded, validated chunks. Return JSON only.`;
+
+    const userPrompt = `Series: "${storyline.title}" (${storyline.genre})
+Logline: ${storyline.logline || ''}
+Theme: ${storyline.central_theme || ''}
+Master summary: ${storyline.comprehensive_summary || storyline.plot_summary || ''}
+Season arcs: ${JSON.stringify(storyline.season_arcs || [])}
+Cast: ${(characters || []).map(c => `${c.name}: ${c.role}; ${c.description}; arc=${c.arc || ''}`).join('\n')}
+
+Build the authoritative beginning-to-ending continuity frame for exactly
+${seasonsPerSeries} seasons with ${episodesPerSeason} episodes each.
+
+Return JSON:
+{
+  "opening_state": "",
+  "inciting_event": "",
+  "season_endpoints": [{"season": 1, "beginning": "", "turning_points": ["","",""], "ending": ""}],
+  "episode_trajectory": [],
+  "finale_resolution": "",
+  "unresolved_threads": []
+}
+
+Return exactly ${seasonsPerSeries} season_endpoints and leave episode_trajectory empty.`;
+    master = await callLLM(systemPrompt, userPrompt, 4500, { useStream: false });
+  } else {
+    console.log(`[ScriptWriter] ↺ Resuming series simulation: ${storedTrajectory.length} trajectory checkpoints already durable in DB`);
+  }
+
+  if (!master?.season_endpoints || master.season_endpoints.length !== seasonsPerSeries) {
+    throw new Error(`[ScriptWriter] Series simulation invalid: expected ${seasonsPerSeries} season endpoints`);
+  }
+  for (let i = 0; i < master.season_endpoints.length; i++) {
+    if (Number(master.season_endpoints[i]?.season) !== i + 1) {
+      throw new Error(`[ScriptWriter] Series simulation invalid: season endpoint at position ${i + 1} must be season ${i + 1}`);
+    }
+  }
+
+  const fullCheckpoint = current => ({
+    ...master,
+    episode_trajectory: current,
+    simulation_status: 'in_progress',
+    simulation_total_episodes: episodesPerSeason * seasonsPerSeries,
+    simulation_completed_episodes: current.length,
+  });
+
+  const trajectory = await buildSeriesEpisodeTrajectories({
+    masterSimulation: master,
+    storyline,
+    characters: characters?.length ? characters : (storyline.character_bible ? safeJsonParse(storyline.character_bible, storyline.character_bible) : []),
+    episodesPerSeason,
+    seasonsPerSeries,
+    initialTrajectories: storedTrajectory,
+    onChunkLocked: async ({ trajectories, completedChunks, totalChunks }) => {
+      await db.execute(
+        `UPDATE storylines SET full_story_simulation = ?, updated_at = NOW() WHERE id = ?`,
+        [JSON.stringify({ ...fullCheckpoint(trajectories), simulation_completed_chunks: completedChunks, simulation_total_chunks: totalChunks }), storyline.id]
+      );
+      console.log(`[ScriptWriter] 💾 DB checkpoint persisted: ${trajectories.length}/${episodesPerSeason * seasonsPerSeries} trajectories (${completedChunks}/${totalChunks} chunks)`);
+    },
+  });
+
+  const finalSimulation = {
+    ...master,
+    episode_trajectory: trajectory,
+    simulation_status: 'complete',
+    simulation_total_episodes: episodesPerSeason * seasonsPerSeries,
+    simulation_completed_episodes: trajectory.length,
+    simulation_completed_chunks: Math.ceil((episodesPerSeason * seasonsPerSeries) / Math.min(5, episodesPerSeason)),
+    simulation_total_chunks: Math.ceil((episodesPerSeason * seasonsPerSeries) / Math.min(5, episodesPerSeason)),
+  };
+
+  await db.execute(
+    `UPDATE storylines SET full_story_simulation = ?, updated_at = NOW() WHERE id = ?`,
+    [JSON.stringify(finalSimulation), storyline.id]
+  );
+  return finalSimulation;
+}
+
+
+/**
+ * Episode-level narrative simulation. This fills the missing simulation stage
+ * between the full-series simulation and the scene/shot production gates.
+ * It is intentionally compact: it locks the episode's causal spine and scene
+ * beat count before the actual episode script is written.
+ */
+async function simulateEpisodeStory({
+  storyline,
+  characters,
+  recentEpisodes = [],
+  episodeNumber,
+  seasonNumber,
+  isFinale = false,
+  isSeriesMovie = false,
+  targetMinutes = 2,
+  sceneCount = null,
+  episodeTrajectory = null,
+  existingSimulation = null,
+  checkpoint = null,
+}) {
+  const fullStorySimulation = storyline?.full_story_simulation
+    ? (typeof storyline.full_story_simulation === 'string'
+      ? safeJsonParse(storyline.full_story_simulation, {})
+      : storyline.full_story_simulation)
+    : {};
+
+  const trajectory = episodeTrajectory || (
+    Array.isArray(fullStorySimulation.episode_trajectory)
+      ? fullStorySimulation.episode_trajectory.find(ep =>
+          Number(ep.season) === Number(seasonNumber) && Number(ep.episode) === Number(episodeNumber)
+        )
+      : null
+  );
+
+  if (!trajectory) {
+    throw new Error(`[ScriptWriter] Authoritative episode trajectory missing for S${seasonNumber}E${episodeNumber}`);
+  }
+
+  const compactSeriesContext = _buildCompactEpisodeContext({
+    storyline,
+    fullStorySimulation,
+    seasonNumber,
+    episodeNumber,
+    episodeTrajectory: _compactEpisodeTrajectoryForLLM(trajectory),
+    recentEpisodes,
+  });
+
+  const resolvedSceneCount = Number(sceneCount) > 0
+    ? Number(sceneCount)
+    : (isSeriesMovie ? 20 : (targetMinutes <= 2 ? 8 : targetMinutes <= 5 ? 10 : 12));
+
+  const prior = existingSimulation && typeof existingSimulation === 'object' ? existingSimulation : {};
+  const priorScenes = Array.isArray(prior.scene_beat_plan)
+    ? prior.scene_beat_plan
+        .filter(sc => Number(sc?.scene_number) >= 1 && Number(sc?.scene_number) <= resolvedSceneCount)
+        .sort((a, b) => Number(a.scene_number) - Number(b.scene_number))
+    : [];
+
+  const completedByNumber = new Map(priorScenes.map(sc => [Number(sc.scene_number), sc]));
+  const scenePlan = [];
+
+  // Keep only a contiguous completed prefix. A stray later scene cannot become
+  // the predecessor for a scene that still needs to be simulated.
+  for (let n = 1; n <= resolvedSceneCount; n++) {
+    const priorScene = completedByNumber.get(n);
+    if (!priorScene || !priorScene.opening_state || !priorScene.closing_state || !priorScene.handoff_to_next_scene || !Array.isArray(priorScene.characters_present) || (priorScene.characters_present.length && !priorScene.conversation_reason)) break;
+    scenePlan.push(priorScene);
+  }
+
+  const priorOpening = _compactLLMText(prior.opening_state || trajectory.opening || '', 900);
+  const priorEnding = _compactLLMText(prior.ending_state || trajectory.ending || '', 900);
+  const previousClosing = () => scenePlan.length ? scenePlan[scenePlan.length - 1].closing_state : priorOpening;
+
+  const phaseFor = (n) => {
+    const ratio = n / resolvedSceneCount;
+    if (n === 1) return 'opening / inciting movement';
+    if (ratio <= 0.25) return 'early escalation';
+    if (ratio <= 0.55) return 'rising pressure / midpoint';
+    if (ratio <= 0.8) return 'crisis / reversal';
+    if (n === resolvedSceneCount) return 'climax / ending / next hook';
+    return 'late escalation';
+  };
+
+  const repairEpisodeScene = async ({ sceneNo, priorState, rawScene, missingFields }) => {
+    const safeRaw = rawScene && typeof rawScene === 'object' ? rawScene : {};
+    const repairSystem = `${DIRECTOR_PERSONA}\nYou are repairing a single scene-simulation JSON object. Return JSON only. Preserve all valid facts; fill only missing/empty required fields. Do not invent facts outside the supplied episode trajectory and inherited state.`;
+    const repairPrompt = `
+SCENE: ${sceneNo}
+MISSING REQUIRED FIELDS: ${missingFields.join(', ')}
+INHERITED STATE: ${_compactLLMText(priorState || '', 1200)}
+CURRENT SCENE JSON:
+${JSON.stringify(safeRaw).slice(0, 10000)}
+
+Return exactly this object shape and keep every supplied valid value:
+{
+  "scene_number": ${sceneNo},
+  "purpose": "...",
+  "opening_state": "...",
+  "causal_event": "...",
+  "characters_present": ["Exact character names from CAST, or [] for a characterless establishing scene"],
+  "character_state_changes": ["..."],
+  "environment_state_changes": ["..."],
+  "conversation_reason": "...",
+  "dialogue_intent": "...",
+  "closing_state": "...",
+  "handoff_to_next_scene": "..."
+}
+
+The closing_state must be concrete. The handoff_to_next_scene must state the exact continuity fact the next scene inherits. Do not add prose outside JSON.`;
+    return callLLM(repairSystem, repairPrompt, undefined, { useStream: false, temperature: 0.1 });
+  };
+
+  for (let sceneNo = scenePlan.length + 1; sceneNo <= resolvedSceneCount; sceneNo++) {
+    const priorScene = scenePlan.length ? scenePlan[scenePlan.length - 1] : null;
+    const priorState = priorScene?.closing_state || priorOpening;
+    const phase = phaseFor(sceneNo);
+
+    const systemPrompt = `${DIRECTOR_PERSONA}\nYou are the continuity architect for ONE scene inside a locked cinematic episode.\nReturn JSON only. Simulate exactly one scene; do not simulate later scenes.\nThe authoritative episode trajectory is fixed. The scene must inherit the prior scene state and hand off a concrete state to the next scene.`;
+
+    const userPrompt = `
+SERIES: ${storyline?.title || ''}
+GENRE: ${storyline?.genre || ''}
+EPISODE: S${seasonNumber}E${episodeNumber}
+SCENE: ${sceneNo} of ${resolvedSceneCount}
+SCENE PHASE: ${phase}
+TARGET RUNTIME: ~${targetMinutes} minutes
+FINALE: ${!!isFinale}
+SERIES MOVIE: ${!!isSeriesMovie}
+
+AUTHORITATIVE EPISODE TRAJECTORY:
+${JSON.stringify(_compactEpisodeTrajectoryForLLM(trajectory))}
+
+COMPACT SERIES CONTEXT:
+${JSON.stringify(compactSeriesContext)}
+
+CURRENT EPISODE OPENING STATE:
+${priorOpening}
+
+CURRENT EPISODE ENDING TARGET:
+${priorEnding}
+
+INHERITED STATE FROM PRIOR SCENE:
+${_compactLLMText(priorState, 1100)}
+
+CAST:
+${(characters || []).map(c => `${c.name}: ${c.role}; ${_compactLLMText(c.description || '', 700)}`).join('\n')}
+
+Create ONLY SCENE ${sceneNo}. It must causally advance the authoritative episode trajectory.
+Do not invent a new episode ending, contradict the trajectory, or jump over the inherited state.
+${sceneNo === 1 ? 'Establish the opening state and begin the inciting movement.' : ''}
+${sceneNo === resolvedSceneCount ? 'Land the episode on the authoritative ending/cliffhanger trajectory.' : ''}
+
+Return exactly:
+{
+  "scene_number": ${sceneNo},
+  "purpose": "...",
+  "opening_state": "...",
+  "causal_event": "...",
+  "characters_present": ["Exact character names from CAST, or [] for a characterless establishing scene"],
+  "character_state_changes": ["..."],
+  "environment_state_changes": ["..."],
+  "conversation_reason": "The concrete story reason a character must speak in this scene; what is at stake in this exchange and why silence would not serve the scene.",
+  "dialogue_intent": "...",
+  "closing_state": "...",
+  "handoff_to_next_scene": "..."
+}
+
+Rules:
+- scene_number must be ${sceneNo}
+- opening_state must inherit the supplied prior state
+- closing_state must be a concrete state, not a vague promise
+- handoff_to_next_scene must state exactly what the next scene inherits
+- characters_present must list ONLY characters from CAST who are actually present in this scene; use [] for a characterless establishing scene
+- conversation_reason is mandatory whenever characters_present is non-empty; it must be specific to the scene's causal problem, not a generic excuse to make someone talk
+- dialogue_intent must describe the necessary verbal exchange created by conversation_reason
+- preserve character, location, prop, costume, time and causal continuity
+- do not write final shot prompts or production JSON
+`;
+
+    const result = await callLLM(systemPrompt, userPrompt, undefined, { useStream: false, temperature: 0.2 });
+    const rawScene = result?.scene && typeof result.scene === 'object' ? result.scene : result;
+    if (!rawScene || typeof rawScene !== 'object') {
+      throw _tagPipelineError(new Error(`[ScriptWriter] Episode scene simulation invalid for S${seasonNumber}E${episodeNumber}: scene ${sceneNo} missing object`), { layer: 'scene_simulation', code: 'SCENE_SIMULATION_MISSING_OBJECT', sceneNumber: sceneNo });
+    }
+
+    const scene = {
+      ...rawScene,
+      scene_number: sceneNo,
+      purpose: _compactLLMText(rawScene.purpose || '', 1000),
+      characters_present: Array.isArray(rawScene.characters_present)
+        ? rawScene.characters_present.map(x => String(x || '').trim()).filter(Boolean)
+        : [],
+      opening_state: _compactLLMText(rawScene.opening_state || priorState || '', 1100),
+      causal_event: _compactLLMText(rawScene.causal_event || '', 1200),
+      character_state_changes: Array.isArray(rawScene.character_state_changes)
+        ? rawScene.character_state_changes.slice(0, 8).map(x => _compactLLMText(x, 350))
+        : [],
+      environment_state_changes: Array.isArray(rawScene.environment_state_changes)
+        ? rawScene.environment_state_changes.slice(0, 8).map(x => _compactLLMText(x, 350))
+        : [],
+      conversation_reason: _compactLLMText(rawScene.conversation_reason || '', 1100),
+      dialogue_intent: _compactLLMText(rawScene.dialogue_intent || '', 700),
+      closing_state: _compactLLMText(rawScene.closing_state || '', 1100),
+      handoff_to_next_scene: _compactLLMText(rawScene.handoff_to_next_scene || '', 1100),
+    };
+
+    const missingFields = ['opening_state', 'closing_state', 'handoff_to_next_scene']
+      .concat((Array.isArray(scene.characters_present) && scene.characters_present.length) ? ['conversation_reason'] : [])
+      .filter(field => !String(scene[field] || '').trim());
+
+    if (missingFields.length) {
+      console.warn(`[ScriptWriter] Scene ${sceneNo} failed structural validation; attempting one bounded repair for: ${missingFields.join(', ')}`);
+      let repaired;
+      try {
+        repaired = await repairEpisodeScene({ sceneNo, priorState, rawScene, missingFields });
+      } catch (repairErr) {
+        throw _tagPipelineError(new Error(`[ScriptWriter] Episode scene simulation invalid: scene ${sceneNo} missing ${missingFields.join(', ')}; repair failed: ${repairErr.message}`), { layer: 'scene_simulation', code: 'SCENE_SIMULATION_REPAIR_FAILED', sceneNumber: sceneNo });
+      }
+
+      const repairedScene = repaired?.scene && typeof repaired.scene === 'object' ? repaired.scene : repaired;
+      if (repairedScene && typeof repairedScene === 'object') {
+        if (Array.isArray(repairedScene.characters_present)) {
+          scene.characters_present = repairedScene.characters_present.map(x => String(x || '').trim()).filter(Boolean);
+        }
+        scene.opening_state = _compactLLMText(repairedScene.opening_state || scene.opening_state || priorState || '', 1100);
+        scene.closing_state = _compactLLMText(repairedScene.closing_state || scene.closing_state || '', 1100);
+        scene.handoff_to_next_scene = _compactLLMText(repairedScene.handoff_to_next_scene || scene.handoff_to_next_scene || '', 1100);
+        scene.purpose = _compactLLMText(repairedScene.purpose || scene.purpose || '', 1000);
+        scene.causal_event = _compactLLMText(repairedScene.causal_event || scene.causal_event || '', 1200);
+        scene.conversation_reason = _compactLLMText(repairedScene.conversation_reason || scene.conversation_reason || '', 1100);
+        scene.dialogue_intent = _compactLLMText(repairedScene.dialogue_intent || scene.dialogue_intent || '', 700);
+        if (Array.isArray(repairedScene.character_state_changes)) {
+          scene.character_state_changes = repairedScene.character_state_changes.slice(0, 8).map(x => _compactLLMText(x, 350));
+        }
+        if (Array.isArray(repairedScene.environment_state_changes)) {
+          scene.environment_state_changes = repairedScene.environment_state_changes.slice(0, 8).map(x => _compactLLMText(x, 350));
+        }
+      }
+    }
+
+    const requiredSceneFields = ['opening_state', 'closing_state', 'handoff_to_next_scene', 'characters_present'];
+    if (scene.characters_present.length) requiredSceneFields.push('conversation_reason');
+    const stillMissing = requiredSceneFields
+      .filter(field => !String(scene[field] || '').trim());
+    if (stillMissing.length) {
+      throw _tagPipelineError(new Error(`[ScriptWriter] Episode scene simulation invalid: scene ${sceneNo} missing state/handoff after repair (${stillMissing.join(', ')})`), { layer: 'scene_simulation', code: 'SCENE_SIMULATION_REQUIRED_FIELDS_MISSING', sceneNumber: sceneNo });
+    }
+
+    // Verify the causal chain locally before checkpointing the scene.
+    if (sceneNo > 1 && !scene.opening_state.trim()) {
+      throw new Error(`[ScriptWriter] Episode scene simulation invalid: empty inherited opening state at scene ${sceneNo}`);
+    }
+
+    scenePlan.push(scene);
+
+    const partial = {
+      episode: { season: Number(seasonNumber), episode: Number(episodeNumber) },
+      opening_state: priorOpening,
+      ending_state: priorEnding,
+      scene_beat_plan: scenePlan.slice(),
+      continuity_invariants: Array.isArray(prior.continuity_invariants)
+        ? prior.continuity_invariants
+        : (Array.isArray(trajectory.character_changes) ? trajectory.character_changes.slice(0, 8) : []),
+      unresolved_threads: Array.isArray(prior.unresolved_threads)
+        ? prior.unresolved_threads
+        : [],
+      simulation_status: scenePlan.length >= resolvedSceneCount ? 'complete' : 'in_progress',
+      completed_scene_numbers: scenePlan.map(sc => Number(sc.scene_number)),
+      total_scene_numbers: resolvedSceneCount,
+    };
+
+    if (typeof checkpoint === 'function') {
+      await checkpoint({
+        stage: 'episode_scene_simulation',
+        sceneNumber: sceneNo,
+        simulation: partial,
+      });
+      console.log(`[Pipeline] 💾 Episode scene-simulation checkpoint persisted: S${seasonNumber}E${episodeNumber} scene ${sceneNo}/${resolvedSceneCount}`);
+    }
+  }
+
+  const finalSimulation = {
+    episode: { season: Number(seasonNumber), episode: Number(episodeNumber) },
+    opening_state: priorOpening,
+    ending_state: priorEnding,
+    scene_beat_plan: scenePlan,
+    continuity_invariants: Array.isArray(prior.continuity_invariants)
+      ? prior.continuity_invariants
+      : (Array.isArray(trajectory.character_changes) ? trajectory.character_changes.slice(0, 8) : []),
+    unresolved_threads: Array.isArray(prior.unresolved_threads) ? prior.unresolved_threads : [],
+    simulation_status: 'complete',
+    completed_scene_numbers: scenePlan.map(sc => Number(sc.scene_number)),
+    total_scene_numbers: resolvedSceneCount,
+  };
+
+  console.log(`[ScriptWriter] Episode scene simulation locked: ${scenePlan.length} scenes.`);
+  return finalSimulation;
+}
+
+/**
+ * Deterministic pipeline-layer diagnostics. Every recoverable production error
+ * carries the layer that owns the bad contract so the autonomous recovery
+ * controller can repair only the owning unit without rewinding the writer.
+ */
+function _tagPipelineError(error, {
+  layer,
+  code = 'PIPELINE_LAYER_FAILURE',
+  sceneNumber = null,
+  shotIndex = null,
+  recoverable = true,
+} = {}) {
+  const err = error instanceof Error ? error : new Error(String(error || 'Unknown pipeline error'));
+  err.pipelineLayer = layer;
+  err.pipelineCode = code;
+  err.sceneNumber = sceneNumber != null ? Number(sceneNumber) : (err.sceneNumber ?? null);
+  err.shotIndex = shotIndex != null ? Number(shotIndex) : (err.shotIndex ?? null);
+  err.recoverable = recoverable;
+  return err;
+}
+
+function _diagnosePipelineError(error) {
+  if (error?.pipelineLayer) return error;
+  const message = String(error?.message || error || '');
+  const sceneMatch = message.match(/Scene\s+(\d+)/i);
+  const shotMatch = message.match(/shot\s+(\d+)/i);
+  const parsedSceneNumber = sceneMatch ? Number(sceneMatch[1]) : null;
+  const parsedShotIndex = shotMatch ? Number(shotMatch[1]) : null;
+  const sceneNumber = Number.isInteger(parsedSceneNumber) && parsedSceneNumber >= 1 ? parsedSceneNumber : null;
+  const shotIndex = Number.isInteger(parsedShotIndex) && parsedShotIndex >= 1 ? parsedShotIndex : null;
+
+  if (/contains characters but has no locked conversation_reason/i.test(message)) {
+    return _tagPipelineError(error, {
+      layer: 'scene_simulation',
+      code: 'SCENE_SIMULATION_CONVERSATION_REASON_MISSING',
+      sceneNumber,
+    });
+  }
+  if (/shot simulation invalid|invalid locked simulation|shot simulation checkpoint missing/i.test(message)) {
+    return _tagPipelineError(error, {
+      layer: 'shot_simulation',
+      code: 'SHOT_SIMULATION_CONTRACT_INVALID',
+      sceneNumber,
+      shotIndex,
+    });
+  }
+  if (/scene shot writing|shot sequence invalid|missing image_prompt|missing dialogue_or_action/i.test(message)) {
+    return _tagPipelineError(error, {
+      layer: 'shot_writing',
+      code: 'SHOT_WRITING_CONTRACT_INVALID',
+      sceneNumber,
+      shotIndex,
+    });
+  }
+  return _tagPipelineError(error, { layer: 'unknown', code: 'UNCLASSIFIED_PIPELINE_FAILURE', recoverable: false });
+}
+
+function _mergeBlueprintWithSceneSimulation(blueprint, sceneSimulation) {
+  const source = blueprint && typeof blueprint === 'object' ? blueprint : {};
+  const plan = Array.isArray(sceneSimulation?.scene_beat_plan)
+    ? sceneSimulation.scene_beat_plan
+        .filter(sc => Number.isInteger(Number(sc?.scene_number)) && Number(sc.scene_number) >= 1)
+        .sort((a, b) => Number(a.scene_number) - Number(b.scene_number))
+    : [];
+  const existingScenes = Array.isArray(source.scenes) ? source.scenes : [];
+  const byNumber = new Map(
+    existingScenes
+      .filter(sc => Number.isInteger(Number(sc?.scene_number)) && Number(sc.scene_number) >= 1)
+      .map(sc => [Number(sc.scene_number), sc])
+  );
+
+  const mergedScenes = plan.map(sim => {
+    const sceneNo = Number(sim.scene_number);
+    const existing = byNumber.get(sceneNo) || {};
+    const characters = Array.isArray(sim.characters_present)
+      ? sim.characters_present.map(x => String(x || '').trim()).filter(Boolean)
+      : (Array.isArray(existing.characters_present) ? existing.characters_present : []);
+
+    return {
+      ...existing,
+      scene_number: sceneNo,
+      scene_description: existing.scene_description || sim.purpose || sim.causal_event || `Scene ${sceneNo} advances the locked episode trajectory.`,
+      emotional_beat: existing.emotional_beat || sim.character_state_changes?.[0] || sim.environment_state_changes?.[0] || sim.causal_event || 'The emotional pressure changes.',
+      location: existing.location || 'INT./EXT. established story location — continuous time',
+      lighting_design: existing.lighting_design || 'Cinematic naturalistic lighting consistent with the established visual language.',
+      camera_language: existing.camera_language || 'Controlled cinematic coverage preserving spatial and emotional continuity.',
+      characters_present: characters,
+      shot_count_target: Math.max(2, Math.min(5, Number(existing.shot_count_target) || 3)),
+      conversation_reason: _compactLLMText(sim.conversation_reason || existing.conversation_reason || '', 1100),
+      dialogue_intent: _compactLLMText(sim.dialogue_intent || existing.dialogue_intent || '', 700),
+      simulation_opening_state: _compactLLMText(sim.opening_state || '', 1100),
+      simulation_closing_state: _compactLLMText(sim.closing_state || '', 1100),
+      simulation_handoff_to_next_scene: _compactLLMText(sim.handoff_to_next_scene || '', 1100),
+      causal_event: _compactLLMText(sim.causal_event || existing.causal_event || '', 1200),
+    };
+  });
+
+  return {
+    ...source,
+    scenes: mergedScenes,
+  };
+}
+
+function _hydrateScenesFromSceneSimulation(scenes, sceneSimulation) {
+  const plan = Array.isArray(sceneSimulation?.scene_beat_plan) ? sceneSimulation.scene_beat_plan : [];
+  const byNumber = new Map(plan.map(sc => [Number(sc.scene_number), sc]));
+  return (Array.isArray(scenes) ? scenes : []).map(scene => {
+    const sim = byNumber.get(Number(scene.scene_number));
+    if (!sim) return { ...scene };
+    return {
+      ...scene,
+      conversation_reason: _compactLLMText(sim.conversation_reason || scene.conversation_reason || '', 1100),
+      dialogue_intent: _compactLLMText(sim.dialogue_intent || scene.dialogue_intent || '', 700),
+      simulation_opening_state: _compactLLMText(sim.opening_state || '', 1100),
+      simulation_closing_state: _compactLLMText(sim.closing_state || '', 1100),
+      simulation_handoff_to_next_scene: _compactLLMText(sim.handoff_to_next_scene || '', 1100),
+      causal_event: _compactLLMText(sim.causal_event || scene.causal_event || '', 1200),
+    };
+  });
+}
+
+function _invalidateShotSimulationScene(shotSimulation, sceneNumber) {
+  const source = shotSimulation && typeof shotSimulation === 'object' ? shotSimulation : {};
+  return {
+    ...source,
+    shots: (Array.isArray(source.shots) ? source.shots : [])
+      .filter(shot => Number(shot.scene_number) !== Number(sceneNumber)),
+  };
+}
+
+function _invalidateWrittenScene(existingScenes, sceneNumber) {
+  const target = Number(sceneNumber);
+  if (!Number.isInteger(target) || target < 1) return Array.isArray(existingScenes) ? existingScenes : [];
+  return (Array.isArray(existingScenes) ? existingScenes : [])
+    .filter(scene => Number(scene?.scene_number) !== target);
+}
+
+async function repairEpisodeSceneSimulation({
+  storyline,
+  characters,
+  episodeTrajectory,
+  episodeSimulation,
+  scene,
+  previousScene = null,
+  sceneNumber,
+  error = '',
+  ensureCharacter = null,
+}) {
+  const sim = episodeSimulation && typeof episodeSimulation === 'object' ? episodeSimulation : {};
+  const existing = Array.isArray(sim.scene_beat_plan)
+    ? sim.scene_beat_plan.find(sc => Number(sc.scene_number) === Number(sceneNumber)) || {}
+    : {};
+  const inheritedState = previousScene?.closing_state || sim.opening_state || episodeTrajectory?.opening || '';
+  const repairSystem = `${DIRECTOR_PERSONA}\nYou are the deterministic scene-simulation repair director. Repair ONLY one persisted scene-simulation object. Return JSON only. Preserve every valid supplied fact. Fill or correct only the field identified by the failure.`;
+  const repairPrompt = `
+PIPELINE FAILURE LAYER: scene_simulation
+FAILURE CODE: SCENE_SIMULATION_CONVERSATION_REASON_MISSING
+SCENE: ${sceneNumber}
+ERROR: ${String(error).slice(0, 1200)}
+INHERITED STATE: ${_compactLLMText(inheritedState, 1200)}
+SCENE BLUEPRINT: ${JSON.stringify(scene || {}).slice(0, 7000)}
+PERSISTED SCENE SIMULATION: ${JSON.stringify(existing).slice(0, 9000)}
+AUTHORITATIVE EPISODE TRAJECTORY: ${JSON.stringify(_compactEpisodeTrajectoryForLLM(episodeTrajectory)).slice(0, 7000)}
+CAST: ${(characters || []).map(c => `${c.name}: ${_compactLLMText(c.description || '', 400)}`).join('\n')}
+
+Repair the scene simulation. The scene contains characters, so conversation_reason MUST explain the exact causal reason these characters need to speak in this scene, what is at stake, and why silence would fail the scene. dialogue_intent must directly arise from that reason.
+Do not casually invent a new character, event, location, prop, time jump, or plot beat.
+However, if the supplied persisted scene/blueprint already names a character that is
+not currently present in CAST, preserve that exact character name in characters_present.
+The pipeline will materialize that missing character into the permanent cast before
+rendering. Never rename that character or substitute another one.
+Return exactly the scene simulation object with these keys:
+{
+  "scene_number": ${Number(sceneNumber)},
+  "purpose": "...",
+  "opening_state": "...",
+  "causal_event": "...",
+  "characters_present": ["Exact existing character names"],
+  "character_state_changes": ["..."],
+  "environment_state_changes": ["..."],
+  "conversation_reason": "...",
+  "dialogue_intent": "...",
+  "closing_state": "...",
+  "handoff_to_next_scene": "..."
+}`;
+
+  const repaired = await callLLM(repairSystem, repairPrompt, undefined, { useStream: false, temperature: 0.1 });
+  const raw = repaired?.scene && typeof repaired.scene === 'object' ? repaired.scene : repaired;
+  if (!raw || typeof raw !== 'object') {
+    throw _tagPipelineError(new Error(`Backward scene repair returned no object for scene ${sceneNumber}`), {
+      layer: 'scene_simulation', code: 'SCENE_SIMULATION_REPAIR_EMPTY', sceneNumber,
+    });
+  }
+
+  // During targeted repair, the persisted scene-simulation roster is
+  // authoritative. A repair LLM may repair the requested field, but it must
+  // never silently add/remove/rename scene participants.
+  const lockedCharacters = Array.isArray(existing.characters_present)
+    ? existing.characters_present.map(x => String(x || '').trim()).filter(Boolean)
+    : (Array.isArray(scene.characters_present) ? scene.characters_present.map(x => String(x || '').trim()).filter(Boolean) : []);
+  const repairedCharacters = lockedCharacters.length
+    ? lockedCharacters.slice()
+    : (Array.isArray(raw.characters_present)
+      ? raw.characters_present.map(x => String(x || '').trim()).filter(Boolean)
+      : []);
+  const allowed = new Set((characters || []).map(c => String(c.name || '').trim()).filter(Boolean));
+  const invalidCharacters = repairedCharacters.filter(name => !allowed.has(name));
+
+  if (invalidCharacters.length) {
+    if (typeof ensureCharacter !== 'function') {
+      throw _tagPipelineError(new Error(
+        `Backward scene repair requires character materialization for: ${invalidCharacters.join(', ')}`
+      ), {
+        layer: 'scene_simulation',
+        code: 'SCENE_SIMULATION_CHARACTER_MATERIALIZATION_UNAVAILABLE',
+        sceneNumber,
+      });
+    }
+
+    for (const missingName of [...new Set(invalidCharacters)]) {
+      const created = await ensureCharacter({
+        name: missingName,
+        scene,
+        sceneNumber,
+        storyline,
+        characters,
+        episodeTrajectory,
+        reason: error,
+      });
+
+      if (!created || typeof created !== 'object' || !String(created.name || '').trim()) {
+        throw _tagPipelineError(new Error(
+          `Character materialization returned no usable character for "${missingName}"`
+        ), {
+          layer: 'scene_simulation',
+          code: 'SCENE_SIMULATION_CHARACTER_MATERIALIZATION_FAILED',
+          sceneNumber,
+        });
+      }
+
+      // Caller is expected to persist and append the character to the authoritative
+      // roster. We also append defensively here so this repair invocation immediately
+      // sees the newly materialized identity.
+      const alreadyPresent = (characters || []).some(
+        c => String(c?.name || '').trim().toLowerCase() === String(created.name || '').trim().toLowerCase()
+      );
+      if (!alreadyPresent && Array.isArray(characters)) characters.push(created);
+    }
+  }
+
+  const allowedAfterMaterialization = new Set(
+    (characters || []).map(c => String(c.name || '').trim()).filter(Boolean)
+  );
+  const unresolvedCharacters = repairedCharacters.filter(name => !allowedAfterMaterialization.has(name));
+  if (unresolvedCharacters.length) {
+    throw _tagPipelineError(new Error(
+      `Scene repair still has unresolved character(s): ${unresolvedCharacters.join(', ')}`
+    ), {
+      layer: 'scene_simulation',
+      code: 'SCENE_SIMULATION_CHARACTER_MATERIALIZATION_INCOMPLETE',
+      sceneNumber,
+    });
+  }
+
+  const repairedScene = {
+    ...existing,
+    ...raw,
+    scene_number: Number(sceneNumber),
+    characters_present: repairedCharacters,
+    conversation_reason: _compactLLMText(raw.conversation_reason || existing.conversation_reason || '', 1100),
+    dialogue_intent: _compactLLMText(raw.dialogue_intent || existing.dialogue_intent || '', 700),
+    opening_state: _compactLLMText(raw.opening_state || existing.opening_state || inheritedState || '', 1100),
+    closing_state: _compactLLMText(raw.closing_state || existing.closing_state || '', 1100),
+    handoff_to_next_scene: _compactLLMText(raw.handoff_to_next_scene || existing.handoff_to_next_scene || '', 1100),
+  };
+
+  const required = ['opening_state', 'closing_state', 'handoff_to_next_scene'];
+  if (repairedScene.characters_present.length) required.push('conversation_reason');
+  const missing = required.filter(k => !String(repairedScene[k] || '').trim());
+  if (missing.length) {
+    throw _tagPipelineError(new Error(`Backward scene repair still missing: ${missing.join(', ')}`), {
+      layer: 'scene_simulation', code: 'SCENE_SIMULATION_REPAIR_INCOMPLETE', sceneNumber,
+    });
+  }
+  return repairedScene;
+}
+
+/**
+ * Hard pre-generation shot simulation.
+ * Simulates the complete ordered shot trajectory for the episode before any
+ * image/video generation begins. The result is a locked causal plan used by
+ * every scene shot-writing pass.
+ */
+async function simulateEpisodeShots({
+  storyline,
+  characters,
+  episodeSimulation,
+  sceneSimulation = null,
+  scenes,
+  episodeNumber,
+  seasonNumber,
+  targetMinutes,
+  existingShotSimulation = null,
+  checkpoint = null,
+}) {
+  const plannedScenes = Array.isArray(scenes) ? scenes : [];
+  const castNames = (characters || []).map(c => c.name).filter(Boolean);
+
+  const counts = Object.fromEntries(plannedScenes.map(sc => [
+    Number(sc.scene_number),
+    Math.max(2, Math.min(5, Number(sc.shot_count_target) || 3)),
+  ]));
+
+  const existing = existingShotSimulation && typeof existingShotSimulation === 'object'
+    ? existingShotSimulation
+    : {};
+  const existingShots = Array.isArray(existing.shots) ? existing.shots : [];
+
+  const normalizedExisting = [];
+  for (const scene of plannedScenes) {
+    const sceneNo = Number(scene.scene_number);
+    const target = counts[sceneNo];
+    const prior = existingShots
+      .filter(s => Number(s.scene_number) === sceneNo)
+      .sort((a, b) => Number(a.shot_index) - Number(b.shot_index));
+
+    if (prior.length === target) {
+      const validPrior = prior.every(shot =>
+        Number.isInteger(Number(shot?.duration)) && Number(shot.duration) >= 6 && Number(shot.duration) <= 10
+      );
+      if (validPrior) {
+        normalizedExisting.push(...prior.map((shot, i) => ({
+          ...shot,
+          scene_number: sceneNo,
+          shot_index: i + 1,
+          duration: Number(shot.duration),
+          duration_source: 'shot_simulation_locked',
+        })));
+        console.log(`[ScriptWriter] ↺ Restored shot simulation checkpoint S${seasonNumber}E${episodeNumber} scene ${sceneNo} (${target}/${target} shots)`);
+      } else {
+        console.warn(`[ScriptWriter] Invalid shot-simulation checkpoint duration(s) in scene ${sceneNo}; re-simulating that scene instead of clamping.`);
+      }
+    }
+  }
+
+  const working = {
+    episode: { season: Number(seasonNumber), episode: Number(episodeNumber) },
+    global_start_state: existing.global_start_state || episodeSimulation?.opening_state || '',
+    global_end_state: existing.global_end_state || episodeSimulation?.ending_state || '',
+    shots: normalizedExisting.slice(),
+    continuity_invariants: Array.isArray(existing.continuity_invariants)
+      ? existing.continuity_invariants
+      : (episodeSimulation?.continuity_invariants || []),
+    unresolved_threads_at_end: Array.isArray(existing.unresolved_threads_at_end)
+      ? existing.unresolved_threads_at_end
+      : (episodeSimulation?.unresolved_threads || []),
+  };
+
+  const simulatedScenes = Array.isArray(sceneSimulation?.scene_beat_plan)
+    ? sceneSimulation.scene_beat_plan
+    : [];
+
+  const getPreviousShot = (sceneNo) => {
+    const sameScene = working.shots
+      .filter(s => Number(s.scene_number) === Number(sceneNo))
+      .sort((a, b) => Number(a.shot_index) - Number(b.shot_index));
+    if (sameScene.length) return sameScene[sameScene.length - 1];
+
+    const prior = working.shots.slice().sort((a, b) => {
+      if (Number(a.scene_number) !== Number(b.scene_number)) {
+        return Number(a.scene_number) - Number(b.scene_number);
+      }
+      return Number(a.shot_index) - Number(b.shot_index);
+    });
+    return prior.length ? prior[prior.length - 1] : null;
+  };
+
+  for (let scenePos = 0; scenePos < plannedScenes.length; scenePos++) {
+    const scene = plannedScenes[scenePos];
+    const sceneNo = Number(scene.scene_number);
+    const target = counts[sceneNo];
+    const already = working.shots.filter(s => Number(s.scene_number) === sceneNo);
+
+    if (already.length === target) continue;
+
+    const rawSim = simulatedScenes.find(s => Number(s.scene_number) === sceneNo) || {};
+    const compactSceneSimulation = {
+      scene_number: sceneNo,
+      purpose: _compactLLMText(rawSim.purpose || scene.scene_description || '', 700),
+      opening_state: _compactLLMText(rawSim.opening_state || '', 800),
+      causal_event: _compactLLMText(rawSim.causal_event || '', 900),
+      character_state_changes: Array.isArray(rawSim.character_state_changes)
+        ? rawSim.character_state_changes.slice(0, 6).map(x => _compactLLMText(x, 300))
+        : [],
+      environment_state_changes: Array.isArray(rawSim.environment_state_changes)
+        ? rawSim.environment_state_changes.slice(0, 6).map(x => _compactLLMText(x, 300))
+        : [],
+      conversation_reason: _compactLLMText(rawSim.conversation_reason || '', 1100),
+      dialogue_intent: _compactLLMText(rawSim.dialogue_intent || '', 600),
+      closing_state: _compactLLMText(rawSim.closing_state || '', 800),
+      handoff_to_next_scene: _compactLLMText(rawSim.handoff_to_next_scene || '', 800),
+    };
+
+    const previousShot = getPreviousShot(sceneNo);
+    const sceneOpeningState = previousShot
+      ? (previousShot.handoff_to_next || previousShot.end_state || compactSceneSimulation.opening_state)
+      : (compactSceneSimulation.opening_state || episodeSimulation?.opening_state || '');
+
+    const systemPrompt = `${DIRECTOR_PERSONA}
+${MULTI_SPEAKER_LTX_RULES}
+You are the continuity director performing a PRE-GENERATION SHOT SIMULATION for ONE SCENE.
+Do not write prose outside JSON. Do not generate images, videos, or final prompts.
+This scene is part of a locked cinematic episode. Preserve the causal state handed into the scene
+and produce exactly the requested number of sequential local shots.`;
+
+    const userPrompt = `
+SERIES: ${_compactLLMText(storyline.title || '', 300)}
+EPISODE: S${seasonNumber}E${episodeNumber}
+SCENE: ${sceneNo}
+SCENE POSITION: ${scenePos + 1} of ${plannedScenes.length}
+TARGET RUNTIME: ~${targetMinutes} minutes
+EXPECTED SHOTS FOR THIS SCENE: ${target}
+CAST: ${castNames.join(', ')}
+
+EPISODE OPENING STATE:
+${_compactLLMText(episodeSimulation?.opening_state || '', 900)}
+
+CURRENT SCENE BLUEPRINT:
+${JSON.stringify({
+      scene_number: sceneNo,
+      scene_description: _compactLLMText(scene.scene_description || '', 800),
+      emotional_beat: _compactLLMText(scene.emotional_beat || '', 600),
+      location: _compactLLMText(scene.location || '', 400),
+      lighting_design: _compactLLMText(scene.lighting_design || '', 400),
+      camera_language: _compactLLMText(scene.camera_language || '', 500),
+      characters_present: scene.characters_present || [],
+      shot_count_target: target,
+    })}
+
+LOCKED SCENE SIMULATION:
+${JSON.stringify(compactSceneSimulation)}
+
+CONVERSATION REQUIREMENT:
+Every character-containing scene must have a concrete conversational reason. At least one shot must contain meaningful spoken dialogue that directly arises from that reason. Do not use generic greetings, exposition dumps, or unrelated filler.
+
+STATE INHERITED FROM PREVIOUS SHOT:
+${JSON.stringify(previousShot ? {
+      scene_number: previousShot.scene_number,
+      shot_index: previousShot.shot_index,
+      end_state: previousShot.end_state || '',
+      handoff_to_next: previousShot.handoff_to_next || '',
+    } : { opening_state: sceneOpeningState })}
+
+Produce exactly ${target} shots for SCENE ${sceneNo}.
+The first shot MUST begin from the inherited state above.
+Each subsequent shot MUST inherit the immediately previous shot's end_state/handoff.
+The final shot MUST end on the scene's locked closing state or a concrete state that causally leads to it.
+
+Return exactly:
+{
+  "scene_number": ${sceneNo},
+  "shots": [
+    {
+      "scene_number": ${sceneNo},
+      "shot_index": 1,
+      "purpose": "...",
+      "start_state": "...",
+      "action_arc": "...",
+      "dialogue_intent": "spoken|internal_monologue|ambient|phone_vo",
+      "speaker": "character name or empty",
+      "dialogue_purpose": "what must be said/heard, and why this conversation belongs in this exact shot",
+      "opening_frame_transition": "Descriptive visual/audio bridge from the previous shot or previous scene into this opening state. No editing instructions.",
+      "duration": 6,
+      "character_state_change": "...",
+      "environment_state_change": "...",
+      "end_state": "...",
+      "end_frame_transition": "Descriptive visual/audio bridge from this shot's end into the next shot or next scene. No editing instructions.",
+      "handoff_to_next": "exact continuity fact the next shot must inherit"
+    }
+  ]
+}
+
+HARD REQUIREMENTS:
+- Exactly ${target} shots.
+- All shots belong to scene ${sceneNo}.
+- Shot indices are local and serial: 1, 2, 3... ${target}.
+- Do NOT use episode-global shot numbering.
+- Do NOT skip or duplicate a local index.
+- Do NOT change scene number.
+- Do NOT introduce new characters, locations, props, time jumps, or costume changes unsupported by the locked scene.
+- Preserve the emotional and causal progression.
+- Every character-containing scene must include at least one meaningful spoken exchange. The shot sequence must provide a concrete reason for it and carry that reason into dialogue_purpose.
+- duration is simulation-owned and MUST be an integer from 6 through 10. Choose it from the actual beat density; never exceed 10.
+- opening_frame_transition and end_frame_transition must describe what visually/audibly carries momentum across shot boundaries. Use match-on-action, held eyeline, continuing prop motion, spatial reveal, sound bridge, lighting change, or another in-world bridge. Never write “cut to”, “fade in”, “fade out”, “edit”, “transition effect”, or other editor instructions.
+`;
+
+    const result = await callLLM(systemPrompt, userPrompt, undefined, { useStream: false, temperature: 0.2 });
+    if (!result || !Array.isArray(result.shots)) {
+      throw _tagPipelineError(new Error(`[ScriptWriter] Shot simulation invalid for S${seasonNumber}E${episodeNumber} scene ${sceneNo}: missing shots array`), { layer: 'shot_simulation', code: 'SHOT_SIMULATION_MISSING_SHOTS', sceneNumber: sceneNo });
+    }
+    if (result.shots.length !== target) {
+      throw _tagPipelineError(new Error(`[ScriptWriter] Shot simulation invalid for S${seasonNumber}E${episodeNumber} scene ${sceneNo}: expected ${target} shots, got ${result.shots.length}`), { layer: 'shot_simulation', code: 'SHOT_SIMULATION_COUNT_MISMATCH', sceneNumber: sceneNo });
+    }
+
+    const sceneShots = result.shots.map((shot, i) => {
+      const rawScene = Number(shot?.scene_number);
+      const rawIndex = Number(shot?.shot_index);
+      const expectedIndex = i + 1;
+      if (rawScene !== sceneNo || rawIndex !== expectedIndex) {
+        console.warn(
+          `[ScriptWriter] Normalizing simulation S${sceneNo}: model returned S${Number.isFinite(rawScene) ? rawScene : 'n/a'}/idx${Number.isFinite(rawIndex) ? rawIndex : 'n/a'}, expected S${sceneNo}/idx${expectedIndex}`
+        );
+      }
+      const rawDuration = Number(shot?.duration);
+      if (!Number.isInteger(rawDuration) || rawDuration < 6 || rawDuration > 10) {
+        throw _tagPipelineError(new Error(`[ScriptWriter] Shot simulation invalid for S${seasonNumber}E${episodeNumber} scene ${sceneNo} shot ${expectedIndex}: duration must be an integer 6–10, got ${shot?.duration}`), { layer: 'shot_simulation', code: 'SHOT_SIMULATION_INVALID_DURATION', sceneNumber: sceneNo, shotIndex: expectedIndex });
+      }
+      const duration = rawDuration;
+      return {
+        ...shot,
+        scene_number: sceneNo,
+        shot_index: expectedIndex,
+        duration,
+        duration_source: 'shot_simulation_locked',
+      };
+    });
+
+    working.shots = working.shots.filter(s => Number(s.scene_number) !== sceneNo);
+    working.shots.push(...sceneShots);
+    working.shots.sort((a, b) =>
+      Number(a.scene_number) - Number(b.scene_number) ||
+      Number(a.shot_index) - Number(b.shot_index)
+    );
+
+    if (typeof checkpoint === 'function') {
+      await checkpoint({
+        stage: 'shot_simulation',
+        sceneNumber: sceneNo,
+        completedScenes: plannedScenes
+          .filter(s => working.shots.filter(x => Number(x.scene_number) === Number(s.scene_number)).length === counts[Number(s.scene_number)])
+          .map(s => Number(s.scene_number)),
+        shotSimulation: working,
+      });
+      console.log(`[Pipeline] 💾 Shot-simulation checkpoint persisted: S${seasonNumber}E${episodeNumber} scene ${sceneNo}/${plannedScenes.length}`);
+    }
+  }
+
+  const expectedTotal = plannedScenes.reduce((n, s) => n + counts[Number(s.scene_number)], 0);
+  if (working.shots.length !== expectedTotal) {
+    throw new Error(`[ScriptWriter] Shot simulation incomplete: ${working.shots.length}/${expectedTotal} shots`);
+  }
+
+  console.log(`[ScriptWriter] Shot simulation locked: ${working.shots.length} shots across ${plannedScenes.length} scenes.`);
+  return working;
+}
+
+function _compactLLMText(value, maxChars = 3000) {
+  const text = value == null ? '' : String(value);
+  if (text.length <= maxChars) return text;
+  return text.slice(0, maxChars) + '\n[context truncated for provider budget]';
+}
+
+function _compactEpisodeTrajectoryForLLM(trajectory) {
+  if (!trajectory || typeof trajectory !== 'object') return null;
+  return {
+    global_episode: Number(trajectory.global_episode || 0),
+    season: Number(trajectory.season || 0),
+    episode: Number(trajectory.episode || 0),
+    opening: _compactLLMText(trajectory.opening || '', 700),
+    inciting: _compactLLMText(trajectory.inciting || '', 800),
+    middle_turn: _compactLLMText(trajectory.middle_turn || '', 800),
+    climax: _compactLLMText(trajectory.climax || '', 800),
+    ending: _compactLLMText(trajectory.ending || '', 700),
+    next_hook: _compactLLMText(trajectory.next_hook || '', 700),
+    character_changes: Array.isArray(trajectory.character_changes)
+      ? trajectory.character_changes.slice(0, 8).map(x => _compactLLMText(x, 350))
+      : [],
+  };
+}
+
+function _buildCompactEpisodeContext({ storyline, fullStorySimulation, seasonNumber, episodeNumber, episodeTrajectory, recentEpisodes = [] }) {
+  const master = fullStorySimulation && typeof fullStorySimulation === 'object' ? fullStorySimulation : {};
+  const endpoints = Array.isArray(master.season_endpoints) ? master.season_endpoints : [];
+  const seasonEndpoint = endpoints.find(e => Number(e?.season) === Number(seasonNumber)) || {};
+  const unresolved = Array.isArray(master.unresolved_threads) ? master.unresolved_threads.slice(-8) : [];
+  const recent = (recentEpisodes || []).slice(-4).map(e => {
+    const sc = safeJsonParse(e.script, {});
+    return {
+      season: Number(e.season_number || 1),
+      episode: Number(e.episode_number || 0),
+      summary: _compactLLMText(sc.updated_plot_summary || sc.logline || '', 700),
+      handoff: _compactLLMText(sc.director_vision || '', 500),
+    };
+  });
+
+  return {
+    title: storyline?.title || '',
+    logline: _compactLLMText(storyline?.logline || '', 700),
+    theme: _compactLLMText(storyline?.central_theme || '', 700),
+    series_summary: _compactLLMText(storyline?.comprehensive_summary || storyline?.plot_summary || '', 5000),
+    season_arc: _compactLLMText(
+      Array.isArray(storyline?.season_arcs)
+        ? (storyline.season_arcs[Number(seasonNumber) - 1] || '')
+        : (typeof storyline?.season_arcs === 'string' ? storyline.season_arcs : ''),
+      1800
+    ),
+    series_opening_state: _compactLLMText(master.opening_state || '', 700),
+    inciting_event: _compactLLMText(master.inciting_event || '', 900),
+    season_endpoint: {
+      beginning: _compactLLMText(seasonEndpoint.beginning || '', 700),
+      turning_points: Array.isArray(seasonEndpoint.turning_points) ? seasonEndpoint.turning_points.slice(0, 4).map(x => _compactLLMText(x, 500)) : [],
+      ending: _compactLLMText(seasonEndpoint.ending || '', 900),
+    },
+    finale_resolution: _compactLLMText(master.finale_resolution || '', 900),
+    unresolved_threads: unresolved.map(x => _compactLLMText(x, 400)),
+    target_episode: {
+      season: Number(seasonNumber),
+      episode: Number(episodeNumber),
+      trajectory: episodeTrajectory || null,
+    },
+    recent_episodes: recent,
+  };
+}
+
+const CHECKPOINT_STAGE_ORDER = Object.freeze({
+  blueprint: 10,
+  shot_simulation: 20,
+  shot_simulation_complete: 30,
+  scene_shot_writing: 40,
+  script_complete: 50,
+  script_ready_for_processing: 60,
+  simulation_chain_locked: 70,
+  media_generation_ready: 80,
+});
+
+function _checkpointStageRank(stage) {
+  return CHECKPOINT_STAGE_ORDER[String(stage || '').toLowerCase()] || 0;
+}
+
+function _hasPersistedProductionBlueprint(existingScript) {
+  if (!existingScript || !Array.isArray(existingScript.scenes) || !existingScript.scenes.length) return false;
+  const rank = _checkpointStageRank(existingScript?.checkpoint_state?.stage);
+  return rank >= CHECKPOINT_STAGE_ORDER.blueprint ||
+    Boolean(existingScript.episode_title || existingScript.director_vision || existingScript.episode_number != null);
+}
+
+async function writeEpisodeScript({
+  storyline,
+  characters,
+  recentEpisodes,
+  episodeNumber,
+  seasonNumber,
+  isFinale,
+  isSeriesMovie,
+  targetMinutes,
+  runtimeRetryNote = null,
+  narrativeSimulation = null,
+  existingScript = null,
+  checkpoint = null,
+  ensureCharacter = null,
+}) {
+  const systemPrompt = `${DIRECTOR_PERSONA}
+You are writing and directing Episode ${episodeNumber} of Season ${seasonNumber} of "${storyline.title}".
+You know this story inside out. You have a specific visual and emotional plan for this episode.
+Write with the confidence of a showrunner who is in full creative control.
+Blueprint pass only: return JSON matching the requested schema. Do not generate final shots or long prose.`;
+
+  const seriesSummary = _compactLLMText(
+    storyline.comprehensive_summary || storyline.plot_summary || '',
+    3500
+  );
+  const globalContextBlock = seriesSummary
+    ? `\n═══ GLOBAL SERIES CONTEXT ═══\n${seriesSummary}\n`
+    : '';
+  const fullStorySimulation = storyline.full_story_simulation
+    ? (typeof storyline.full_story_simulation === 'string'
+      ? safeJsonParse(storyline.full_story_simulation, {})
+      : storyline.full_story_simulation)
+    : null;
+
+  const selectCurrentEpisodeTrajectory = (value) => {
+    if (Array.isArray(value)) {
+      return value.find(ep =>
+        Number(ep?.season) === Number(seasonNumber) &&
+        Number(ep?.episode) === Number(episodeNumber)
+      ) || null;
+    }
+    if (value && typeof value === 'object') {
+      const epSeason = Number(value?.season ?? value?.episode?.season);
+      const epNumber = Number(value?.episode ?? value?.episode?.episode);
+      if (epSeason === Number(seasonNumber) && epNumber === Number(episodeNumber)) return value;
+    }
+    return null;
+  };
+
+  const currentEpisodeTrajectoryRaw =
+    selectCurrentEpisodeTrajectory(narrativeSimulation?.episode_trajectory) ||
+    selectCurrentEpisodeTrajectory(narrativeSimulation?.trajectory) ||
+    selectCurrentEpisodeTrajectory(fullStorySimulation?.episode_trajectory) ||
+    null;
+  const currentEpisodeTrajectory = _compactEpisodeTrajectoryForLLM(currentEpisodeTrajectoryRaw);
+
+  const scriptFullStorySimulation = fullStorySimulation
+    ? {
+        opening_state: _compactLLMText(fullStorySimulation.opening_state || '', 700),
+        inciting_event: _compactLLMText(fullStorySimulation.inciting_event || '', 900),
+        finale_resolution: _compactLLMText(fullStorySimulation.finale_resolution || '', 900),
+        season_endpoints: Array.isArray(fullStorySimulation.season_endpoints)
+          ? fullStorySimulation.season_endpoints.slice(0, 8)
+          : [],
+        unresolved_threads: Array.isArray(fullStorySimulation.unresolved_threads)
+          ? fullStorySimulation.unresolved_threads.slice(-8)
+          : [],
+        episode_trajectory: currentEpisodeTrajectory ? [currentEpisodeTrajectory] : [],
+      }
+    : null;
+
+  const compactSeriesContext = _buildCompactEpisodeContext({
+    storyline,
+    fullStorySimulation: scriptFullStorySimulation,
+    seasonNumber,
+    episodeNumber,
+    episodeTrajectory: currentEpisodeTrajectory,
+    recentEpisodes,
+  });
+
+  const scriptNarrativeSimulation = narrativeSimulation
+    ? {
+        episode: narrativeSimulation.episode
+          ? {
+              season: Number(narrativeSimulation.episode.season ?? seasonNumber),
+              episode: Number(narrativeSimulation.episode.episode ?? episodeNumber),
+            }
+          : { season: Number(seasonNumber), episode: Number(episodeNumber) },
+        opening_state: _compactLLMText(narrativeSimulation.opening_state || '', 700),
+        ending_state: _compactLLMText(narrativeSimulation.ending_state || '', 700),
+        scene_beat_plan: Array.isArray(narrativeSimulation.scene_beat_plan)
+          ? narrativeSimulation.scene_beat_plan.slice(0, 12).map(scene => ({
+              scene_number: Number(scene?.scene_number || 0),
+              characters_present: Array.isArray(scene?.characters_present) ? scene.characters_present.slice(0, 12) : [],
+              purpose: _compactLLMText(scene?.purpose || '', 300),
+              opening_state: _compactLLMText(scene?.opening_state || '', 300),
+              causal_event: _compactLLMText(scene?.causal_event || '', 400),
+              character_state_changes: Array.isArray(scene?.character_state_changes)
+                ? scene.character_state_changes.slice(0, 4).map(x => _compactLLMText(x, 180))
+                : [],
+              environment_state_changes: Array.isArray(scene?.environment_state_changes)
+                ? scene.environment_state_changes.slice(0, 4).map(x => _compactLLMText(x, 180))
+                : [],
+              dialogue_intent: _compactLLMText(scene?.dialogue_intent || '', 300),
+              closing_state: _compactLLMText(scene?.closing_state || '', 300),
+              handoff_to_next_scene: _compactLLMText(scene?.handoff_to_next_scene || '', 300),
+            }))
+          : [],
+        continuity_invariants: Array.isArray(narrativeSimulation.continuity_invariants)
+          ? narrativeSimulation.continuity_invariants.slice(0, 8).map(x => _compactLLMText(x, 250))
+          : [],
+        unresolved_threads: Array.isArray(narrativeSimulation.unresolved_threads)
+          ? narrativeSimulation.unresolved_threads.slice(-6).map(x => _compactLLMText(x, 250))
+          : [],
+        episode_trajectory: currentEpisodeTrajectory || null,
+      }
+    : null;
+
+  console.log(`[ScriptWriter] LLM script context locked to S${seasonNumber}E${episodeNumber} trajectory only`);
+
+  const fullStoryBlock = `\n═══ COMPACT AUTHORITATIVE SERIES CONTEXT ═══\n${JSON.stringify(compactSeriesContext)}\nThe complete master plan remains durable in DB; this request receives only bounded current-episode continuity.\n`;
+
+  const continuityBlock = recentEpisodes.length
+    ? _compactLLMText(
+        `\n═══ STORY CONTINUITY (from last ${recentEpisodes.length} posted episodes) ═══\n` +
+        recentEpisodes.slice(-3).map(e => {
+          const sc = safeJsonParse(e.script, {});
+          return `Ep ${e.episode_number}: ${_compactLLMText(sc.updated_plot_summary || '(no summary)', 500)}\n  Director's note: ${_compactLLMText(sc.director_vision || '', 300)}`;
+        }).join('\n'),
+        2600
+      )
+    : '';
+
+  const characterBlock = (characters || []).map(c => {
+    const vp = typeof c.visual_profile === 'string'
+      ? safeJsonParse(c.visual_profile, {})
+      : (c.visual_profile || {});
+    return _compactLLMText(`▸ ${c.name} (${c.role || 'character'}) [gender: ${c.gender || vp.gender || 'unknown'}, voice_id: ${c.voice_id || 'unassigned'}, seed: ${c.seed || 'unassigned'}]
+  Psychology: ${c.description || ''}
+  Performance note: ${vp.performance_note || c.description || ''}
+  Identity tag-lock: ${c.visual_anchor || c.description || ''}`, 1400);
+  }).join('\n\n');
+
+  const visualLanguage = storyline.visual_language
+    ? (typeof storyline.visual_language === 'string'
+        ? safeJsonParse(storyline.visual_language, {})
+        : storyline.visual_language)
+    : null;
+
+  const visualBlock = visualLanguage
+    ? _compactLLMText(`\n═══ SERIES VISUAL LANGUAGE ═══
+Palette: ${visualLanguage.primary_palette || ''}
+Camera: ${visualLanguage.camera_philosophy || ''}
+Motifs: ${(visualLanguage.recurring_motifs || []).join(', ')}`, 1200)
+    : '';
+
+  const seasonArc = (() => {
+    const arcs = storyline.season_arcs
+      ? (typeof storyline.season_arcs === 'string'
+          ? safeJsonParse(storyline.season_arcs)
+          : storyline.season_arcs)
+      : [];
+    return _compactLLMText(arcs[seasonNumber - 1] || 'Continue the story with escalating stakes', 1400);
+  })();
+
+  const episodeType = isSeriesMovie
+    ? `THE SERIES FINALE MOVIE — this is the culmination of ALL 4 seasons, ALL character arcs, ALL thematic threads. Runtime: ~${targetMinutes} minutes.`
+    : isFinale
+      ? `SEASON ${seasonNumber} FINALE — a cliffhanger that recontextualises everything. Runtime: ~${targetMinutes} minutes.`
+      : `Season ${seasonNumber}, Episode ${episodeNumber} — a chapter in the season arc. Runtime: ~${targetMinutes} minutes.`;
+
+  const minScenesFor2Min = 8;
+  const sceneCountRaw = isSeriesMovie
+    ? '20-25'
+    : targetMinutes <= 2
+      ? String(minScenesFor2Min)
+      : targetMinutes <= 5
+        ? `${minScenesFor2Min}-10`
+        : '10-14';
+  const sceneCount = sceneCountRaw;
+
+  let blueprint = null;
+  const hasReusableBlueprint =
+    !runtimeRetryNote &&
+    _hasPersistedProductionBlueprint(existingScript);
+
+  if (hasReusableBlueprint) {
+    blueprint = {
+      ...existingScript,
+      // Preserve the locked simulation when resuming an incomplete draft.
+      episode_trajectory: existingScript.episode_trajectory || currentEpisodeTrajectory,
+      narrative_simulation: existingScript.narrative_simulation || narrativeSimulation || null,
+    };
+    console.log(`[ScriptWriter] ↺ Reusing persisted blueprint for S${seasonNumber}E${episodeNumber}; generating only missing scene work`);
+  } else {
+    const blueprintUserPrompt = `${runtimeRetryNote ? `⚠️ RETRY REQUIRED — PREVIOUS SCRIPT WAS REJECTED:\n${runtimeRetryNote}\n\n` : ''}Direct: ${episodeType}
+
+${globalContextBlock}
+${fullStoryBlock}
+═══ SERIES: "${storyline.title}" (${storyline.genre}) ═══
+Central Theme: ${storyline.central_theme || storyline.plot_summary}
+Tone: ${storyline.tone_manifesto || ''}
+Season ${seasonNumber} Arc: ${seasonArc}
+${visualBlock}
+${continuityBlock}
+${scriptNarrativeSimulation ? `═══ PRE-GENERATION EPISODE SIMULATION — LOCKED, SCENE-BY-SCENE SOURCE OF TRUTH ═══\n${JSON.stringify(scriptNarrativeSimulation)}\n\nABSOLUTE SCENE MAPPING RULES:\n- The scene_beat_plan is authoritative. Create exactly one blueprint scene for each simulated scene_number, in the same order.\n- scene_description MUST dramatize that simulated scene's causal_event and purpose; do not replace it with a new action, parallel version, or generic mood beat.\n- opening_state, closing_state, handoff_to_next_scene, characters_present, and character_state_changes must remain consistent with the corresponding simulated scene.\n- NEVER repeat the same core action across adjacent scenes. When the prior simulated scene already completed an action (e.g. writing/mailing a letter, watching from a street, drafting a reply), the next scene must move to the NEXT causal event in its own simulation entry.\n- NEVER undo or teleport a character relative to the prior simulated scene.\n- Each scene must introduce a distinct causal development or consequence from its simulation entry.\n- If the simulated scene is characterless, keep characters_present empty rather than inventing a conversation.\n- Do not invent new plot turns that are absent from the locked scene_beat_plan.\n` : ""}
+
+═══ CAST (locked — voice_id and seed are permanent) ═══
+${characterBlock}
+
+Return this JSON structure. Do NOT include a "shots" array inside any scene.
+{
+  "episode_title": "Title that is a metaphor or line of dialogue, not a plot summary",
+  "season_number": ${seasonNumber},
+  "episode_number": ${episodeNumber},
+  "director_vision": "1 paragraph",
+  "episode_color_palette": "Dominant colours and meaning",
+  "episode_motif": "Recurring visual or symbolic element",
+  "emotional_arc": {
+    "opening_state": "Opening emotional state",
+    "escalation": "Pressure that builds",
+    "break_point": "Moment something cracks",
+    "closing_state": "Changed/refused state"
+  },
+  "updated_plot_summary": "2-3 sentences updating the living series bible",
+  "music_direction": "Composer reference",
+  "caption": "Social caption ending with an existential question. 6-10 hashtags on a separate line.",
+  "episode_transition": "FFMPEG transition effect",
+  "episode_final_color_grade": "FFMPEG color grade",
+  "is_series_finale": ${isSeriesMovie ? 'true' : 'false'},
+  "safety_check_passed": true,
+  "safety_notes": "",
+  "scenes": [
+    {
+      "scene_number": 1,
+      "scene_description": "What is actually happening — including what is UNSAID",
+      "emotional_beat": "Specific emotional shift",
+      "location": "INT./EXT. specific location — time of day",
+      "lighting_design": "Quality, direction, and colour",
+      "camera_language": "How the camera is operated",
+      "characters_present": ["character names"],
+      "shot_count_target": 3
+    }
+  ]
+}
+
+Write ${sceneCount} scenes. Each scene needs 2-5 shots according to narrative need.
+The compiled episode MUST run at minimum 2 minutes. The final scene's last shot is the cliffhanger.`;
+
+    blueprint = await callLLM(systemPrompt, blueprintUserPrompt, undefined, { useStream: false });
+    if (!Array.isArray(blueprint.scenes) || blueprint.scenes.length === 0) {
+      throw new Error('[ScriptWriter] Blueprint pass returned no scenes');
+    }
+
+    // The locked scene simulation is the production source of truth. Reject a
+    // blueprint that silently drops/reorders simulated scenes or omits the
+    // continuity fields needed to keep the causal chain intact.
+    const lockedPlan = Array.isArray(narrativeSimulation?.scene_beat_plan)
+      ? narrativeSimulation.scene_beat_plan
+      : [];
+    if (lockedPlan.length) {
+      if (blueprint.scenes.length !== lockedPlan.length) {
+        throw _tagPipelineError(new Error(`[ScriptWriter] Blueprint scene count ${blueprint.scenes.length} does not match locked simulation ${lockedPlan.length}`), {
+          layer: 'scene_simulation', code: 'BLUEPRINT_SCENE_COUNT_DRIFT', sceneNumber: null
+        });
+      }
+      const byNo = new Map(blueprint.scenes.map(sc => [Number(sc?.scene_number), sc]));
+      for (const simScene of lockedPlan) {
+        const no = Number(simScene?.scene_number);
+        const bpScene = byNo.get(no);
+        if (!bpScene) {
+          throw _tagPipelineError(new Error(`[ScriptWriter] Blueprint dropped locked simulated scene ${no}`), {
+            layer: 'scene_simulation', code: 'BLUEPRINT_SCENE_MAPPING_MISSING', sceneNumber: no
+          });
+        }
+        const simChars = Array.isArray(simScene.characters_present) ? simScene.characters_present.map(String).map(s => s.trim()).filter(Boolean) : [];
+        const bpChars = Array.isArray(bpScene.characters_present) ? bpScene.characters_present.map(String).map(s => s.trim()).filter(Boolean) : [];
+        const simKey = simChars.map(s => s.toLowerCase()).sort().join('\n');
+        const bpKey = bpChars.map(s => s.toLowerCase()).sort().join('\n');
+        if (simKey !== bpKey) {
+          // The locked simulation owns scene cast membership. Do not fail the
+          // entire episode because the creative blueprint drifted; correct only
+          // this field deterministically and preserve all other generated detail.
+          console.warn(`[ScriptWriter] Blueprint scene ${no} changed locked character presence; restoring authoritative simulation roster.`);
+          bpScene.characters_present = simChars.slice();
+          bpScene._character_roster_corrected = true;
+        }
+      }
+    }
+  }
+
+  blueprint.episode_trajectory = blueprint.episode_trajectory || currentEpisodeTrajectory;
+  blueprint.narrative_simulation = blueprint.narrative_simulation || narrativeSimulation || null;
+  blueprint.scene_simulation = blueprint.scene_simulation || narrativeSimulation || null;
+
+  // NEVER regress a durable checkpoint on resume. If a prior run already
+  // completed shot simulation or scene-shot writing, reusing the blueprint
+  // must not overwrite those later artifacts with an early "blueprint" stage.
+  if (typeof checkpoint === 'function' && !hasReusableBlueprint) {
+    await checkpoint({
+      stage: 'blueprint',
+      sceneNumber: null,
+      script: {
+        ...blueprint,
+        checkpoint_state: {
+          stage: 'blueprint',
+          completed_scene_numbers: [],
+          shot_simulation_completed_scene_numbers: [],
+        },
+      },
+    });
+  } else if (hasReusableBlueprint) {
+    blueprint.shot_simulation = blueprint.shot_simulation || existingScript?.shot_simulation || null;
+    blueprint.checkpoint_state = existingScript?.checkpoint_state || blueprint.checkpoint_state || null;
+    console.log(
+      `[ScriptWriter] ↺ Preserved durable checkpoint stage=${blueprint.checkpoint_state?.stage || 'unknown'} ` +
+      `while resuming existing blueprint for S${seasonNumber}E${episodeNumber}`
+    );
+  }
+
+  // ── SCENE SIMULATION CONTRACT VALIDATION ────────────────────────────────
+  // The scene blueprint and the scene simulation are separate artifacts. The
+  // simulation is authoritative for causal fields such as conversation_reason.
+  // Hydrate those locked fields into the blueprint before shot writing so a
+  // valid scene simulation cannot be lost merely because the blueprint omitted
+  // a field. If a persisted simulation is itself defective, repair ONLY that
+  // scene and invalidate only that scene's downstream shot simulation.
+  let sceneSimulationWorking = scriptNarrativeSimulation || narrativeSimulation || blueprint.scene_simulation || null;
+  let shotSimulationSeed = blueprint?.shot_simulation || existingScript?.shot_simulation || null;
+
+  const invalidatedSceneShotWrites = new Set();
+  let existingScenesForRetry = Array.isArray(existingScript?.scenes)
+    ? existingScript.scenes.slice()
+    : [];
+
+  blueprint.scene_simulation = sceneSimulationWorking;
+  // The authoritative scene simulation owns scene cardinality on resume. A persisted
+  // blueprint can be partial/stale (for example, only 2 scenes were written before a
+  // provider interruption while the durable simulation later reached 8). Merge the
+  // simulation into the blueprint so we never silently truncate the episode.
+  blueprint = _mergeBlueprintWithSceneSimulation(blueprint, sceneSimulationWorking);
+  blueprint.scenes = _hydrateScenesFromSceneSimulation(blueprint.scenes, sceneSimulationWorking);
+
+  const findSceneSimulationContractFailure = () => {
+    const plan = Array.isArray(sceneSimulationWorking?.scene_beat_plan)
+      ? sceneSimulationWorking.scene_beat_plan
+          .filter(sc => Number.isInteger(Number(sc?.scene_number)) && Number(sc.scene_number) >= 1)
+          .sort((a, b) => Number(a.scene_number) - Number(b.scene_number))
+      : [];
+    for (const sim of plan) {
+      const sceneNo = Number(sim.scene_number);
+      const scene = (blueprint.scenes || []).find(sc => Number(sc.scene_number) === sceneNo) || {
+        scene_number: sceneNo,
+        characters_present: Array.isArray(sim.characters_present) ? sim.characters_present : [],
+      };
+      const charactersPresent = Array.isArray(sim.characters_present)
+        ? sim.characters_present
+        : (Array.isArray(scene.characters_present) ? scene.characters_present : []);
+      if (!charactersPresent.length) continue;
+      if (!String(sim.conversation_reason || '').trim()) {
+        return {
+          scene,
+          sim,
+          error: _tagPipelineError(
+            new Error(`[ScriptWriter] Scene ${sceneNo} contains characters but has no locked conversation_reason`),
+            { layer: 'scene_simulation', code: 'SCENE_SIMULATION_CONVERSATION_REASON_MISSING', sceneNumber: sceneNo }
+          ),
+        };
+      }
+    }
+    return null;
+  };
+
+  // Scene simulation is authoritative once checkpointed. Do not rewind already-simulated
+  // scenes inside the writer. Any contract failure is surfaced with its owning layer and
+  // handed to the autonomous recovery controller, which performs a targeted transactional
+  // repair only after deterministic diagnosis.
+  const initialContractFailure = findSceneSimulationContractFailure();
+  if (initialContractFailure) {
+    console.warn(
+      `[ScriptWriter] Scene-simulation contract failure surfaced to autonomous recovery: ` +
+      `scene=${initialContractFailure.error.sceneNumber || initialContractFailure.scene?.scene_number || '?'} ` +
+      `code=${initialContractFailure.error.pipelineCode}`
+    );
+    throw initialContractFailure.error;
+  }
+
+  if (invalidatedSceneShotWrites.size) {
+    existingScenesForRetry = existingScenesForRetry.filter(
+      scene => !invalidatedSceneShotWrites.has(Number(scene?.scene_number))
+    );
+    console.log(
+      `[ScriptWriter] ↶ Invalidated stale scene-shot checkpoints for scene(s): ${[...invalidatedSceneShotWrites].sort((a,b) => a-b).join(', ')}`
+    );
+  }
+
+  let shotSimulation = await simulateEpisodeShots({
+    storyline,
+    characters,
+    episodeSimulation: scriptNarrativeSimulation || narrativeSimulation,
+    sceneSimulation: sceneSimulationWorking,
+    scenes: blueprint.scenes,
+    episodeNumber,
+    seasonNumber,
+    targetMinutes,
+    existingShotSimulation: shotSimulationSeed,
+    checkpoint: async ({ stage, sceneNumber, completedScenes, shotSimulation: sim }) => {
+      if (typeof checkpoint !== 'function') return;
+      await checkpoint({
+        stage,
+        sceneNumber,
+        script: {
+          ...blueprint,
+          scene_simulation: sceneSimulationWorking,
+          shot_simulation: sim,
+          checkpoint_state: {
+            stage,
+            completed_scene_numbers: Array.isArray(blueprint.scenes)
+              ? blueprint.scenes.map(s => Number(s.scene_number)).filter(Boolean)
+              : [],
+            shot_simulation_completed_scene_numbers: completedScenes,
+          },
+        },
+      });
+    },
+  });
+
+  blueprint.shot_simulation = shotSimulation;
+
+  if (typeof checkpoint === 'function') {
+    await checkpoint({
+      stage: 'shot_simulation_complete',
+      sceneNumber: null,
+      script: blueprint,
+    });
+  }
+
+  // Runtime shot-writing failures are surfaced directly to the autonomous
+  // recovery controller. The writer never rewinds completed creative stages or silently
+  // invalidates already-simulated scenes.
+  let scenesWithShots = null;
+  try {
+    scenesWithShots = await _writeSceneShotsSequential({
+      scenes: blueprint.scenes,
+      characterBlock,
+      shotSimulation,
+      existingScenes: existingScenesForRetry,
+      checkpoint: async ({ sceneNumber, completedSceneNumbers, scenes: partialScenes }) => {
+        existingScenesForRetry = Array.isArray(partialScenes) ? partialScenes.slice() : existingScenesForRetry;
+        if (typeof checkpoint !== 'function') return;
+        await checkpoint({
+          stage: 'scene_shot_writing',
+          sceneNumber,
+          script: {
+            ...blueprint,
+            scenes: partialScenes,
+            shot_simulation: shotSimulation,
+            checkpoint_state: {
+              stage: 'scene_shot_writing',
+              completed_scene_numbers: completedSceneNumbers,
+              shot_simulation_completed_scene_numbers:
+                Array.from(new Set((shotSimulation.shots || []).map(s => Number(s.scene_number)))),
+            },
+          },
+        });
+      },
+    });
+  } catch (rawErr) {
+    throw _diagnosePipelineError(rawErr);
+  }
+
+  const completedScriptWithSpeech = await ensureSceneSpeechCoverage(
+    { ...blueprint, scenes: scenesWithShots },
+    { storyline, characters }
+  );
+
+  const completedScript = {
+    ...completedScriptWithSpeech,
+    episode_trajectory: currentEpisodeTrajectory || completedScriptWithSpeech.episode_trajectory,
+    narrative_simulation: narrativeSimulation || completedScriptWithSpeech.narrative_simulation,
+    scene_simulation: sceneSimulationWorking || completedScriptWithSpeech.scene_simulation,
+    shot_simulation: shotSimulation,
+    global_continuity_state: globalContinuity.buildGlobalContinuityState(completedScriptWithSpeech),
+    checkpoint_state: {
+      stage: 'script_complete',
+      completed_scene_numbers: scenesWithShots.map(s => Number(s.scene_number)),
+      shot_simulation_completed_scene_numbers:
+        Array.from(new Set((shotSimulation.shots || []).map(s => Number(s.scene_number)))),
+    },
+  };
+
+  if (typeof checkpoint === 'function') {
+    await checkpoint({
+      stage: 'script_complete',
+      sceneNumber: null,
+      script: completedScript,
+    });
+  }
+
+  console.log(`[ScriptWriter] Episode assembled — ${completedScript.scenes.length} scenes, ` +
+    `${completedScript.scenes.reduce((n, s) => n + (s.shots || []).length, 0)} shots, persistent checkpoints enabled.`);
+
+  return completedScript;
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sequential per-scene shot generation with rolling story memory
+//
+// "Memory" here is a short, locally-built digest of what has already been
+// written (last location, emotional beat, and closing line per scene) plus
+// the blueprint's own description of what the CURRENT scene needs to
+// accomplish. Nothing here costs an extra LLM call — the summary is derived
+// from data already returned by the previous scene's shot generation.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const LTX_SHOT_WRITING_RULES = `
+═══ LTX SHOT DESCRIPTION — REQUIRED OUTPUT STYLE ═══
+
+The field ltx_shot_description is the actual prompt sent to the LTX image-to-video model.
+It is NOT a production-control specification, shot contract, metadata block, or checklist.
+Write it as one natural, continuous paragraph in plain English with whatever descriptive detail is required
+for the shot. Do NOT impose a word count, truncate, summarize, or concatenate away scene-specific details.
+Start directly with what is visibly happening. Describe the shot chronologically
+from the supplied first frame: what changes first, what happens next, and where the shot ends.
+Use literal, concrete cinematography language. Describe only things the model can see or hear:
+visible subject movement, gaze, gestures, expressions, object movement, environment, lighting,
+and requested camera movement. Keep established visual details brief because the supplied image is
+the exact first frame; focus on the changes that occur during the clip. When multiple characters
+are visible, preserve their relative screen positions naturally in the prose, for example by saying
+that one character remains in the foreground while another stays behind them.
+
+Do NOT write headings, labels, field names, JSON-like language, numbered instructions, control phrases,
+spatial-map declarations, warnings, negative-prompt lists, or explanations to the model. Never write
+phrases such as "LTX SHOT CONTRACT", "LOCKED SPATIAL MAP", "Audio/text boundary", "preserve the map",
+"do not speak the prompt", or similar production-control language. Do not describe the prompt itself.
+Do not narrate character names or staging as if they are instructions. Natural phrases such as
+"the woman at center" or "the man behind her" are acceptable when needed for clarity.
+
+For image-to-video continuity, describe only the motion and change from the supplied first frame rather
+than re-describing the entire still. Keep the screen geography stable through natural visual wording.
+Camera movement is included only when requested. If there is dialogue, place the spoken words naturally
+in the paragraph; otherwise do not invent speech. Never turn actions, emotions, camera directions, or
+staging into quoted dialogue. End on a clear visible state that can naturally lead into the next shot.`;
+
+const SHOT_SYSTEM_PROMPT = `${DIRECTOR_PERSONA}
+${MULTI_SPEAKER_LTX_RULES}
+${PACING_RULES}
+${FFMPEG_EFFECTS_CATALOG}
+${LTX_SHOT_WRITING_RULES}
+You are generating the shots for ONE scene of an episode, working scene-by-scene
+through the full episode in order. Return ONLY a JSON object with a single "shots"
+array — nothing else.`;
+
+const SHOT_SCHEMA = `{
+  "shots": [
+    {
+      "shot_index": 1,
+      "shot_type": "ECU|CU|MCU|MS|MWS|WS|XWS|OTS|POV|AERIAL|INSERT",
+      "shot_purpose": "Why does this shot exist?",
+      "shot_description": "What the camera sees — concise framing, depth and focus description.",
+      "ltx_shot_description": "Single continuous natural-language LTX image-to-video prompt. Use as much descriptive detail as the shot genuinely needs; there is no artificial word cap. Start directly with visible action and describe the chronological changes from the supplied first frame through the end state. Use literal cinematography language only; no headings, control labels, spatial-map declarations, prompt instructions, or negative-prompt lists.",
+      "camera_movement": "static|slow push-in|pull back|pan left|pan right|handheld drift|tilt up|tilt down|crane up|none",
+      "focal_length_hint": "wide 24mm|normal 35mm|portrait 50mm|telephoto 85mm|macro 100mm",
+      "depth_layering": "Describe foreground, midground, background separation and focus plane for this shot",
+      "characters_in_shot": ["character names — must match CAST"],
+      "character_staging": [
+        {
+          "name": "Exact character name from CAST",
+          "screen_position": "far-left|screen-left|left-of-center|screen-center|right-of-center|screen-right|far-right",
+          "depth": "foreground|midground|background",
+          "facing_toward": "Exact character name, object, or spatial direction",
+          "action": "Specific visible action performed during the shot",
+          "pose": "Specific frozen opening pose",
+          "eyeline": "Exact gaze target",
+          "interaction": "Concrete physical/social relationship to another visible character or prop",
+          "speaking": true,
+          "visual_identity": "Short identity cue that distinguishes this character from other visible characters"
+        }
+      ],
+      "character_positions": "Human-readable spatial summary generated from character_staging; mention every visible character, screen position, depth, and relationship.",
+      "speakers_in_shot": ["Character names speaking in chronological order; empty array for silent/action-only shots"],
+      "start_frame_state": "Exact opening visual state of this shot: character identity, screen position, body/hand/prop state, gaze, expression, environment, lighting and camera framing. For a continuation, this must match the previous shot end state before new motion begins. Plain descriptive prose only and no quotation marks.",
+      "end_frame_state": "Exact terminal visual state of this shot at its final frame: character identity, screen position, body/hand/prop state, gaze, expression, environment, lighting and camera framing. Plain descriptive prose only and no quotation marks.",
+      "opening_frame_transition": "Descriptive visual/audio bridge from the previous shot or previous scene into this shot's opening state. No editing instructions.",
+      "emotional_subtext": "What is the character hiding or feeling beneath the surface, described plainly and never as quoted dialogue",
+      "environmental_story_beat": "Specific way the environment participates in the story during this shot: light, weather, objects, architecture, distant activity, time-of-day evidence, or environmental change tied to this episode",
+      "temporal_arc": "Describe the visual progression inside the shot from beginning state to development/change to meaningful end state",
+      "end_frame_transition": "Describe the exact final visual/audio state of this shot and the contextual handoff into the next shot. Use an in-world descriptive phrase such as a held eyeline, continuing object movement, environmental reveal, sound bridge, lighting change, spatial discovery, time shift, or purposeful hard cut. Do NOT write editing instructions or use quotation marks.",
+      "duration": "Locked integer from the shot simulation, 6–10 seconds. Do not recalculate or invent a different duration.",
+      "next_shot_continuity": "State the concrete fact the following shot should inherit from this shot’s ending: gaze, prop position, body position, environment, sound source, light state, location reveal, or unresolved action. Plain descriptive prose only.",
+      "scene_environment": "The most narratively important environmental context visible in this shot",
+      "pose_state": "standing|sitting|walking|running|leaning|crouching|lying|turning|reaching|fighting",
+      "image_prompt": "STILL-FRAME prompt for the Cloudflare image model. Build the single frozen opening frame directly from character_staging. Explicitly describe each visible character's exact screen position, depth, pose, eyeline, facing direction, visible action and interaction, then framing, camera viewpoint, lighting, palette, environment and atmosphere. The image MUST depict the same spatial map that LTX will animate. NEVER write speaking, talking, lips moving, dialogue delivery, camera movement, animation, audio, or temporal instructions. 9:16 vertical, 768x1365, photorealistic 4K cinematic. Character identity comes from supplied reference images; do not invent alternate physical descriptions.",
+      "duration": 10,
+      "clip_duration": 9,
+      "shot_pacing_type": "hook|action|reaction|broll_cutaway|dialogue_mid|dialogue_full|slow_dramatic|establishing",
+      "narrative_complexity": "low|medium|high",
+      "motion_level": "low|medium|high",
+      "motion_intensity": "0.0 to 1.0 numeric — how much camera motion energy this shot has (0=static, 1=maximal)",
+      "subject_motion": "still|subtle|active|intense",
+      "ambient_motion": "still|gentle|dynamic",
+      "music_cue": "none|subtle|prominent",
+      "music_reason": "Why music is genuinely needed in this shot, or empty when music_cue is none.",
+      "tts_mode": "spoken|internal_monologue|ambient|phone_vo",
+      "dialogue_or_action": "EXACT FORMAT RULE: only spoken dialogue uses quotation marks. Spoken dialogue: CHARACTER NAME: \"exact words spoken aloud\" followed by optional unquoted delivery/emotion notes. Action-only: plain unquoted description such as Dr. Jane looks at her phone, her expression tightening. NEVER quote actions, emotions, stage directions, camera movement, posture, facial expressions, or subtext. Internal monologue: NAME (V.O.): exact audible thought without quotation marks. Phone voiceover: REMOTE CALLER (PHONE): \"exact audible words\". If the shot is silent/action-only, there must be ZERO quotation marks."
+    }
+  ]
+}`;
+
+/**
+ * Build a one-line memory digest for a scene that has already been written.
+ * Purely local — no LLM call — derived from the shots already returned.
+ */
+function _summarizeSceneForMemory(scene) {
+  const shots = scene.shots || [];
+  const lastLine = [...shots].reverse().find(s => s.dialogue_or_action)?.dialogue_or_action;
+  return `Scene ${scene.scene_number} (${scene.location || 'unspecified location'}): ` +
+    `${scene.emotional_beat || scene.scene_description || 'no summary'}` +
+    (lastLine ? ` — closed on: "${lastLine}"` : '');
+}
+
+
+/**
+ * Enforce the semantic contract before shot data reaches any downstream model.
+ * Quotes are the spoken-audio channel; actions/emotions are visual description only.
+ * This is intentionally conservative: quoted strings that look like third-person
+ * stage directions are unquoted, and silent shots cannot retain quoted text.
+ */
+function _sanitizeDialogueOrActionSemantics(shot) {
+  if (!shot || typeof shot !== 'object') return shot;
+
+  const out = { ...shot };
+  let text = typeof out.dialogue_or_action === 'string' ? out.dialogue_or_action.trim() : '';
+  const mode = String(out.tts_mode || '').toLowerCase();
+
+  // Quotes are reserved for spoken dialogue/phone speech. Internal voice-over is intentionally unquoted.
+  const audibleMode = mode === 'spoken' || mode === 'phone_vo' || mode === 'internal_monologue';
+
+  const actionLead = /^(?:the\s+)?(?:[A-Z][A-Za-z.'’-]*(?:\s+[A-Z][A-Za-z.'’-]*){0,4})\s+(?:looks?|stares?|glances?|watches?|turns?|walks?|steps?|moves?|reaches?|holds?|opens?|closes?|checks?|reads?|types?|sits?|stands?|leans?|smiles?|frowns?|nods?|shakes?|breathes?|pauses?|grips?|clenches?|raises?|lowers?|takes?|puts?|pulls?|pushes?|enters?|leaves?|crosses?)\b/i;
+
+  // Process line-by-line so multi-shot/speaker formatting remains intact.
+  const lines = text.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  const cleaned = lines.map(line => {
+    const speakerMatch = line.match(/^\s*([^:]{1,80}):\s*(.*)$/);
+    const body = speakerMatch ? speakerMatch[2].trim() : line;
+
+    // If the quoted content itself is plainly an action sentence, unquote it.
+    const spans = body.match(/["“”][^"“”]+["“”]/g) || [];
+    let next = body;
+    for (const span of spans) {
+      const inner = span.slice(1, -1).trim();
+      if (actionLead.test(inner) || /^(?:he|she|they|the\s+(?:man|woman|person|doctor|detective))\s+(?:looks?|turns?|walks?|steps?|moves?|reads?|checks?|opens?|closes?)/i.test(inner)) {
+        next = next.replace(span, inner);
+      }
+    }
+
+    // Silent/action shots: strip every quotation mark. They are not an audio channel.
+    if (!audibleMode || mode === 'ambient' || mode === 'internal_monologue') {
+      next = next.replace(/["“”]/g, '');
+    }
+    return speakerMatch ? `${speakerMatch[1].trim()}: ${next.trim()}` : next.trim();
+  }).filter(Boolean);
+
+  out.dialogue_or_action = cleaned.join('\n');
+
+  if (mode === 'internal_monologue') {
+    out.dialogue_or_action = out.dialogue_or_action.replace(/(\(V\.O\.\)\s*:\s*)[\"“”]+|[\"“”]+(?=\s*$)/g, '$1');
+  }
+
+  // End-frame fields are never an audio channel. Remove accidental wrapping quotes
+  // so they can never be interpreted as speech downstream.
+  // These fields are visual/action channels, never speech channels. Strip quote glyphs
+  // throughout the value so a quoted narrative fragment cannot be promoted later by
+  // an LTX speech extractor. Exact spoken words belong ONLY in dialogue_or_action.
+  for (const key of ['shot_description', 'shot_purpose', 'character_positions', 'start_frame_state', 'end_frame_state', 'opening_frame_transition', 'end_frame_transition', 'next_shot_continuity', 'temporal_arc', 'environmental_story_beat', 'emotional_subtext', 'scene_environment', 'subject_motion', 'ambient_motion', 'camera_movement', 'focal_length_hint']) {
+    if (typeof out[key] === 'string') {
+      out[key] = out[key].trim()
+        .replace(/[“”\"']/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+    }
+  }
+
+  // If a supposedly spoken shot contains only an action sentence, downgrade it to ambient.
+  if (mode === 'spoken') {
+    const probe = out.dialogue_or_action.replace(/^[^:]{1,80}:\s*/, '').trim();
+    if (!/["“”][^"“”]+["“”]/.test(probe) && actionLead.test(probe)) {
+      out.tts_mode = 'ambient';
+      out.dialogue_or_action = probe;
+    }
+  }
+
+  return out;
+}
+
+function _hasAudibleSceneSpeech(shot) {
+  if (!shot || typeof shot !== 'object') return false;
+  const mode = String(shot.tts_mode || '').toLowerCase();
+  const text = typeof shot.dialogue_or_action === 'string' ? shot.dialogue_or_action.trim() : '';
+  if (!text) return false;
+
+  // The scene contract permits contextual internal voice-over when visible dialogue
+  // would be unnatural. It is audible, even though it is intentionally unquoted.
+  const entries = ttsGen.extractStrictSpokenDialogue(text, { allowUnquotedVO: true });
+  return entries.some(entry =>
+    entry.mode === 'spoken' ||
+    entry.mode === 'phone_vo' ||
+    (entry.mode === 'internal_monologue' && mode === 'internal_monologue')
+  );
+}
+
+function _sceneHasAudibleSpeech(scene) {
+  return !!scene &&
+    Array.isArray(scene.shots) &&
+    scene.shots.some(_hasAudibleSceneSpeech);
+}
+
+function _resolveSceneSpeaker(scene, shot, characters) {
+  const declaredNames = [
+    ...(Array.isArray(scene?.characters_present) ? scene.characters_present : []),
+    ...(Array.isArray(shot?.characters_in_shot) ? shot.characters_in_shot : []),
+  ].filter(Boolean).map(String);
+
+  if (!declaredNames.length) return null;
+
+  const catalog = Array.isArray(characters) ? characters : [];
+  const normalize = value => String(value || '').trim().toLowerCase().replace(/\s+/g, ' ');
+  for (const name of declaredNames) {
+    const exact = catalog.find(c => normalize(c.name) === normalize(name));
+    if (exact) return exact.name;
+  }
+  const fallback = catalog.find(c => declaredNames.some(name => normalize(c.name).includes(normalize(name)) || normalize(name).includes(normalize(c.name))));
+  return fallback?.name || declaredNames[0] || null;
+}
+
+async function _ensureSpeechForScene(scene, { storyline, characters } = {}) {
+  if (!scene || !Array.isArray(scene.shots) || !scene.shots.length) return scene;
+
+  const hasCharacters = Array.isArray(scene.characters_present) && scene.characters_present.length;
+  if (!hasCharacters) return scene;
+
+  // Normalize before extraction. Internal V.O. is intentionally unquoted, so validating
+  // before semantic sanitization incorrectly rejects otherwise valid audible speech.
+  for (const shot of scene.shots) _sanitizeDialogueOrActionSemantics(shot);
+
+  if (!String(scene.conversation_reason || '').trim()) {
+    throw new Error(
+      `[SpeechGuard] Scene ${scene.scene_number} has characters but no locked conversation_reason from scene simulation.`
+    );
+  }
+
+  if (!_sceneHasAudibleSpeech(scene)) {
+    throw new Error(
+      `[SpeechGuard] Scene ${scene.scene_number} has a locked conversation_reason but no audible ` +
+      `spoken dialogue or explicit internal voice-over in its realized shots.`
+    );
+  }
+
+  return scene;
+}
+
+async function ensureSceneSpeechCoverage(script, { storyline, characters } = {}) {
+  if (!script || !Array.isArray(script.scenes)) return script;
+  for (const scene of script.scenes) {
+    await _ensureSpeechForScene(scene, { storyline, characters });
+  }
+  return script;
+}
+
+function _fallbackSceneShots(scene) {
+  const target = Math.max(2, Math.min(5, Number(scene?.shot_count_target) || 3));
+  const characters = Array.isArray(scene?.characters_present) ? scene.characters_present.filter(Boolean) : [];
+  const speaker = characters[0] || null;
+  const base = String(scene?.scene_description || 'The scene unfolds with controlled visual action.').replace(/\s+/g, ' ').trim();
+  const emotion = String(scene?.emotional_beat || 'The emotional pressure in the scene changes.').replace(/\s+/g, ' ').trim();
+  const location = String(scene?.location || 'The established location').replace(/\s+/g, ' ').trim();
+  const lighting = String(scene?.lighting_design || 'natural cinematic light').replace(/\s+/g, ' ').trim();
+  const common = {
+    shot_pacing_type: 'dialogue_mid',
+    narrative_complexity: 'medium',
+    camera_movement: 'slow push-in',
+    focal_length_hint: 'normal 35mm',
+    motion_level: 'low',
+    motion_intensity: 0.25,
+    ambient_motion: 'gentle',
+    subject_motion: 'subtle',
+    pose_state: speaker ? 'standing' : 'none',
+    depth_layering: `Foreground details frame the ${location}; the characters remain readable in the midground with the environment receding behind them.`,
+    scene_environment: `${location}, ${lighting}`,
+    environment_sound: `Natural room tone and subtle environmental sound from ${location}.`,
+    music_cue: 'none',
+    music_reason: '',
+    subject_motion: 'Small natural movement continues through the moment while the emotional beat develops.',
+    temporal_arc: `${base} The moment develops into ${emotion} and settles into a clear end state.`,
+    environmental_story_beat: `${lighting} and the surrounding environment visibly reinforce ${emotion}.`,
+  };
+  const shots = [];
+  for (let i = 0; i < target; i++) {
+    const isFirst = i === 0;
+    const isLast = i === target - 1;
+    const charLine = speaker
+      ? `${speaker} remains present and emotionally engaged with the immediate situation.`
+      : 'The environment carries the scene without inventing a new character.';
+    const dialogue = speaker
+      ? `${speaker} (V.O.): I know this moment matters, and I cannot pretend it does not.`
+      : '';
+    shots.push({
+      ...common,
+      shot_index: i + 1,
+      shot_type: isFirst ? 'WS' : isLast ? 'CU' : 'MCU',
+      shot_purpose: isFirst ? 'Establish the dramatic situation and emotional temperature.' : isLast ? 'Land the scene on a meaningful emotional state.' : 'Advance the immediate emotional beat without changing the established world.',
+      shot_description: `${charLine} ${base}`,
+      image_prompt: `Vertical 9:16 photorealistic cinematic still frame in ${location}, ${lighting}. ${base} Freeze one clear visual instant with ${speaker || 'the environment'} as the visible subject, natural composition, realistic depth, grounded posture and expressive eyeline. Do not depict speech, lip movement, camera motion, animation or audio.`,
+      characters_in_shot: characters,
+      character_staging: speaker ? [{
+        name: speaker,
+        screen_position: 'screen-center',
+        depth: 'midground',
+        facing_toward: 'the immediate story focus',
+        action: 'remains present and emotionally engaged with the immediate situation',
+        pose: isFirst ? 'grounded neutral stance' : isLast ? 'settled final pose' : 'natural conversational stance',
+        eyeline: 'the immediate story focus',
+        interaction: 'engaged with the scene without inventing another person',
+        speaking: Boolean(speaker),
+        visual_identity: 'preserve the locked CAST identity'
+      }] : [],
+      speakers_in_shot: speaker ? [speaker] : [],
+      character_positions: speaker ? `${speaker} is framed at screen-center in the midground, facing the immediate story focus, with a grounded readable pose.` : 'No character is required; the environment remains the subject.',
+      start_frame_state: `${speaker || 'The environment'} begins in the established state for ${location}, with ${lighting}.`,
+      end_frame_state: `${speaker || 'The environment'} settles into a visible state that reflects ${emotion}.`,
+      emotional_subtext: emotion,
+      dialogue_or_action: dialogue || `${base} The surrounding environment changes subtly as the scene settles into its next beat.`,
+      tts_mode: speaker ? 'internal_monologue' : 'ambient',
+      speaker_name: speaker || undefined,
+      end_frame_transition: isLast ? `The scene holds on the final emotional state established by ${emotion}.` : 'The ending gaze and environmental state create a direct handoff into the next shot.',
+      next_shot_continuity: isLast ? 'Carry the emotional state forward into the next scene.' : 'Inherit the established gaze, posture, light, environment and unresolved emotional beat.',
+      duration: 8,
+      clip_duration: 8,
+      _fallback_generated: true,
+      _speech_guarded: Boolean(speaker),
+      _speech_guard_reason: speaker ? 'deterministic-internal-monologue-fallback' : undefined,
+    });
+  }
+  return shots;
+}
+
+
+async function _repairSceneShotsForRetry({
+  scene,
+  shots,
+  shotSimulation,
+  previousScene,
+  error,
+  attempt,
+  maxAttempts,
+}) {
+  const currentShots = Array.isArray(shots) ? shots.map(s => ({ ...s })) : [];
+  const characters = Array.isArray(scene?.characters_present)
+    ? scene.characters_present.filter(Boolean).map(String)
+    : [];
+  const speaker = characters[0] || null;
+
+  // Use the existing authoritative shot repair path first. This repairs the smallest
+  // semantic unit possible while preserving the simulation-locked duration.
+  for (let round = 1; round <= SCENE_REPAIR_MAX_ATTEMPTS; round++) {
+    const candidates = currentShots
+      .map((shot, i) => ({ shot, i, valid: _hasAudibleSceneSpeech(shot) }))
+      .sort((a, b) => Number(a.valid) - Number(b.valid));
+
+    for (const candidate of candidates) {
+      try {
+        const patch = await repairShotForRetry({
+          shot: candidate.shot,
+          storyline: {
+            title: 'scene semantic repair',
+            genre: 'episode production',
+            central_theme: scene?.emotional_beat || '',
+            tone_manifesto: scene?.lighting_design || '',
+          },
+          previousShot: previousScene?.shots?.slice(-1)?.[0] || null,
+          error:
+            `${String(error)}\n` +
+            `SCENE CONTRACT: characters are present (${characters.join(', ')}). ` +
+            `The scene MUST contain audible dialogue. Prefer an explicit quoted ` +
+            `speaker line; internal V.O. is acceptable only when contextually appropriate.` +
+            (speaker ? ` Use ${speaker} if a speaker must be selected.` : ''),
+          failedPrompt: candidate.shot?.image_prompt || null,
+          attempt: attempt + round,
+          maxRetries: maxAttempts,
+        });
+
+        currentShots[candidate.i] = _sanitizeDialogueOrActionSemantics({
+          ...candidate.shot,
+          ...(patch && typeof patch === 'object' ? patch : {}),
+        });
+
+        if (_sceneHasAudibleSpeech({ shots: currentShots })) return currentShots;
+      } catch (repairErr) {
+        console.warn(
+          `[ScriptWriter] Scene ${scene.scene_number} semantic repair ${round}/${SCENE_REPAIR_MAX_ATTEMPTS} failed: ${repairErr.message}`
+        );
+      }
+    }
+  }
+
+  // Deterministic last-resort repair for this specific semantic class. It never invents a
+  // character, never changes locked duration, and only restores the missing audio channel.
+  if (!_sceneHasAudibleSpeech({ shots: currentShots }) && speaker) {
+    const target = currentShots.findIndex(s => !_hasAudibleSceneSpeech(s));
+    const targetIndex = target >= 0 ? target : 0;
+    const base = currentShots[targetIndex] || {};
+    const sim = Array.isArray(shotSimulation?.shots)
+      ? shotSimulation.shots.find(s => Number(s.scene_number) === Number(scene.scene_number) &&
+          Number(s.shot_index) === Number(base.shot_index || targetIndex + 1))
+      : null;
+    const intent = String(
+      scene?.dialogue_intent ||
+      scene?.conversation_reason ||
+      scene?.emotional_beat ||
+      'We need to deal with what just happened.'
+    ).replace(/\s+/g, ' ').trim();
+    const words = intent.replace(/^["“”]|["“”"]$/g, '').slice(0, 220);
+
+    currentShots[targetIndex] = _sanitizeDialogueOrActionSemantics({
+      ...base,
+      dialogue_or_action: `${speaker}: "${words}"`,
+      tts_mode: 'spoken',
+      speaker_name: speaker,
+      speakers_in_shot: [speaker],
+      characters_in_shot: Array.isArray(base.characters_in_shot) && base.characters_in_shot.length
+        ? base.characters_in_shot
+        : characters,
+      duration: Number.isInteger(Number(sim?.duration))
+        ? Number(sim.duration)
+        : (Number.isInteger(Number(base.duration)) ? Number(base.duration) : 8),
+      duration_source: 'shot_simulation_locked',
+      _speech_repaired: true,
+      _speech_repair_reason: 'deterministic-semantic-repair',
+    });
+  }
+
+  if (_sceneHasAudibleSpeech({ shots: currentShots })) return currentShots;
+  throw new Error(
+    `[SpeechRepair] Scene ${scene.scene_number} could not be repaired with audible dialogue after ` +
+    `${SCENE_REPAIR_MAX_ATTEMPTS} repair rounds.`
+  );
+}
+
+async function _writeSceneShotsSequential({
+  scenes,
+  characterBlock,
+  shotSimulation,
+  existingScenes = [],
+  checkpoint = null,
+}) {
+  const totalScenes = scenes.length;
+  const MEMORY_WINDOW = 5;
+  const memory = [];
+  const scenesWithShots = [];
+
+  const priorByScene = new Map(
+    (Array.isArray(existingScenes) ? existingScenes : [])
+      .map(scene => [Number(scene.scene_number), scene])
+  );
+
+  // Restore only the contiguous completed prefix. Production checkpoints are
+  // written in serial order; never let a stray later checkpoint jump ahead and
+  // poison the causal memory of the scene currently being resumed.
+  for (const scene of scenes) {
+    const prior = priorByScene.get(Number(scene.scene_number));
+    const target = Math.max(2, Math.min(5, Number(scene.shot_count_target) || 3));
+    if (!prior || !Array.isArray(prior.shots) || prior.shots.length !== target) break;
+
+    const restored = {
+      ...scene,
+      ...prior,
+      shots: prior.shots.map((shot, i) => ({
+        ...shot,
+        scene_number: Number(scene.scene_number),
+        shot_index: i + 1,
+      })),
+    };
+    scenesWithShots.push(restored);
+    memory.push(_summarizeSceneForMemory(restored));
+    console.log(`[ScriptWriter] ↺ Restored scene-shot checkpoint S${scene.scene_number} (${target}/${target} shots)`);
+  }
+
+  for (let idx = scenesWithShots.length; idx < totalScenes; idx++) {
+    const scene = scenes[idx];
+    const existing = priorByScene.get(Number(scene.scene_number));
+    const alreadyCompleted = scenesWithShots.some(s => Number(s.scene_number) === Number(scene.scene_number));
+    if (alreadyCompleted) continue;
+
+    const isFirst = idx === 0;
+    const isLast = idx === totalScenes - 1;
+    const targetShots = Math.max(2, Math.min(5, Number(scene.shot_count_target) || 3));
+
+    const memoryBlock = memory.length
+      ? `\n═══ STORY MEMORY — what happened so far ═══\n${memory.slice(-MEMORY_WINDOW).join('\n')}\n`
+      : '\n═══ STORY MEMORY ═══\nThis is the opening scene — there is nothing to recap yet.\n';
+
+    const continuitySnapshot = globalContinuity.buildGlobalContinuityState({ scenes: scenesWithShots });
+    const continuityJson = JSON.stringify(continuitySnapshot);
+
+    const simulatedSceneShots = (shotSimulation?.shots || [])
+      .filter(s => Number(s.scene_number) === Number(scene.scene_number))
+      .sort((a, b) => Number(a.shot_index) - Number(b.shot_index));
+
+    const shotSimulationBlock = `\n═══ LOCKED SHOT SIMULATION — DO NOT CONTRADICT ═══\n${JSON.stringify(simulatedSceneShots)}\nUse this as the causal blueprint for every shot in this scene. Preserve its start/end states, handoffs, character changes, dialogue intent, and order.\n`;
+
+    const previousScene = scenesWithShots.length
+      ? scenesWithShots[scenesWithShots.length - 1]
+      : null;
+    const previousEnd = previousScene?.shots?.length
+      ? previousScene.shots[previousScene.shots.length - 1]
+      : null;
+
+    const inheritedStateBlock = previousEnd
+      ? `\n═══ INHERITED STATE FROM PRIOR SCENE ═══\n${JSON.stringify({
+          scene_number: previousScene.scene_number,
+          last_shot_index: previousEnd.shot_index,
+          end_frame_state: previousEnd.end_frame_state || previousEnd.end_state || '',
+          next_shot_continuity: previousEnd.next_shot_continuity || previousEnd.handoff_to_next || '',
+        })}\n`
+      : '';
+
+    const shotUserPrompt = `You are ${idx + 1} of ${totalScenes} scenes into this episode.
+${memoryBlock}${shotSimulationBlock}${inheritedStateBlock}
+═══ SCENE CONVERSATION REASON ═══
+${scene.conversation_reason || 'Every character-containing scene needs a concrete causal reason for the exchange; derive it from the locked scene simulation rather than adding filler.'}
+
+═══ GLOBAL CONTINUITY STATE — inherit before inventing new details ═══
+${continuityJson}
+
+═══ WHAT TO WRITE NEXT ═══
+Generate ${targetShots} shots for SCENE ${scene.scene_number}${isFirst ? ' (OPENING — first 2 shots MUST be "hook" type)' : ''}${isLast ? ' (FINAL SCENE — last shot MUST be the cliffhanger)' : ''}:
+Description: ${scene.scene_description}
+Emotional beat: ${scene.emotional_beat || ''}
+Location: ${scene.location || ''}
+Lighting: ${scene.lighting_design || ''}
+Camera language: ${scene.camera_language || ''}
+Characters present: ${(scene.characters_present || []).join(', ')}
+
+SHOT-TO-SHOT CONTINUITY: Write the shots as a causal sequence, never independent prompts.
+The first shot MUST inherit the supplied prior-scene state when one exists.
+Every following shot MUST inherit the prior shot's terminal state.
+DURATION: copy the locked duration from the shot simulation exactly; it is the only duration authority.
+TRANSITIONS: opening_frame_transition and end_frame_transition are in-world visual/audio continuity descriptions for LTX. They are NOT FFmpeg/editor instructions.
+DIALOGUE: only exact spoken words may be inside quotation marks. Never quote actions, emotions, camera language, transitions, or subtext.
+
+CAST identity locks:
+${characterBlock}
+
+${SHOT_SCHEMA}`;
+
+    let lastSceneError = null;
+    let committedScene = null;
+
+    for (let sceneAttempt = 1; sceneAttempt <= SCENE_SHOT_MAX_ATTEMPTS; sceneAttempt++) {
+      try {
+        const retryContext = sceneAttempt > 1
+          ? `\n⚠️ SCENE RETRY ${sceneAttempt}/${SCENE_SHOT_MAX_ATTEMPTS}\n` +
+            `Previous semantic failure: ${String(lastSceneError?.message || '').slice(0, 1400)}\n` +
+            `Do not repeat the failure; preserve all locked simulation facts.\n`
+          : '';
+
+        const result = await callLLM(
+          SHOT_SYSTEM_PROMPT,
+          retryContext + shotUserPrompt,
+          undefined,
+          { useStream: false, temperature: sceneAttempt === 1 ? 0.35 : 0.2 }
+        );
+        const rawShots = Array.isArray(result?.shots) ? result.shots : [];
+
+        if (rawShots.length !== targetShots) {
+          throw new Error(
+            `[ScriptWriter] Scene ${scene.scene_number} shot sequence invalid: expected ${targetShots} shots, got ${rawShots.length}`
+          );
+        }
+
+        const orderedShots = rawShots.map((shot, shotPos) => {
+          const expectedIndex = shotPos + 1;
+          const lockedSim = simulatedSceneShots[shotPos] || {};
+          const lockedDuration = Number(lockedSim.duration);
+          if (!Number.isInteger(lockedDuration) || lockedDuration < 6 || lockedDuration > 10) {
+            throw new Error(`[ScriptWriter] Scene ${scene.scene_number} shot ${expectedIndex} has invalid locked simulation duration`);
+          }
+
+          const sanitizedShot = _sanitizeDialogueOrActionSemantics({
+            ...shot,
+            scene_number: Number(scene.scene_number),
+            shot_index: expectedIndex,
+          });
+          sanitizedShot.duration = lockedDuration;
+          sanitizedShot.duration_source = 'shot_simulation_locked';
+
+          const normalizedStaging = shotStaging.getShotCharacterStaging(sanitizedShot, []);
+          sanitizedShot.character_staging = normalizedStaging;
+          sanitizedShot.character_positions = normalizedStaging.length
+            ? shotStaging.formatCharacterStagingBlock(normalizedStaging)
+            : (sanitizedShot.character_positions || '');
+
+          return {
+            ...sanitizedShot,
+            scene_number: Number(scene.scene_number),
+            shot_index: expectedIndex,
+          };
+        });
+
+        const sceneWithShots = { ...scene, shots: orderedShots };
+
+        if (Array.isArray(scene.characters_present) && scene.characters_present.length) {
+          if (!String(scene.conversation_reason || '').trim()) {
+            throw _tagPipelineError(new Error(
+              `[ScriptWriter] Scene ${scene.scene_number} contains characters but has no locked conversation_reason`
+            ), { layer: 'scene_simulation', code: 'SCENE_SIMULATION_CONVERSATION_REASON_MISSING', sceneNumber: scene.scene_number });
+          }
+          if (!_sceneHasAudibleSpeech(sceneWithShots)) {
+            const speechErr = new Error(
+              `[ScriptWriter] Scene ${scene.scene_number} contains characters but no audible spoken dialogue ` +
+              `or explicit internal voice-over after semantic sanitization`
+            );
+            speechErr.sceneSpeechMissing = true;
+            speechErr.shots = orderedShots;
+            throw speechErr;
+          }
+        }
+
+        // Catch the common class of model omissions before a checkpoint is written.
+        for (const shot of sceneWithShots.shots) {
+          if (!shot.image_prompt || typeof shot.image_prompt !== 'string') {
+            const e = new Error(`[ScriptWriter] Scene ${scene.scene_number} shot ${shot.shot_index} missing image_prompt`);
+            e.shots = orderedShots;
+            throw e;
+          }
+          if (!shot.dialogue_or_action || typeof shot.dialogue_or_action !== 'string') {
+            const e = new Error(`[ScriptWriter] Scene ${scene.scene_number} shot ${shot.shot_index} missing dialogue_or_action`);
+            e.shots = orderedShots;
+            throw e;
+          }
+        }
+
+        committedScene = sceneWithShots;
+        break;
+      } catch (err) {
+        lastSceneError = err;
+        console.warn(
+          `[ScriptWriter] Scene ${scene.scene_number} attempt ${sceneAttempt}/${SCENE_SHOT_MAX_ATTEMPTS} failed: ${err.message}`
+        );
+
+        // Repair the already-produced JSON first. This avoids throwing away valid shots
+        // merely because one semantic field failed validation.
+        if (sceneAttempt < SCENE_SHOT_MAX_ATTEMPTS && Array.isArray(err.shots)) {
+          try {
+            const repairedShots = await _repairSceneShotsForRetry({
+              scene,
+              shots: err.shots,
+              shotSimulation,
+              previousScene,
+              error: err.message,
+              attempt: sceneAttempt,
+              maxAttempts: SCENE_SHOT_MAX_ATTEMPTS,
+            });
+            const repairedScene = { ...scene, shots: repairedShots };
+            if (!Array.isArray(scene.characters_present) || !scene.characters_present.length || _sceneHasAudibleSpeech(repairedScene)) {
+              committedScene = repairedScene;
+              break;
+            }
+          } catch (repairErr) {
+            lastSceneError = repairErr;
+            console.warn(
+              `[ScriptWriter] Scene ${scene.scene_number} repair failed: ${repairErr.message}`
+            );
+          }
+        }
+
+        if (sceneAttempt < SCENE_SHOT_MAX_ATTEMPTS) {
+          await new Promise(resolve =>
+            setTimeout(resolve, SCENE_RETRY_BASE_DELAY_MS * sceneAttempt)
+          );
+        }
+      }
+    }
+
+    if (!committedScene) {
+      throw lastSceneError || new Error(
+        `[ScriptWriter] Scene ${scene.scene_number} failed without a diagnostic error`
+      );
+    }
+
+    scenesWithShots.push(committedScene);
+    memory.push(_summarizeSceneForMemory(committedScene));
+
+    if (typeof checkpoint === 'function') {
+      await checkpoint({
+        sceneNumber: Number(scene.scene_number),
+        completedSceneNumbers: scenesWithShots.map(s => Number(s.scene_number)),
+        scenes: scenesWithShots.slice(),
+      });
+      console.log(
+        `[Pipeline] 💾 Scene-shot checkpoint persisted: S${committedScene?.season_number || ''} ` +
+        `scene ${scene.scene_number}/${totalScenes}`
+      );
+    }
+  }
+  if (scenesWithShots.length !== totalScenes) {
+    throw new Error(`[ScriptWriter] Scene shot writing incomplete: ${scenesWithShots.length}/${totalScenes} scenes`);
+  }
+
+  return scenesWithShots;
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Social posts
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function writeFinaleAnnouncement(storyline) {
+  const systemPrompt = `${DIRECTOR_PERSONA}
+You are writing the farewell post for a series that has concluded. Write it with the weight of something real ending.`;
+
+  const userPrompt = `Write a farewell/finale social post for the series "${storyline.title}" (${storyline.genre}) that has just concluded after ${storyline.episode_count} episodes across 4 seasons.
+
+Central theme: ${storyline.central_theme || storyline.plot_summary}
+
+Return JSON:
+{
+  "post_text": "3-4 sentences. Speak directly to the fans. Acknowledge the journey. End with a reflection question.",
+  "hashtags": "#StreamVerseStudios #SeriesFinale and 4-6 genre-specific hashtags"
+}`;
+
+  const result = await callLLM(systemPrompt, userPrompt, 512);
+  return `${result.post_text || ''}\n\n${result.hashtags || '#StreamVerseStudios'}`;
+}
+
+async function writePremiereAnnouncement(storyline) {
+  const systemPrompt = `${DIRECTOR_PERSONA}
+You are writing the premiere announcement for a new original series. This is the first thing potential fans see.
+Make it impossible to scroll past.`;
+
+  const userPrompt = `Write a social/Discord premiere announcement for the new series "${storyline.title}" (${storyline.genre}).
+
+Logline: ${storyline.logline || ''}
+Central theme: ${storyline.central_theme || ''}
+Engagement hook: ${storyline.engagement_hook || ''}
+Premiere announcement copy from the series bible: ${storyline.premiere_announcement || ''}
+
+Return JSON:
+{
+  "post_text": "3-4 sentences. Open with a statement that stops scrolling. End with the engagement_hook as a direct question.",
+  "hashtags": "#StreamVerseStudios #SeriesPremiere #NewShow and 4-6 genre/theme specific hashtags"
+}`;
+
+  const result = await callLLM(systemPrompt, userPrompt, 512);
+  return `🎬 SERIES PREMIERE\n\n${result.post_text || ''}\n\n${result.hashtags || '#StreamVerseStudios #SeriesPremiere'}`;
+}
+
+async function writeShotCaption(storylineTitle, genre, episodeContext) {
+  const systemPrompt = `${DIRECTOR_PERSONA}
+You write short, visceral social video captions engineered for maximum engagement.`;
+
+  const userPrompt = `Write a social video caption for a ${genre} clip from "${storylineTitle}".
+Context: ${episodeContext}
+
+Return: {
+  "caption": "Under 60 words. Emotional opener. Engagement tactic. End with a question. 6-8 hashtags.",
+  "engagement_tactic": "binary_choice | tag_someone | controversy | poll_question"
+}`;
+
+  const result = await callLLM(systemPrompt, userPrompt, 300);
+  return result.caption || `✨ ${storylineTitle} | StreamVerse Studios\n\nWatch till the end — would YOU have made the same choice?\n\n#StreamVerseStudios #AIFilm #${genre.replace(/[^a-z0-9]/gi,'')} #NewEpisode`;
+}
+
+async function writeAutoCommentReply({ storylineTitle, genre, episodeTitle, commentText }) {
+  const systemPrompt = `You are the official community manager for StreamVerse Studios.
+You write short, warm, personality-rich replies to viewer comments.
+You NEVER reveal you are AI. You write as the voice of the show's production team.
+Rules: 1-2 sentences max. Acknowledge what the viewer said. End with a question or teaser.`;
+
+  const userPrompt = `The show: "${storylineTitle}" (${genre})
+Current episode: "${episodeTitle}"
+Viewer comment: "${commentText}"
+
+Return JSON: { "reply": "1-2 sentence reply." }`;
+
+  try {
+    const result = await callLLM(systemPrompt, userPrompt, 200);
+    return result.reply || null;
+  } catch (err) {
+    console.warn('[ScriptWriter] writeAutoCommentReply failed:', err.message);
+    return null;
+  }
+}
+
+async function writeEngagementPost({ storylineTitle, genre, centralTheme, engagementHook, episodeCount }) {
+  const systemPrompt = `${DIRECTOR_PERSONA}
+You write high-performing social posts designed to re-ignite engagement between episode drops.`;
+
+  const userPrompt = `Write a between-episodes engagement post for "${storylineTitle}" (${genre}).
+Central theme: ${centralTheme}
+Core engagement hook: ${engagementHook}
+Episodes aired so far: ${episodeCount}
+
+Return JSON:
+{
+  "post_text": "2-3 sentences. Pose a dilemma or ask a fan theory question. Ends with a direct question.",
+  "post_type": "fan_theory | character_dilemma | would_you_rather | behind_the_scenes_tease",
+  "hashtags": "#StreamVerseStudios #AIFilm and 4-6 relevant tags"
+}`;
+
+  try {
+    const result = await callLLM(systemPrompt, userPrompt, 400);
+    return result.post_text
+      ? `${result.post_text}\n\n${result.hashtags || '#StreamVerseStudios'}`
+      : null;
+  } catch (err) {
+    console.warn('[ScriptWriter] writeEngagementPost failed:', err.message);
+    return null;
+  }
+}
+
+
+/**
+ * Director-driven repair for recoverable shot retries.
+ *
+ * The director receives the last shot object plus the concrete runtime error
+ * and returns a semantically complete replacement/patch. This is deliberately
+ * provider-agnostic: it can fill missing fields without requiring a source-code
+ * edit for every new edge case discovered in production.
+ */
+async function repairShotForRetry({ shot, storyline, previousShot = null, error = '', failedPrompt = null, attempt = 1, maxRetries = 3 }) {
+  const safeShot = shot && typeof shot === 'object' ? shot : {};
+  const systemPrompt = `${DIRECTOR_PERSONA}
+
+RETRY REPAIR MODE:
+You are repairing one production shot after a runtime failure. Do not merely repeat the
+same shot. Diagnose the missing, malformed, or inconsistent field and return a complete,
+provider-safe shot patch.
+
+SEMANTIC CONTRACT:
+- "..." quotation marks are ONLY for exact words actually spoken aloud.
+- Actions, emotions, facial expressions, internal states, camera behavior, environmental
+  events, temporal arcs, and end-frame transitions are plain descriptive prose and NEVER quoted.
+- image_prompt is a frozen STILL IMAGE description only. Never describe movement, speaking,
+  lip movement, camera motion, audio, or instructions to an image model in image_prompt.
+- temporal_arc, subject_motion, environmental_story_beat, end_frame_transition and
+  next_shot_continuity describe what happens over time and are never quoted.
+- duration must be an integer from 6 to 10 and should preserve the locked shot-simulation duration whenever available.
+- Keep one speaking character per shot.
+- Preserve character names and story continuity unless the error itself indicates a field is invalid.
+- The movie should remain engaging and strongly dialogue-forward when the scene naturally supports speech.
+- Build the LTX-ready semantics in this order: visible world/start state, progression, visible emotion,
+  camera, spoken dialogue, meaningful end state, natural ambience, and optional music only when truly needed.
+- Default music_cue to "none"; never add background music merely because the episode has a score palette.
+- Use music only when the story context genuinely benefits from it.
+`;
+
+  const userPrompt = `Repair this failed StreamVerse shot for retry ${attempt}/${maxRetries}.
+
+RUNTIME ERROR:
+${String(error).slice(0, 1200)}
+
+FAILED IMAGE PROMPT (may be null):
+${failedPrompt || '(none)'}
+
+PREVIOUS SHOT CONTEXT:
+${previousShot ? JSON.stringify(previousShot).slice(0, 6000) : '(none)'}
+
+CURRENT SHOT:
+${JSON.stringify(safeShot).slice(0, 12000)}
+
+STORYLINE:
+Title: ${storyline?.title || ''}
+Genre: ${storyline?.genre || ''}
+Theme: ${storyline?.central_theme || ''}
+Tone: ${storyline?.tone_manifesto || ''}
+
+Return JSON ONLY. Return a PATCH containing every field that is missing, malformed,
+or should change to make the shot safely retryable. Preserve valid existing values.
+
+{
+  "image_prompt": "A vivid frozen-frame description for the still-image model only.",
+  "dialogue_or_action": "Plain descriptive action, OR spoken dialogue with quoted spoken words, OR NAME (V.O.): unquoted internal voice-over thought.",
+  "tts_mode": "spoken | ambient | phone_vo | internal_monologue",
+  "duration": 8,
+  "opening_frame_transition": "A descriptive in-world opening bridge inherited from the prior shot/scene.",
+  "temporal_arc": "A complete visual micro-arc from beginning state through development to end state.",
+  "environmental_story_beat": "A concrete environmental event that matters to the scene.",
+  "music_cue": "none | subtle | prominent",
+  "music_reason": "Why music is genuinely needed, or empty when music_cue is none.",
+  "end_frame_transition": "The descriptive final visual/audio state reached by this shot.",
+  "next_shot_continuity": "The descriptive fact the next shot should inherit.",
+  "subject_motion": "Observable movement over time, unquoted.",
+  "camera_movement": "Descriptive camera behavior, unquoted.",
+  "narrative_complexity": "low | medium | high"
+}
+
+Do not add keys outside this patch schema.`;
+
+  const repaired = await callLLM(
+    `${systemPrompt}\n${MULTI_SPEAKER_LTX_RULES}`,
+    userPrompt,
+    1400,
+    { useStream: false }
+  );
+
+  if (!repaired || typeof repaired !== 'object') {
+    throw new Error('Director returned no repair object');
+  }
+
+  const out = { ...repaired };
+  // Apply the same semantic dialogue hygiene used in normal shot generation.
+  const sanitized = _sanitizeDialogueOrActionSemantics(out);
+
+  // Duration belongs to the pre-generation shot simulation. A retry repair may
+  // repair semantics, but it must never invent, clamp, or otherwise change the
+  // locked timing of the existing shot.
+  const lockedDuration = Number(shot?.duration);
+  if (!Number.isInteger(lockedDuration) || lockedDuration < 6 || lockedDuration > 10) {
+    throw new Error('Shot retry repair cannot proceed without a valid simulation-locked duration (6–10s).');
+  }
+  sanitized.duration = lockedDuration;
+  sanitized.duration_source = 'shot_simulation_locked';
+
+  // Never let the repair introduce explicit video/audio instructions into the still prompt.
+  // Keep ordinary visible pose words intact (e.g. "standing", "walking pose") because those
+  // can describe a single frozen frame. Remove only unmistakable temporal/meta directives.
+  if (typeof sanitized.image_prompt === 'string') {
+    sanitized.image_prompt = sanitized.image_prompt
+      .replace(/\b(?:use this image|animate this image|camera moves?[^.]*|lips? moving[^.]*|is speaking[^.]*|is talking[^.]*|delivers? dialogue[^.]*|voice(?:over)?[^.]*|audio[^.]*|says aloud[^.]*)/gi, ' ')
+      .replace(/\s{2,}/g, ' ')
+      .trim();
+  }
+
+  return sanitized;
+}
+
+module.exports = {
+  callLLM,
+  writeSeriesSummary,
+  simulateSeriesStory,
+  simulateEpisodeTrajectoryWindow,
+  simulateSeasonStory,
+  simulateEpisodeStory,
+  simulateEpisodeShots,
+  repairEpisodeSceneSimulation,
+  writeCastBible,
+  writeNewStoryline: writeSeriesSummary,  // backward-compatible alias
+  writeEpisodeScript,
+  generateCharacterVisualAnchor,
+  createCharacterFromSceneContext,
+  rewriteCharacterPortraitPrompt,
+  writeFinaleAnnouncement,
+  writePremiereAnnouncement,
+  writeShotCaption,
+  writeAutoCommentReply,
+  writeEngagementPost,
+  repairShotForRetry,
+  ensureSceneSpeechCoverage,
+  assignVoiceForCharacter,
+  assignSeedForCharacter,
+  assignShotSeed,
+};
