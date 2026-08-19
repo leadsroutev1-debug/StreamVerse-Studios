@@ -12,22 +12,32 @@ const config = require('./config');
  * Production contract:
  *   - prompt is the cinematic scene-image prompt
  *   - input_image_0..3 are binary reference images
- *   - reference images are resized to <=512x512 before transmission
- *   - output is a 9:16 high-resolution image for the LTX I2V stage
+ *   - ONLY reference inputs are normalized to the Cloudflare multi-reference
+ *     limit (<512x512); the generated scene image is NEVER resized here
+ *   - generated scene output defaults to 1024x1536 (9:16) for LTX I2V
  *   - seed and guidance are passed through for reproducibility/control
  *   - characterMap is metadata used by the custom Worker to bind reference
  *     indices to character identities
  *
- * FLUX.2 klein 9B supports up to four reference images, but the reference
- * inputs must be named explicitly and kept below 512x512. The model's
- * distilled sampler has fixed steps, so this client deliberately does not
- * expose or invent a steps parameter.
+ * Cloudflare's FLUX.2 klein 9B API supports up to four named reference
+ * inputs and requires each reference image to be smaller than 512x512.
+ * That restriction applies to the INPUT references, not the requested
+ * OUTPUT dimensions. StreamVerse therefore preserves the full 1024x1536
+ * generated frame for the downstream LTX-2.3 I2V stage.
  */
 
 class CFSafetyRefusalError extends Error {
   constructor(message) {
     super(message);
     this.name = 'CFSafetyRefusalError';
+  }
+}
+
+class CFOutputValidationError extends Error {
+  constructor(message, detail = {}) {
+    super(message);
+    this.name = 'CFOutputValidationError';
+    this.detail = detail;
   }
 }
 
@@ -59,10 +69,10 @@ function _checkNotJsonError(buf) {
 }
 
 /**
- * Resize a reference image to the Workers AI multi-reference limit without
- * changing its semantic framing. Contain preserves the whole character
- * reference and pads transparent/empty areas rather than cropping faces.
- * JPEG is used because the Worker only needs a compact binary reference.
+ * Prepare ONLY a reference image for FLUX.2's documented multi-reference
+ * input constraint. This must never be used on the generated scene frame.
+ * Contain preserves the complete character reference and avoids face/body
+ * cropping. No enlargement is performed.
  */
 async function _prepareReferenceImage(buffer) {
   return sharp(buffer, { failOn: 'none' })
@@ -95,6 +105,24 @@ function _resolveDimension(name, fallback) {
   return Number.isFinite(value) && value >= 256 && value <= 1920 ? Math.floor(value) : fallback;
 }
 
+async function _validateGeneratedSceneImage(buf, expectedWidth, expectedHeight) {
+  let metadata;
+  try {
+    metadata = await sharp(buf, { failOn: 'none' }).metadata();
+  } catch (err) {
+    throw new CFOutputValidationError(`Generated CF image is not a decodable image: ${err.message}`);
+  }
+
+  if (metadata.width !== expectedWidth || metadata.height !== expectedHeight) {
+    throw new CFOutputValidationError(
+      `Cloudflare returned ${metadata.width || '?'}x${metadata.height || '?'}; expected ${expectedWidth}x${expectedHeight}. Refusing to resize/crop the cinematic frame before LTX I2V.`,
+      { actualWidth: metadata.width, actualHeight: metadata.height, expectedWidth, expectedHeight },
+    );
+  }
+
+  return metadata;
+}
+
 async function _generateImageOnce(prompt, referenceImageUrls = [], seed = null, negativePrompt = null, characterMap = []) {
   const urlCount = config.cfWorkerUrls.length;
   const keyCount = config.cfWorkerKeys.length;
@@ -105,13 +133,20 @@ async function _generateImageOnce(prompt, referenceImageUrls = [], seed = null, 
   const height = _resolveDimension('CF_IMAGE_HEIGHT', 1536);
   const guidance = _resolveGuidance();
 
+  // The image stage is the canonical visual frame for LTX. Keep the output
+  // portrait geometry explicit and reject accidental configuration drift.
+  if (width !== 1024 || height !== 1536) {
+    console.warn(`[CFImageGen] Non-production output geometry requested: ${width}x${height}. Production LTX I2V expects 1024x1536 portrait frames.`);
+  }
+
+  const refs = (referenceImageUrls || []).slice(0, 4);
   const refBuffers = [];
-  for (const url of (referenceImageUrls || []).slice(0, 4)) {
+  for (const url of refs) {
     try {
       const r = await axios.get(url, { responseType: 'arraybuffer', timeout: 20000 });
       refBuffers.push(await _prepareReferenceImage(Buffer.from(r.data)));
     } catch (e) {
-      console.warn(`[CFImageGen] Skipping reference image (fetch/resize failed): ${e.message}`);
+      console.warn(`[CFImageGen] Skipping reference image (fetch/preparation failed): ${e.message}`);
     }
   }
 
@@ -149,11 +184,14 @@ async function _generateImageOnce(prompt, referenceImageUrls = [], seed = null, 
         _checkNotJsonError(buf);
         if (buf.length < 100) throw new Error(`CF Worker returned suspiciously small response (${buf.length} bytes)`);
 
+        await _validateGeneratedSceneImage(buf, width, height);
+
         config.markKeyStatus('cf', key, 'active');
-        console.log(`[CFImageGen] Image generated (${buf.length} bytes, ${refBuffers.length} prepared refs, ${width}x${height}, guidance=${guidance})`);
+        console.log(`[CFImageGen] Image generated (${buf.length} bytes, ${refBuffers.length}/${refs.length} refs prepared, output=${width}x${height}, guidance=${guidance})`);
         return buf;
       } catch (err) {
         lastError = err;
+        if (err instanceof CFOutputValidationError) throw err;
         if (err.message?.startsWith('CF Worker returned JSON error')) {
           const errText = err.message;
           if (errText.includes('3030')) throw new CFSafetyRefusalError(`CF Worker content flagged (3030): ${errText}`);
@@ -211,4 +249,4 @@ async function generateImage(prompt, referenceImageUrls = [], seed = null, negat
   }
 }
 
-module.exports = { generateImage, CFSafetyRefusalError };
+module.exports = { generateImage, CFSafetyRefusalError, CFOutputValidationError };
