@@ -3,7 +3,7 @@
 /**
  * Semantic character-reference selection.
  *
- * Each canonical character can have up to four reference images:
+ * Each canonical character MUST have four locked reference images:
  *   front, three_quarter, profile, full_body
  *
  * This module chooses the best reference FOR THE CURRENT SHOT rather than
@@ -13,9 +13,23 @@
  *
  * It never changes identity. It only chooses which already-locked portrait
  * best teaches the image model the character's appearance for this shot.
+ *
+ * Production invariant: an incomplete canonical reference set is a hard
+ * generation blocker. We must never silently fall back to a single front
+ * portrait and pretend a four-view identity package exists.
  */
 
 const ANGLES = Object.freeze(['front', 'three_quarter', 'profile', 'full_body']);
+
+class CharacterReferenceIntegrityError extends Error {
+  constructor(characterName, missingAngles = []) {
+    super(`Character reference set incomplete for ${characterName}: missing ${missingAngles.join(', ') || 'canonical angles'}`);
+    this.name = 'CharacterReferenceIntegrityError';
+    this.characterName = characterName;
+    this.missingAngles = missingAngles;
+    this.code = 'CHARACTER_REFERENCE_INCOMPLETE';
+  }
+}
 
 const ANGLE_ALIASES = Object.freeze({
   front: ['front', 'frontal', 'head on', 'straight on', 'facing camera', 'looking into camera', 'direct to camera'],
@@ -57,8 +71,6 @@ function scoreAngle(angle, shot, char, stagingRow, previousSelection = null) {
   let score = 0;
   const reasons = [];
 
-  // Framing is the strongest signal because it determines how much of the
-  // character should be visible in the final composition.
   if (angle === 'full_body') {
     if (hasAny(framing, ['full body', 'full-body', 'full length', 'full-length', 'long shot', 'wide shot', 'establishing', 'medium wide', 'medium-long', 'wide framing'])) {
       score += 48; reasons.push('full-body/wide framing');
@@ -104,8 +116,6 @@ function scoreAngle(angle, shot, char, stagingRow, previousSelection = null) {
     }
   }
 
-  // Camera vocabulary can imply the useful face orientation even when the
-  // script does not explicitly name the angle.
   if (angle === 'profile' && hasAny(camera, ['side angle', 'side angle shot', '90 degree', '90°'])) {
     score += 18; reasons.push('side-angle camera');
   }
@@ -116,7 +126,6 @@ function scoreAngle(angle, shot, char, stagingRow, previousSelection = null) {
     score += 15; reasons.push('centered camera');
   }
 
-  // Semantic actions with visible face orientation.
   if (angle === 'profile' && hasAny(action, ['phone call', 'on the phone', 'phone', 'looking out window', 'looks away', 'watching someone offscreen'])) {
     score += 7; reasons.push('side-oriented action');
   }
@@ -127,14 +136,11 @@ function scoreAngle(angle, shot, char, stagingRow, previousSelection = null) {
     score += 11; reasons.push('direct-address performance');
   }
 
-  // Continuity should matter, but never override an explicit framing cue.
   if (previousSelection && previousSelection === angle) {
     score += 4;
     reasons.push('continuity with previous selected angle');
   }
 
-  // Prefer three-quarter as a neutral general-purpose fallback, then front,
-  // then profile, then full_body. This only decides ambiguous ties.
   const neutralBonus = { three_quarter: 3, front: 2, profile: 1, full_body: 0 };
   score += neutralBonus[angle] || 0;
 
@@ -161,12 +167,21 @@ function getReferenceAngles(character) {
   return out;
 }
 
-function selectCharacterReference({ character, shot, stagingRow = null, previousSelection = null }) {
+function assertCompleteCanonicalReferences(character) {
   const references = getReferenceAngles(character);
-  const available = Object.keys(references).filter(angle => ANGLES.includes(angle));
-  if (!available.length) {
-    return { url: null, angle: null, score: 0, confidence: 0, reason: 'no canonical reference image available', candidates: [] };
+  const missing = ANGLES.filter(angle => !references[angle]);
+  if (missing.length) {
+    throw new CharacterReferenceIntegrityError(character?.name || 'unknown character', missing);
   }
+  if (character?.reference_status && character.reference_status !== 'locked') {
+    throw new CharacterReferenceIntegrityError(character?.name || 'unknown character', ['locked canonical reference status']);
+  }
+  return references;
+}
+
+function selectCharacterReference({ character, shot, stagingRow = null, previousSelection = null }) {
+  const references = assertCompleteCanonicalReferences(character);
+  const available = ANGLES.filter(angle => !!references[angle]);
 
   const scored = available
     .map(angle => scoreAngle(angle, shot, character, stagingRow, previousSelection))
@@ -207,6 +222,8 @@ function buildReferenceDecisionLedger({ characters, shot, stagingRows = [], prev
 module.exports = {
   ANGLES,
   getReferenceAngles,
+  assertCompleteCanonicalReferences,
   selectCharacterReference,
   buildReferenceDecisionLedger,
+  CharacterReferenceIntegrityError,
 };
