@@ -108,12 +108,34 @@ function getPool() {
  * when any parameter value is `undefined`. Coerce every undefined to null so
  * the driver always receives a serialisable value.
  */
+function _sanitizeDbString(value) {
+  if (typeof value !== 'string') return value;
+  // Node strings can contain lone UTF-16 surrogates. mysql2 encodes those as
+  // invalid UTF-8; MySQL JSON columns then reject the entire document.
+  return Buffer.from(value, 'utf8').toString('utf8');
+}
+
+function _sanitizeDbValue(value) {
+  if (value === undefined) return null;
+  if (typeof value === 'string') return _sanitizeDbString(value);
+  if (value && Object.getPrototypeOf(value) === Object.prototype) {
+    const normalized = {};
+    for (const [k, v] of Object.entries(value)) normalized[_sanitizeDbString(k)] = _sanitizeDbValue(v);
+    return JSON.stringify(normalized);
+  }
+  if (Array.isArray(value)) {
+    const normalized = value.map(_sanitizeDbValue);
+    return JSON.stringify(normalized);
+  }
+  return value;
+}
+
 function sanitizeParams(params) {
   if (params == null) return [];
   if (!Array.isArray(params)) {
     throw new TypeError('Database parameters must be an array');
   }
-  return params.map(p => (p === undefined ? null : p));
+  return params.map(_sanitizeDbValue);
 }
 
 function _compactSql(sql) {
@@ -265,6 +287,7 @@ async function initSchema() {
       ready_at            DATETIME      NULL COMMENT 'When final compilation finished and the episode became ready for manual review/publish',
       posted_at           DATETIME      NULL,
       created_at          DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at          DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
       INDEX idx_storyline (storyline_id),
       INDEX idx_status    (status)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -324,6 +347,7 @@ async function initSchema() {
     [`episodes`,    `scene_background_state`, `ALTER TABLE episodes ADD COLUMN scene_background_state JSON NULL COMMENT 'scene number → dedicated empty-set background reference URL'`],
     [`episodes`,    `paused_reason`,       `ALTER TABLE episodes ADD COLUMN paused_reason VARCHAR(512) NULL COMMENT 'Why this draft is paused'`],
     [`episodes`,    `ready_at`,            `ALTER TABLE episodes ADD COLUMN ready_at DATETIME NULL COMMENT 'Final compilation completed; waiting for manual review/publish'`],
+    [`episodes`,    `updated_at`,          `ALTER TABLE episodes ADD COLUMN updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`],
     // shots table — structured motion parameters from the Motion System Upgrade
     [`shots`,       `motion_params`,        `ALTER TABLE shots ADD COLUMN motion_params JSON NULL COMMENT 'Structured motion control params from Motion System Upgrade'`],
     // shots table — constraint enforcement results

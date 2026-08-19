@@ -156,7 +156,7 @@ async function simulateEpisodeScenes({ episode_id } = {}) {
   const season = (full.season_simulations || []).find(s=>Number(s.season)===Number(episode.season_number));
   const trajectory = (season?.episode_trajectory || []).find(e=>Number(e.episode)===Number(episode.episode_number));
   const existing = script.narrative_simulation || null;
-  const expected = 10;
+  const expected = Math.max(1, Number(trajectory?.scene_count || trajectory?.sceneCount || trajectory?.scenes?.length || config.scenesPerEpisode || 10));
   if (existing?.simulation_status==='complete' && Array.isArray(existing.scene_beat_plan) && existing.scene_beat_plan.length >= expected) return {ok:true,skipped:true,simulation:existing};
   let current = existing;
   const save = async ({stage,sceneNumber,simulation})=>{
@@ -165,6 +165,11 @@ async function simulateEpisodeScenes({ episode_id } = {}) {
     await db.execute(`UPDATE episodes SET script=?,scene_count=?,shot_count=?,updated_at=NOW() WHERE id=?`,[JSON.stringify(payload),Array.isArray(simulation?.scene_beat_plan)?simulation.scene_beat_plan.length:0,0,episode.id]);
   };
   current = await scriptWriter.simulateEpisodeStory({ storyline, characters:chars, recentEpisodes:await db.query(`SELECT * FROM episodes WHERE storyline_id=? AND status IN ('ready','published') ORDER BY episode_number DESC LIMIT 5`,[storyline.id]), episodeNumber:Number(episode.episode_number), seasonNumber:Number(episode.season_number), isFinale:Number(episode.episode_number)===num(config.episodesPerSeason,1), isSeriesMovie:false, targetMinutes:num(config.targetEpisodeMinSeconds,120)/60, episodeTrajectory:trajectory, existingSimulation:existing, checkpoint:save });
+  const scenePlan = Array.isArray(current?.scene_beat_plan) ? current.scene_beat_plan : [];
+  const complete = current?.simulation_status === 'complete' && scenePlan.length >= expected;
+  if (!complete) {
+    return {ok:false,pending:true,reason:'Episode scene simulation is not complete',simulation:current,expected_scene_count:expected,actual_scene_count:scenePlan.length};
+  }
   return {ok:true,simulation:current};
 }
 
@@ -175,7 +180,10 @@ async function writeEpisodeBlueprintAndShotSimulation({ episode_id } = {}) {
   const chars = await db.query(`SELECT * FROM characters WHERE storyline_id=? ORDER BY created_at`, [episode.storyline_id]);
   const draftScript = json(episode.script, {});
   const narrative = draftScript.narrative_simulation;
-  if (!narrative) throw new Error('Episode scene simulation is not complete');
+  const expectedScenes = Math.max(1, Number((await db.queryOne(`SELECT scene_count FROM episodes WHERE id=?`,[episode.id]))?.scene_count || config.scenesPerEpisode || 10));
+  if (!narrative || narrative.simulation_status !== 'complete' || !Array.isArray(narrative.scene_beat_plan) || narrative.scene_beat_plan.length < expectedScenes) {
+    throw new Error(`Episode scene simulation is not complete: ${Array.isArray(narrative?.scene_beat_plan) ? narrative.scene_beat_plan.length : 0}/${expectedScenes}`);
+  }
   const full = json(storyline.full_story_simulation, {});
   const targetMinutes = Math.max(1,num(config.targetEpisodeMinSeconds,120)/60);
   const finalScript = await scriptWriter.writeEpisodeScript({
@@ -219,7 +227,12 @@ async function generateMedia({ episode_id, scene_number = null, shot_index = nul
   const pipeline = require('./pipeline');
   const episode = await db.queryOne(`SELECT * FROM episodes WHERE id=?`, [episode_id]);
   if (!episode) throw new Error('Episode not found');
-  if (typeof pipeline.generateEpisodeMediaAgent === 'function') return pipeline.generateEpisodeMediaAgent(episode_id,{sceneNumber:scene_number,shotIndex:shot_index});
+  if (typeof pipeline.generateEpisodeMediaAgent === 'function') {
+    const result = await pipeline.generateEpisodeMediaAgent(episode_id,{sceneNumber:scene_number,shotIndex:shot_index});
+    const activeJobs = await recovery.queryActiveJobs(episode_id).catch(()=>[]);
+    if (Array.isArray(activeJobs) && activeJobs.length) return {ok:false,pending:true,reason:'Media generation is still in progress; do not advance the production state yet',active_jobs:activeJobs,result};
+    return result;
+  }
   if (scene_number != null && shot_index != null) return pipeline.regenerateShot(Number(scene_number),Number(shot_index),{episodeId:episode_id});
   return pipeline.regenerateScene(Number(scene_number || 1));
 }

@@ -1016,9 +1016,10 @@ async function runProductionAgent({ storyline = null, episode = null, maxSteps =
 `3. Never regenerate a locked/complete upstream layer just because a downstream layer is incomplete.\n` +
 `4. Never fabricate DB tables, columns, episode IDs, counts, or states. Use DB-backed tools.\n` +
 `5. Never publish until validate_episode returns ok=true.\n` +
-`6. When a tool fails, diagnose with the recovery tools already available, repair only the owning unit, then re-inspect production_state.\n` +
-`7. Preserve locked creative continuity. Locked season trajectories, scene simulations and shot simulations are authoritative.\n` +
-`8. You may use ALL database inspection/recovery tools in addition to the production tools.\n\n` +
+`6. When a tool fails or returns pending, STOP production progression. Diagnose the concrete failure, repair only the owning unit, then re-inspect production_state before choosing another production tool.\n` +
+`7. Never repeat the identical production tool call with identical arguments unless new durable evidence proves the state changed.\n` +
+`9. Preserve locked creative continuity. Locked season trajectories, scene simulations and shot simulations are authoritative.\n` +
+`10. You may use ALL database inspection/recovery tools in addition to the production tools.\n\n` +
 `NORMAL PRODUCTION ORDER (guide, not a hard-coded workflow):\n` +
 `initialize_series -> simulate_season -> ensure_episode_draft -> simulate_episode_scenes -> write_episode_script -> prepare_shot_rows -> generate_episode_media -> compile_episode -> validate_episode -> publish_episode.\n` +
 `You are allowed to deviate from this sequence when production_state and validation evidence show another tool is the correct next action.\n\n` +
@@ -1034,6 +1035,10 @@ async function runProductionAgent({ storyline = null, episode = null, maxSteps =
   ];
 
   let lastDecision = null;
+  let lastToolFingerprint = null;
+  let blockedAfterFailure = false;
+  const diagnosticTools = new Set(['production_state','classify_error','trace_root_cause','diagnose_provider_failure','validate_all_invariants','find_stuck_work','find_invalid_transitions','find_orphaned_work','find_skipped_work','find_out_of_order_work','detect_retry_loop','detect_timeout_loop','detect_rate_limit_loop','detect_provider_degradation','build_recovery_plan','checkpoint_production']);
+  const productionToolNames = new Set(['initialize_series','simulate_season','ensure_episode_draft','simulate_episode_scenes','write_episode_script','prepare_shot_rows','generate_episode_media','compile_episode','validate_episode','publish_episode']);
   try {
     for (let step = 0; step < limit; step++) {
       const forced = step === 0 ? { type: 'function', function: { name: 'production_state' } } : 'auto';
@@ -1053,7 +1058,12 @@ async function runProductionAgent({ storyline = null, episode = null, maxSteps =
         const fn = toolByName.get(name);
         let result;
         const args = jsonParse(call?.function?.arguments, {});
-        if (!fn) result = { error: `Unknown tool ${name}` };
+        const fingerprint = `${name}:${JSON.stringify(args)}`;
+        if (blockedAfterFailure && productionToolNames.has(name) && !diagnosticTools.has(name)) {
+          result = {ok:false,blocked:true,error:'Production action blocked after a failed/pending tool result. Diagnose the failure or re-inspect production_state before selecting another production action.',code:'AGENT_RECOVERY_GATE'};
+        } else if (fingerprint === lastToolFingerprint && productionToolNames.has(name)) {
+          result = {ok:false,blocked:true,error:'Identical production action was requested twice without new evidence. Re-inspect production_state and make a targeted repair instead of oscillating.',code:'AGENT_NO_PROGRESS'};
+        } else if (!fn) result = { error: `Unknown tool ${name}` };
         else {
           try {
             result = await fn.handler(args);
@@ -1064,6 +1074,14 @@ async function runProductionAgent({ storyline = null, episode = null, maxSteps =
           } catch (err) {
             result = { ok: false, error: err.message, code: err.code || null };
           }
+        }
+        lastToolFingerprint = fingerprint;
+        if (productionToolNames.has(name)) {
+          blockedAfterFailure = !!(result?.error || result?.pending || result?.blocked || result?.ok === false);
+          if (!blockedAfterFailure && (result?.ok === true || result?.status === 'completed')) blockedAfterFailure = false;
+        } else if (diagnosticTools.has(name) && result?.ok !== false) {
+          // Diagnostics/inspection are explicitly allowed to break the recovery gate.
+          blockedAfterFailure = false;
         }
         messages.push({ role: 'tool', tool_call_id: call.id, name, content: JSON.stringify(result) });
         await _safeMemoryCall('production tool event', () => memory.rememberEvent({
