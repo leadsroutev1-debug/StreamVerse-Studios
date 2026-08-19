@@ -26,7 +26,6 @@ jobs:
         shell: python
         run: |
           from pathlib import Path
-          import re
 
           def patch(path, replacements):
               p = Path(path)
@@ -39,13 +38,11 @@ jobs:
               p.write_text(s, encoding='utf-8')
               print(f'patched {path}: {len(original)} -> {len(s)} bytes')
 
-          # 1) The generic DB mutation tool must never be able to forge a
-          # production status. Status transitions belong to validated tools.
           patch('src/agentOrchestrator.js', [
             (
               'forbid-agent-status-mutation',
               """      const w = Object.entries(where||{});\n      const u = Object.entries(updates||{});\n      if (!w.length || !u.length) throw new Error('db_update_fields requires non-empty where and updates');\n""",
-              """      const w = Object.entries(where||{});\n      const u = Object.entries(updates||{});\n      if (!w.length || !u.length) throw new Error('db_update_fields requires non-empty where and updates');\n      // Production state is a guarded invariant. The LLM may inspect DB state,\n      // but it may not manufacture an episode/shot/storyline status by writing\n      // the status column directly. Validated production tools own transitions.\n      if (['episodes','shots','storylines'].includes(table) && u.some(([c]) => c === 'status')) {\n        throw Object.assign(new Error(`Direct status mutation is forbidden for ${table}; use the validated production tool for the owning transition.`), { code:'AGENT_STATUS_MUTATION_FORBIDDEN' });\n      }\n"""
+              """      const w = Object.entries(where||{});\n      const u = Object.entries(updates||{});\n      if (!w.length || !u.length) throw new Error('db_update_fields requires non-empty where and updates');\n      if (['episodes','shots','storylines'].includes(table) && u.some(([c]) => c === 'status')) {\n        throw Object.assign(new Error(`Direct status mutation is forbidden for ${table}; use the validated production tool for the owning transition.`), { code:'AGENT_STATUS_MUTATION_FORBIDDEN' });\n      }\n"""
             ),
             (
               'checkpoint-not-diagnostic',
@@ -54,14 +51,11 @@ jobs:
             )
           ])
 
-          # 2) Scene simulation only becomes a durable milestone after its
-          # completion invariant is true. The previous agent was able to write
-          # scenes_simulated directly after receiving a pending result.
           patch('src/agentProductionTools.js', [
             (
               'scene-simulation-verified-status',
               """  const complete = current?.simulation_status === 'complete' && scenePlan.length >= expected;\n  if (!complete) {\n    return {ok:false,pending:true,reason:'Episode scene simulation is not complete',simulation:current,expected_scene_count:expected,actual_scene_count:scenePlan.length};\n  }\n  return {ok:true,simulation:current};\n""",
-              """  const complete = current?.simulation_status === 'complete' && scenePlan.length >= expected;\n  if (!complete) {\n    return {ok:false,pending:true,reason:'Episode scene simulation is not complete',simulation:current,expected_scene_count:expected,actual_scene_count:scenePlan.length};\n  }\n  // Only the verified tool may promote the durable episode milestone.\n  await db.execute(`UPDATE episodes SET status='scenes_simulated', scene_count=?, updated_at=NOW() WHERE id=?`, [scenePlan.length, episode.id]);\n  return {ok:true,simulation:current,scene_count:scenePlan.length,status:'scenes_simulated'};\n"""
+              """  const complete = current?.simulation_status === 'complete' && scenePlan.length >= expected;\n  if (!complete) {\n    return {ok:false,pending:true,reason:'Episode scene simulation is not complete',simulation:current,expected_scene_count:expected,actual_scene_count:scenePlan.length};\n  }\n  await db.execute(`UPDATE episodes SET status='scenes_simulated', scene_count=?, updated_at=NOW() WHERE id=?`, [scenePlan.length, episode.id]);\n  return {ok:true,simulation:current,scene_count:scenePlan.length,status:'scenes_simulated'};\n"""
             ),
             (
               'prepare-shots-invariant',
@@ -80,31 +74,18 @@ jobs:
             )
           ])
 
-          # 3) Schema bootstrap currently swallows migration failures. That is
-          # dangerous: the app can report "schema ready" while a live table is
-          # missing a required column. Make critical legacy-column repair fail
-          # startup instead of leaving a latent mismatch.
           p = Path('src/db.js')
           s = p.read_text(encoding='utf-8')
           old = """    if (!exists) {\n      try { await execute(ddl); console.log(`[DB] Added column ${table}.${col}`); }\n      catch (e) { console.warn(`[DB] Could not add ${table}.${col}:`, e.message); }\n    }\n"""
-          new = """    if (!exists) {\n      try { await execute(ddl); console.log(`[DB] Added column ${table}.${col}`); }\n      catch (e) {\n        // A schema mismatch is not recoverable by continuing with an old table.\n        // Fail bootstrap loudly so Render restarts the service instead of\n        // allowing the agent to operate against a partially migrated schema.\n        console.error(`[DB] CRITICAL schema migration failed for ${table}.${col}:`, e.message);\n        throw Object.assign(new Error(`Required schema migration failed for ${table}.${col}: ${e.message}`), { code:'DB_SCHEMA_MIGRATION_FAILED', cause:e });\n      }\n    }\n"""
+          new = """    if (!exists) {\n      try { await execute(ddl); console.log(`[DB] Added column ${table}.${col}`); }\n      catch (e) {\n        console.error(`[DB] CRITICAL schema migration failed for ${table}.${col}:`, e.message);\n        throw Object.assign(new Error(`Required schema migration failed for ${table}.${col}: ${e.message}`), { code:'DB_SCHEMA_MIGRATION_FAILED', cause:e });\n      }\n    }\n"""
           if old not in s:
               raise SystemExit('PATCH FAILED: db.js migration error handling anchor missing')
-          s = s.replace(old, new, 1)
-          p.write_text(s, encoding='utf-8')
+          p.write_text(s.replace(old, new, 1), encoding='utf-8')
 
-          # 4) Verify the repository has the exact runtime contracts we just
-          # hardened. These are static guards for the action itself.
-          checks = {
-            'src/agentOrchestrator.js': [
-              'AGENT_STATUS_MUTATION_FORBIDDEN',
-              'checkpoint_production']);
-            ],
-          }
-          assert "AGENT_STATUS_MUTATION_FORBIDDEN" in Path('src/agentOrchestrator.js').read_text(encoding='utf-8')
+          assert 'AGENT_STATUS_MUTATION_FORBIDDEN' in Path('src/agentOrchestrator.js').read_text(encoding='utf-8')
           assert "status='scenes_simulated'" in Path('src/agentProductionTools.js').read_text(encoding='utf-8')
           assert "status='shots_ready'" in Path('src/agentProductionTools.js').read_text(encoding='utf-8')
-          assert "DB_SCHEMA_MIGRATION_FAILED" in Path('src/db.js').read_text(encoding='utf-8')
+          assert 'DB_SCHEMA_MIGRATION_FAILED' in Path('src/db.js').read_text(encoding='utf-8')
           print('Surgical hardening checks passed.')
 
       - name: Syntax check
