@@ -13,62 +13,33 @@ jobs:
     if: ${{ !contains(github.event.head_commit.message, '[agent-reset-ui]') }}
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Patch backend and dashboard
+      - uses: actions/checkout@v4
+      - name: Patch dashboard reset UI
         shell: python
         run: |
           from pathlib import Path
+          p = Path('views/dashboard.html')
+          s = p.read_text(encoding='utf-8')
+          marker = 'AGENT_RESET_DASHBOARD_V2'
+          if marker in s:
+              print('Reset UI already present')
+          else:
+              button = '''<button id="agentResetBtn" class="memory-btn" onclick="openAgentResetModal()" title="Reset agent state without deleting production data">🧠 Reset Agent State</button>'''
+              needle = '<button class="memory-btn" id="agentMemoryPrune">Prune Low-Priority Memory</button>'
+              if needle not in s:
+                  raise SystemExit('Agent memory prune control not found')
+              s = s.replace(needle, needle + '\n    ' + button + '\n    <span id="AGENT_RESET_DASHBOARD_V2" style="display:none"></span>', 1)
 
-          index = Path('index.js')
-          text = index.read_text(encoding='utf-8')
-          marker = "// AGENT_RESET_ENDPOINT_V1"
-          if marker not in text:
-              needle = "app.post('/api/agent/memory/prune', async (req,res)=>{"
-              start = text.find(needle)
-              if start < 0:
-                  raise SystemExit('Could not find agent memory prune endpoint')
-              end = text.find("\n});", start)
-              if end < 0:
-                  raise SystemExit('Could not find end of agent memory prune endpoint')
-              end += len("\n});")
-              block = '''\n\n// AGENT_RESET_ENDPOINT_V1\napp.post('/api/agent/memory/reset', async (req,res)=>{\n  try {\n    const confirmation = String(req.body?.confirmation || '').trim();\n    if (confirmation !== 'RESET_AGENT_STATE') {\n      return res.status(400).json({ ok:false, error:'Confirmation required: RESET_AGENT_STATE' });\n    }\n    const data = await agentDashboard.resetAgentState({\n      storylineId:req.body?.storyline_id||null,\n      episodeId:req.body?.episode_id||null,\n      includeEvents:req.body?.include_events !== false,\n      includeLlmCalls:req.body?.include_llm_calls !== false,\n    });\n    res.json(data);\n  } catch(err) {\n    console.error('[API /api/agent/memory/reset]', err.message);\n    res.status(500).json({ok:false,error:err.message});\n  }\n});'''
-              text = text[:end] + block + text[end:]
-              index.write_text(text, encoding='utf-8')
+              modal = '''\n<div id="agentResetModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.82);z-index:4000;align-items:center;justify-content:center;padding:18px">\n  <div class="card" style="max-width:520px;width:100%;border-color:rgba(239,68,68,.35)">\n    <div style="display:flex;align-items:center;justify-content:space-between;gap:12px"><h3 style="margin:0;color:var(--text)">🧠 Reset Agent State</h3><button class="refresh-btn" style="margin:0" onclick="closeAgentResetModal()">✕</button></div>\n    <p style="margin-top:12px;color:var(--muted);font-size:12px;line-height:1.6">This resets the agent's resumable runs, agent memory, event telemetry and LLM telemetry. <strong style="color:var(--text)">Production data is not deleted.</strong> Storylines, episodes, scripts, shots, characters and generated media remain intact.</p>\n    <div style="margin-top:12px;padding:10px;border:1px solid rgba(239,68,68,.25);border-radius:7px;background:rgba(239,68,68,.06);color:#fca5a5;font-size:11px">The agent will reassess the current studio state from scratch after the reset.</div>\n    <input id="agentResetConfirmation" class="sheet-input" placeholder="Type RESET_AGENT_STATE" autocomplete="off" style="width:100%;margin-top:14px">\n    <div id="agentResetResult" style="margin-top:10px;font-size:12px;display:none"></div>\n    <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:14px">\n      <button class="refresh-btn" style="margin:0" onclick="closeAgentResetModal()">Cancel</button>\n      <button id="agentResetConfirmBtn" class="memory-btn" style="margin:0" onclick="confirmAgentReset()">Reset Agent State</button>\n    </div>\n  </div>\n</div>\n'''
+              close = s.rfind('</body>')
+              if close < 0:
+                  raise SystemExit('Dashboard closing body tag not found')
+              s = s[:close] + modal + s[close:]
 
-          dash = Path('views/dashboard.html')
-          text = dash.read_text(encoding='utf-8')
-          ui_marker = 'AGENT_RESET_DASHBOARD_V1'
-          if ui_marker not in text:
-              button_needle = '<button onclick="openPruneModal()"'
-              pos = text.find(button_needle)
-              if pos < 0:
-                  raise SystemExit('Could not find dashboard prune button')
-              line_end = text.find('</div>', pos)
-              if line_end < 0:
-                  raise SystemExit('Could not find dashboard control container')
-              insert = '''\n        <button id="agentResetBtn" onclick="openAgentResetModal()" style="background:rgba(239,68,68,.14);color:#fca5a5;border:1px solid rgba(239,68,68,.35);padding:5px 12px;border-radius:6px;font-size:12px;cursor:pointer;margin-left:6px" title="Reset agent memory, runs and telemetry without deleting production data">🧠 Reset Agent State</button>\n        <span id="AGENT_RESET_DASHBOARD_V1" style="display:none"></span>'''
-              text = text[:line_end] + insert + text[line_end:]
-
-              modal_marker = '<div id="pruneModal"'
-              mpos = text.find(modal_marker)
-              if mpos < 0:
-                  raise SystemExit('Could not find prune modal')
-              # Insert reset modal immediately before the existing prune modal.
-              modal = '''<div id="agentResetModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.82);z-index:2995;align-items:center;justify-content:center;padding:18px">\n  <div class="admin-login-panel" style="max-width:520px;width:100%">\n    <div style="display:flex;align-items:center;justify-content:space-between"><h3>🧠 Reset Agent State</h3><button class="modal-close" style="position:static" onclick="closeAgentResetModal()">✕</button></div>\n    <div style="margin-top:12px;color:var(--muted);font-size:12px;line-height:1.6">This clears the agent's resumable runs, agent memory, event telemetry and LLM telemetry. <strong style="color:var(--text)">Production data is untouched</strong>: storylines, episodes, scripts, shots, characters and generated media remain intact.</div>\n    <div style="margin-top:12px;padding:10px;border:1px solid rgba(239,68,68,.25);border-radius:7px;background:rgba(239,68,68,.06);color:#fca5a5;font-size:11px">This is a hard agent-state reset. The agent will reassess the current studio state from scratch after the next run.</div>\n    <input id="agentResetConfirmation" class="sheet-input" placeholder="Type RESET_AGENT_STATE" autocomplete="off" style="width:100%;margin-top:14px">\n    <div id="agentResetResult" style="margin-top:10px;font-size:12px;display:none"></div>\n    <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:14px">\n      <button class="refresh-btn" onclick="closeAgentResetModal()">Cancel</button>\n      <button id="agentResetConfirmBtn" style="background:linear-gradient(135deg,#b91c1c,#ef4444);color:#fff;border:none;padding:8px 16px;border-radius:7px;font-size:12px;font-weight:700;cursor:pointer" onclick="confirmAgentReset()">Reset Agent State</button>\n    </div>\n  </div>\n</div>\n\n'''
-              text = text[:mpos] + modal + text[mpos:]
-
-              script_needle = "  // ── SSE ────────────────────────────────────────────────────────────────────"
-              spos = text.find(script_needle)
-              if spos < 0:
-                  raise SystemExit('Could not find dashboard main script marker')
-              script = '''  // ── Agent state reset ─────────────────────────────────────────────────────\n  function openAgentResetModal(){\n    const m=document.getElementById('agentResetModal');\n    document.getElementById('agentResetConfirmation').value='';\n    document.getElementById('agentResetResult').style.display='none';\n    document.getElementById('agentResetConfirmBtn').disabled=false;\n    document.getElementById('agentResetConfirmBtn').textContent='Reset Agent State';\n    m.style.display='flex'; document.body.style.overflow='hidden';\n  }\n  function closeAgentResetModal(){\n    const m=document.getElementById('agentResetModal');\n    if(!m) return; m.style.display='none'; document.body.style.overflow='';\n  }\n  async function confirmAgentReset(){\n    const confirmation=document.getElementById('agentResetConfirmation').value.trim();\n    const result=document.getElementById('agentResetResult');\n    const btn=document.getElementById('agentResetConfirmBtn');\n    if(confirmation!=='RESET_AGENT_STATE'){\n      result.style.cssText='margin-top:10px;font-size:12px;display:block;color:#f87171';\n      result.textContent='✗ Type RESET_AGENT_STATE exactly to confirm';\n      return;\n    }\n    btn.disabled=true; btn.textContent='Resetting…'; result.style.display='none';\n    try{\n      const r=await fetch('/api/agent/memory/reset',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirmation,include_events:true,include_llm_calls:true})});\n      const d=await r.json();\n      if(!r.ok||!d.ok) throw new Error(d.error||'Agent reset failed');\n      const x=d.deleted||{};\n      result.style.cssText='margin-top:10px;font-size:12px;display:block;color:#4ade80';\n      result.textContent=`✓ Reset complete — ${x.runs||0} runs, ${x.memory||0} memories, ${x.events||0} events, ${x.llmCalls||0} LLM records removed. Production data untouched.`;\n      btn.textContent='Done';\n      document.getElementById('agentResetConfirmation').value='';\n      setTimeout(()=>{closeAgentResetModal(); if(typeof loadAgentObservability==='function') loadAgentObservability();},1800);\n    }catch(e){\n      result.style.cssText='margin-top:10px;font-size:12px;display:block;color:#f87171';\n      result.textContent='✗ '+e.message; btn.disabled=false; btn.textContent='Reset Agent State';\n    }\n  }\n\n'''
-              text = text[:spos] + script + text[spos:]
-              dash.write_text(text, encoding='utf-8')
-
-          print('Patch complete')
-
+              js = '''\n<script>\n(function(){\n  window.openAgentResetModal=function(){\n    const m=document.getElementById('agentResetModal');\n    if(!m)return;\n    document.getElementById('agentResetConfirmation').value='';\n    document.getElementById('agentResetResult').style.display='none';\n    const b=document.getElementById('agentResetConfirmBtn'); b.disabled=false; b.textContent='Reset Agent State';\n    m.style.display='flex'; document.body.style.overflow='hidden';\n  };\n  window.closeAgentResetModal=function(){\n    const m=document.getElementById('agentResetModal');\n    if(m)m.style.display='none'; document.body.style.overflow='';\n  };\n  window.confirmAgentReset=async function(){\n    const confirmation=document.getElementById('agentResetConfirmation').value.trim();\n    const result=document.getElementById('agentResetResult');\n    const btn=document.getElementById('agentResetConfirmBtn');\n    if(confirmation!=='RESET_AGENT_STATE'){\n      result.style.cssText='margin-top:10px;font-size:12px;display:block;color:#f87171';\n      result.textContent='✗ Type RESET_AGENT_STATE exactly to confirm'; return;\n    }\n    btn.disabled=true; btn.textContent='Resetting…';\n    try{\n      const r=await fetch('/api/agent/memory/reset',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirmation,include_events:true,include_llm_calls:true})});\n      const d=await r.json();\n      if(!r.ok||!d.ok)throw new Error(d.error||'Agent reset failed');\n      const x=d.deleted||{};\n      result.style.cssText='margin-top:10px;font-size:12px;display:block;color:#4ade80';\n      result.textContent='✓ Reset complete — '+(x.runs||0)+' runs, '+(x.memory||0)+' memories, '+(x.events||0)+' events, '+(x.llmCalls||0)+' LLM records removed. Production data untouched.';\n      btn.textContent='Done';\n      setTimeout(()=>{closeAgentResetModal(); location.reload();},1500);\n    }catch(e){\n      result.style.cssText='margin-top:10px;font-size:12px;display:block;color:#f87171';\n      result.textContent='✗ '+e.message; btn.disabled=false; btn.textContent='Reset Agent State';\n    }\n  };\n})();\n</script>\n'''
+              s = s[:close] + js + s[close:]
+              p.write_text(s, encoding='utf-8')
+              print('Reset UI patched')
       - name: Validate
         run: |
           node --check index.js
@@ -76,20 +47,15 @@ jobs:
           python - <<'PY'
           from pathlib import Path
           s=Path('views/dashboard.html').read_text(encoding='utf-8')
-          assert 'Reset Agent State' in s
-          assert '/api/agent/memory/reset' in s
-          assert 'RESET_AGENT_STATE' in s
-          print('Dashboard reset UI verified')
+          for x in ('AGENT_RESET_DASHBOARD_V2','Reset Agent State','openAgentResetModal','/api/agent/memory/reset','RESET_AGENT_STATE'):
+              assert x in s, x
+          print('Agent reset dashboard UI verified')
           PY
-
-      - name: Commit patch
+      - name: Commit
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add index.js views/dashboard.html .github/workflows/expose-agent-reset.yml
-          if git diff --cached --quiet; then
-            echo "No changes needed"
-            exit 0
-          fi
+          git add views/dashboard.html .github/workflows/expose-agent-reset.yml
+          if git diff --cached --quiet; then exit 0; fi
           git commit -m "Expose agent reset control in dashboard [agent-reset-ui]"
           git push origin HEAD:main
