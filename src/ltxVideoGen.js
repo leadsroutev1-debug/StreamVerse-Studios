@@ -1,54 +1,16 @@
 'use strict';
 
 /**
- * ============================================================================
- * StreamVerse Studio — LTX-2.3 Image-to-Video Integration
- * ============================================================================
+ * StreamVerse Studio — LTX-2.3 Image-to-Video control-plane integration.
  *
- * Backend:
- *   Lightricks/LTX-2-3 Hugging Face Space, executed by the Python Video
- *   Engine (video_engine/) via gradio_client — NOT reimplemented here.
- *
- * Architecture:
- *
- *   Character References
- *          ↓
- *   Cloudflare Image Worker
- *          ↓
- *   FINAL MULTI-CHARACTER SCENE IMAGE
- *          ↓
- *   THIS MODULE (Node control plane)
- *          ↓
- *   services/videoEngineClient.js
- *          ↓
- *   Python Video Engine (internal HTTP API, separate port)
- *          ↓
- *   gradio_client → LTX-2.3 Space
- *          ↓
- *   Generated MP4
- *          ↓
- *   Existing StreamVerse pipeline
- *
- * IMPORTANT:
- *
- * This module NEVER sends individual character reference images to LTX.
- * Character references are used upstream by the Cloudflare image-generation
- * stage to construct the final multi-character scene. LTX receives ONLY the
- * final composed scene image.
- *
- * This module preserves the PUBLIC INTERFACE of the previous manual-Gradio
- * implementation (submitVideoJob / pollVideoJob / error classes) so nothing
- * downstream (pipeline.js, index.js) needs to change. Only the internals —
- * how the video is actually generated — moved to Python.
- * ============================================================================
+ * The final scene image is generated upstream, then LTX-2.3 receives that
+ * image as the first-frame condition plus a motion/performance prompt.
+ * Character references are never sent directly to LTX; identity is already
+ * resolved in the scene image stage.
  */
 
 const config = require('./config');
 const videoEngineClient = require('../services/videoEngineClient');
-
-// ============================================================================
-// TYPED ERRORS (unchanged — downstream code detects these by name/flag)
-// ============================================================================
 
 class LTXQuotaExhaustedError extends Error {
   constructor(message) {
@@ -67,10 +29,6 @@ class LTXGenerationError extends Error {
   }
 }
 
-/**
- * A temporary problem talking to the Python video engine (not the same as
- * the remote LTX generation failing). The caller should keep polling.
- */
 class LTXTransientPollError extends Error {
   constructor(message) {
     super(message);
@@ -78,10 +36,6 @@ class LTXTransientPollError extends Error {
     Error.captureStackTrace?.(this, LTXTransientPollError);
   }
 }
-
-// ============================================================================
-// CONFIG-DERIVED DEFAULTS
-// ============================================================================
 
 const DEFAULT_MIN_DURATION = 1;
 const DEFAULT_MAX_DURATION = 10;
@@ -94,20 +48,26 @@ function _getPositiveNumber(value, fallback) {
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
+function _snapDimension(value, fallback) {
+  const n = Math.floor(_getPositiveNumber(value, fallback));
+  // LTX requires width/height to be divisible by 32. Never silently send an
+  // invalid geometry to the Space.
+  const snapped = Math.floor(n / 32) * 32;
+  return Math.max(32, snapped || fallback);
+}
+
 function _resolveResolution(shotMeta = {}) {
-  const configuredWidth = _getPositiveNumber(config.ltxWidth, HIGH_RES_WIDTH);
-  const configuredHeight = _getPositiveNumber(config.ltxHeight, HIGH_RES_HEIGHT);
+  const configuredWidth = _snapDimension(config.ltxWidth, HIGH_RES_WIDTH);
+  const configuredHeight = _snapDimension(config.ltxHeight, HIGH_RES_HEIGHT);
   return {
-    width: Math.floor(_getPositiveNumber(shotMeta.width, configuredWidth)),
-    height: Math.floor(_getPositiveNumber(shotMeta.height, configuredHeight)),
+    width: _snapDimension(shotMeta.width, configuredWidth),
+    height: _snapDimension(shotMeta.height, configuredHeight),
   };
 }
 
 function _resolveSeed(shotMeta = {}) {
   const suppliedSeed = Number(shotMeta.seed);
-  if (Number.isFinite(suppliedSeed) && suppliedSeed >= 0) {
-    return Math.min(MAX_SEED, Math.floor(suppliedSeed));
-  }
+  if (Number.isFinite(suppliedSeed) && suppliedSeed >= 0) return Math.min(MAX_SEED, Math.floor(suppliedSeed));
   return Math.floor(Math.random() * MAX_SEED);
 }
 
@@ -119,38 +79,34 @@ function _resolveDuration(shotMeta = {}) {
   return Math.min(maxDuration, Math.max(minDuration, duration));
 }
 
-// ============================================================================
-// SUBMIT VIDEO JOB
-// ============================================================================
-
 /**
- * Submit an image-to-video job. Returns immediately once the Python video
- * engine has queued it — this call does NOT block for the full generation.
- *
- * @returns {{ jobId: string, apiKey: string }} apiKey is retained for
- *   interface compatibility with the previous implementation and callers
- *   that pass it straight through to pollVideoJob(); token management now
- *   lives entirely in the Python engine, so this is just an opaque marker.
+ * LTX-2.3's official guidance favors one flowing, present-tense prompt with
+ * explicit motion, camera, performance and audio beats. I2V already receives
+ * the visual starting state, so this function removes accidental formatting
+ * noise without rewriting the director's words or dialogue.
  */
+function _normalizeI2VPrompt(rawPrompt) {
+  return String(rawPrompt || '')
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 async function submitVideoJob(imageBuffer, shotMeta = {}) {
   if (!Buffer.isBuffer(imageBuffer) || imageBuffer.length === 0) {
     throw new LTXGenerationError('[LTXVideoGen] submitVideoJob received an empty image buffer.');
   }
 
-  const prompt = typeof shotMeta.videoPrompt === 'string' ? shotMeta.videoPrompt.trim() : '';
-  if (!prompt) {
-    throw new LTXGenerationError('[LTXVideoGen] submitVideoJob called with no videoPrompt.');
-  }
+  const prompt = _normalizeI2VPrompt(shotMeta.videoPrompt);
+  if (!prompt) throw new LTXGenerationError('[LTXVideoGen] submitVideoJob called with no videoPrompt.');
 
   const duration = _resolveDuration(shotMeta);
   const { width, height } = _resolveResolution(shotMeta);
   const seed = _resolveSeed(shotMeta);
   const randomizeSeed = Boolean(config.ltxRandomizeSeed);
-  // The StreamVerse script writer now produces a deliberately structured,
-  // spatially locked LTX prompt. When lockPrompt is set, bypass LTX's generic
-  // prompt enhancer so it cannot paraphrase away character geography, speaker
-  // mapping, or the audio/text boundary.
   const enhancePrompt = Boolean(config.ltxEnhancePrompt) && !Boolean(shotMeta.lockPrompt);
+
+  console.log(`[LTXVideoGen] I2V submit duration=${duration}s resolution=${width}x${height} seed=${seed} randomize=${randomizeSeed} enhance=${enhancePrompt}`);
 
   try {
     const { jobId } = await videoEngineClient.submitJob({
@@ -167,28 +123,11 @@ async function submitVideoJob(imageBuffer, shotMeta = {}) {
     return { jobId, apiKey: 'video-engine-managed' };
   } catch (err) {
     const status = err.response?.status;
-    if (status === 401) {
-      throw new LTXGenerationError(`[LTXVideoGen] Video engine rejected the internal request (401): ${err.message}`);
-    }
+    if (status === 401) throw new LTXGenerationError(`[LTXVideoGen] Video engine rejected the internal request (401): ${err.message}`);
     throw new LTXGenerationError(`[LTXVideoGen] Failed to submit job to video engine: ${err.message}`);
   }
 }
 
-// ============================================================================
-// POLL VIDEO JOB
-// ============================================================================
-
-/**
- * Poll the Python video engine until the job completes. The engine already
- * uploads the finished clip to Cloudinary itself (see
- * video_engine/cloudinary_client.py) and returns its secure_url directly —
- * this function just waits for that and hands it back. No local disk is
- * ever touched by either process; the caller (pipeline.js) is the one that
- * moves this tmp Cloudinary asset to its final permanent public_id.
- *
- * apiKey is accepted for interface compatibility but unused — see
- * submitVideoJob() above.
- */
 async function pollVideoJob(jobId, _apiKey) {
   const intervalMs = _getPositiveNumber(config.ltxPollIntervalMs, 15000);
   const maxAttempts = _getPositiveNumber(config.ltxMaxPollAttempts, 80);
@@ -197,29 +136,14 @@ async function pollVideoJob(jobId, _apiKey) {
   try {
     job = await videoEngineClient.pollJob(jobId, { intervalMs, maxAttempts });
   } catch (err) {
-    if (err.category === 'quota') {
-      throw new LTXQuotaExhaustedError(err.message);
-    }
-    if (err.message?.includes('did not complete after')) {
-      throw new LTXTransientPollError(err.message);
-    }
+    if (err.category === 'quota') throw new LTXQuotaExhaustedError(err.message);
+    if (err.message?.includes('did not complete after')) throw new LTXTransientPollError(err.message);
     throw new LTXGenerationError(err.message);
   }
 
-  if (!job.video_url) {
-    throw new LTXGenerationError(`[LTXVideoGen] Job ${jobId} completed with no video_url.`);
-  }
-
+  if (!job.video_url) throw new LTXGenerationError(`[LTXVideoGen] Job ${jobId} completed with no video_url.`);
   return job.video_url;
 }
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-// ============================================================================
-// MODULE EXPORTS
-// ============================================================================
 
 module.exports = {
   submitVideoJob,
