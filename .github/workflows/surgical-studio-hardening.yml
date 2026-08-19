@@ -1,0 +1,126 @@
+name: Surgical Studio Hardening
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'src/agentOrchestrator.js'
+      - 'src/agentProductionTools.js'
+      - 'src/db.js'
+      - '.github/workflows/surgical-studio-hardening.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  harden:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply deterministic production-state hardening
+        shell: python
+        run: |
+          from pathlib import Path
+          import re
+
+          def patch(path, replacements):
+              p = Path(path)
+              s = p.read_text(encoding='utf-8')
+              original = s
+              for name, old, new in replacements:
+                  if old not in s:
+                      raise SystemExit(f'PATCH FAILED: {path}: missing anchor {name}')
+                  s = s.replace(old, new, 1)
+              p.write_text(s, encoding='utf-8')
+              print(f'patched {path}: {len(original)} -> {len(s)} bytes')
+
+          # 1) The generic DB mutation tool must never be able to forge a
+          # production status. Status transitions belong to validated tools.
+          patch('src/agentOrchestrator.js', [
+            (
+              'forbid-agent-status-mutation',
+              """      const w = Object.entries(where||{});\n      const u = Object.entries(updates||{});\n      if (!w.length || !u.length) throw new Error('db_update_fields requires non-empty where and updates');\n""",
+              """      const w = Object.entries(where||{});\n      const u = Object.entries(updates||{});\n      if (!w.length || !u.length) throw new Error('db_update_fields requires non-empty where and updates');\n      // Production state is a guarded invariant. The LLM may inspect DB state,\n      // but it may not manufacture an episode/shot/storyline status by writing\n      // the status column directly. Validated production tools own transitions.\n      if (['episodes','shots','storylines'].includes(table) && u.some(([c]) => c === 'status')) {\n        throw Object.assign(new Error(`Direct status mutation is forbidden for ${table}; use the validated production tool for the owning transition.`), { code:'AGENT_STATUS_MUTATION_FORBIDDEN' });\n      }\n"""
+            ),
+            (
+              'checkpoint-not-diagnostic',
+              "const diagnosticTools = new Set(['production_state','classify_error','trace_root_cause','diagnose_provider_failure','validate_all_invariants','find_stuck_work','find_invalid_transitions','find_orphaned_work','find_skipped_work','find_out_of_order_work','detect_retry_loop','detect_timeout_loop','detect_rate_limit_loop','detect_provider_degradation','build_recovery_plan','checkpoint_production']);",
+              "const diagnosticTools = new Set(['production_state','classify_error','trace_root_cause','diagnose_provider_failure','validate_all_invariants','find_stuck_work','find_invalid_transitions','find_orphaned_work','find_skipped_work','find_out_of_order_work','detect_retry_loop','detect_timeout_loop','detect_rate_limit_loop','detect_provider_degradation','build_recovery_plan']);"
+            )
+          ])
+
+          # 2) Scene simulation only becomes a durable milestone after its
+          # completion invariant is true. The previous agent was able to write
+          # scenes_simulated directly after receiving a pending result.
+          patch('src/agentProductionTools.js', [
+            (
+              'scene-simulation-verified-status',
+              """  const complete = current?.simulation_status === 'complete' && scenePlan.length >= expected;\n  if (!complete) {\n    return {ok:false,pending:true,reason:'Episode scene simulation is not complete',simulation:current,expected_scene_count:expected,actual_scene_count:scenePlan.length};\n  }\n  return {ok:true,simulation:current};\n""",
+              """  const complete = current?.simulation_status === 'complete' && scenePlan.length >= expected;\n  if (!complete) {\n    return {ok:false,pending:true,reason:'Episode scene simulation is not complete',simulation:current,expected_scene_count:expected,actual_scene_count:scenePlan.length};\n  }\n  // Only the verified tool may promote the durable episode milestone.\n  await db.execute(`UPDATE episodes SET status='scenes_simulated', scene_count=?, updated_at=NOW() WHERE id=?`, [scenePlan.length, episode.id]);\n  return {ok:true,simulation:current,scene_count:scenePlan.length,status:'scenes_simulated'};\n"""
+            ),
+            (
+              'prepare-shots-invariant',
+              """  const script = json(episode.script, {});\n  const shots = flattenShots(script);\n  for (const shot of shots) {\n""",
+              """  const script = json(episode.script, {});\n  const shots = flattenShots(script);\n  const simulatedShots = Array.isArray(script.shot_simulation?.shots) ? script.shot_simulation.shots : [];\n  const expectedShots = simulatedShots.length;\n  if (!expectedShots) {\n    return {ok:false,pending:true,reason:'Shot simulation is empty; prepare_shot_rows cannot manufacture production work',expected_shots:0,shots:0};\n  }\n  if (shots.length !== expectedShots) {\n    return {ok:false,pending:true,reason:`Shot materialization mismatch: ${shots.length}/${expectedShots}`,expected_shots:expectedShots,shots:shots.length};\n  }\n  for (const shot of shots) {\n"""
+            ),
+            (
+              'prepare-shots-success-status',
+              """  await db.execute(`UPDATE episodes SET shot_count=? WHERE id=?`,[shots.length,episode_id]);\n  return {ok:true,shots:shots.length};\n""",
+              """  await db.execute(`UPDATE episodes SET shot_count=?, status='shots_ready', updated_at=NOW() WHERE id=?`,[shots.length,episode_id]);\n  const persisted = await db.queryOne(`SELECT COUNT(*) AS count FROM shots WHERE episode_id=?`, [episode_id]);\n  const persistedCount = Number(persisted?.count || 0);\n  if (persistedCount !== shots.length) {\n    return {ok:false,pending:true,reason:`Shot persistence verification failed: ${persistedCount}/${shots.length}`,expected_shots:shots.length,persisted_shots:persistedCount};\n  }\n  return {ok:true,shots:shots.length,persisted_shots:persistedCount,status:'shots_ready'};\n"""
+            ),
+            (
+              'write-script-status',
+              """  return {ok:true,script:payload,scene_count:payload.scenes?.length||0,shot_count:payload.shot_simulation?.shots?.length||0};\n""",
+              """  const sceneCount = payload.scenes?.length || 0;\n  const shotCount = payload.shot_simulation?.shots?.length || 0;\n  if (!sceneCount || !shotCount) throw new Error(`Script/shot simulation incomplete: scenes=${sceneCount}, shots=${shotCount}`);\n  await db.execute(`UPDATE episodes SET status='script_ready', scene_count=?, shot_count=?, updated_at=NOW() WHERE id=?`, [sceneCount, shotCount, episode.id]);\n  return {ok:true,script:payload,scene_count:sceneCount,shot_count:shotCount,status:'script_ready'};\n"""
+            )
+          ])
+
+          # 3) Schema bootstrap currently swallows migration failures. That is
+          # dangerous: the app can report "schema ready" while a live table is
+          # missing a required column. Make critical legacy-column repair fail
+          # startup instead of leaving a latent mismatch.
+          p = Path('src/db.js')
+          s = p.read_text(encoding='utf-8')
+          old = """    if (!exists) {\n      try { await execute(ddl); console.log(`[DB] Added column ${table}.${col}`); }\n      catch (e) { console.warn(`[DB] Could not add ${table}.${col}:`, e.message); }\n    }\n"""
+          new = """    if (!exists) {\n      try { await execute(ddl); console.log(`[DB] Added column ${table}.${col}`); }\n      catch (e) {\n        // A schema mismatch is not recoverable by continuing with an old table.\n        // Fail bootstrap loudly so Render restarts the service instead of\n        // allowing the agent to operate against a partially migrated schema.\n        console.error(`[DB] CRITICAL schema migration failed for ${table}.${col}:`, e.message);\n        throw Object.assign(new Error(`Required schema migration failed for ${table}.${col}: ${e.message}`), { code:'DB_SCHEMA_MIGRATION_FAILED', cause:e });\n      }\n    }\n"""
+          if old not in s:
+              raise SystemExit('PATCH FAILED: db.js migration error handling anchor missing')
+          s = s.replace(old, new, 1)
+          p.write_text(s, encoding='utf-8')
+
+          # 4) Verify the repository has the exact runtime contracts we just
+          # hardened. These are static guards for the action itself.
+          checks = {
+            'src/agentOrchestrator.js': [
+              'AGENT_STATUS_MUTATION_FORBIDDEN',
+              'checkpoint_production']);
+            ],
+          }
+          assert "AGENT_STATUS_MUTATION_FORBIDDEN" in Path('src/agentOrchestrator.js').read_text(encoding='utf-8')
+          assert "status='scenes_simulated'" in Path('src/agentProductionTools.js').read_text(encoding='utf-8')
+          assert "status='shots_ready'" in Path('src/agentProductionTools.js').read_text(encoding='utf-8')
+          assert "DB_SCHEMA_MIGRATION_FAILED" in Path('src/db.js').read_text(encoding='utf-8')
+          print('Surgical hardening checks passed.')
+
+      - name: Syntax check
+        run: |
+          node --check src/agentOrchestrator.js
+          node --check src/agentProductionTools.js
+          node --check src/db.js
+
+      - name: Commit hardening changes
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/agentOrchestrator.js src/agentProductionTools.js src/db.js
+          if git diff --cached --quiet; then
+            echo 'No hardening changes required.'
+            exit 0
+          fi
+          git commit -m 'Surgically harden production state and schema invariants [skip ci]'
+          git push origin HEAD:main
