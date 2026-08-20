@@ -36,18 +36,26 @@
  * stage to construct the final multi-character scene. LTX receives ONLY the
  * final composed scene image.
  *
- * This module preserves the PUBLIC INTERFACE of the previous manual-Gradio
- * implementation (submitVideoJob / pollVideoJob / error classes) so nothing
- * downstream (pipeline.js, index.js) needs to change. Only the internals —
- * how the video is actually generated — moved to Python.
+ * LTX-2.3 prompt contract:
+ *   - image-to-video: treat the supplied image as the authoritative first frame;
+ *   - describe observable changes rather than rebuilding the still frame;
+ *   - use one continuous chronological paragraph;
+ *   - include concrete action, environment, camera, lighting, and synchronized
+ *     sound when present;
+ *   - keep the prompt below 200 words;
+ *   - do not send production-control labels or spatial-map instructions to LTX.
+ *
+ * The public interface is preserved (submitVideoJob / pollVideoJob / error
+ * classes) so downstream callers do not need provider-specific changes.
  * ============================================================================
  */
 
 const config = require('./config');
 const videoEngineClient = require('../services/videoEngineClient');
+const ltxPromptEngine = require('./ltxPromptEngine');
 
 // ============================================================================
-// TYPED ERRORS (unchanged — downstream code detects these by name/flag)
+// TYPED ERRORS
 // ============================================================================
 
 class LTXQuotaExhaustedError extends Error {
@@ -137,20 +145,37 @@ async function submitVideoJob(imageBuffer, shotMeta = {}) {
     throw new LTXGenerationError('[LTXVideoGen] submitVideoJob received an empty image buffer.');
   }
 
-  const prompt = typeof shotMeta.videoPrompt === 'string' ? shotMeta.videoPrompt.trim() : '';
-  if (!prompt) {
+  const rawPrompt = typeof shotMeta.videoPrompt === 'string' ? shotMeta.videoPrompt.trim() : '';
+  if (!rawPrompt) {
     throw new LTXGenerationError('[LTXVideoGen] submitVideoJob called with no videoPrompt.');
+  }
+
+  let prompt;
+  try {
+    // Final source-level contract enforcement. We intentionally reject an
+    // overlong prompt rather than truncating it, because truncation can remove
+    // the shot's terminal state and break causal continuity into the next shot.
+    prompt = ltxPromptEngine.prepareImageToVideoPrompt(rawPrompt);
+  } catch (err) {
+    throw new LTXGenerationError(`[LTXVideoGen] Invalid LTX image-to-video prompt: ${err.message}`);
+  }
+
+  const validation = ltxPromptEngine.validateImageToVideoPrompt(prompt);
+  if (!validation.valid) {
+    throw new LTXGenerationError(
+      `[LTXVideoGen] LTX prompt contract violation: ${validation.violations.join(', ')}`
+    );
   }
 
   const duration = _resolveDuration(shotMeta);
   const { width, height } = _resolveResolution(shotMeta);
   const seed = _resolveSeed(shotMeta);
   const randomizeSeed = Boolean(config.ltxRandomizeSeed);
-  // The StreamVerse script writer now produces a deliberately structured,
-  // spatially locked LTX prompt. When lockPrompt is set, bypass LTX's generic
-  // prompt enhancer so it cannot paraphrase away character geography, speaker
-  // mapping, or the audio/text boundary.
-  const enhancePrompt = Boolean(config.ltxEnhancePrompt) && !Boolean(shotMeta.lockPrompt);
+  // Prompt enhancement is intentionally disabled for the authored deterministic
+  // LTX shot contract. The source prompt already contains chronological action,
+  // camera, environment, lighting and synchronized sound; a second enhancer
+  // could paraphrase away exact continuity or speaker geography.
+  const enhancePrompt = false;
 
   try {
     const { jobId } = await videoEngineClient.submitJob({
@@ -216,10 +241,6 @@ async function pollVideoJob(jobId, _apiKey) {
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
-
-// ============================================================================
-// MODULE EXPORTS
-// ============================================================================
 
 module.exports = {
   submitVideoJob,
