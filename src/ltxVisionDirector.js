@@ -49,10 +49,7 @@ async function describeForLTX({ imageBuffer, imageMime = 'image/png', shot = {},
 
   const characterHints = (characters || [])
     .filter(c => intent.characters_in_shot.some(name => String(name).toLowerCase() === String(c.name || '').toLowerCase()))
-    .map(c => ({
-      name: c.name,
-      visual_anchor: c.visual_anchor || c.description || '',
-    }));
+    .map(c => ({ name: c.name, visual_anchor: c.visual_anchor || c.description || '' }));
 
   const system = [
     'You are the visual director for a feature-film-quality LTX-2.3 image-to-video shot.',
@@ -60,14 +57,14 @@ async function describeForLTX({ imageBuffer, imageMime = 'image/png', shot = {},
     'Use the authored shot intent as the narrative target. The intent is authoritative for what must happen; the image is authoritative for who and what is visibly present and where they are positioned.',
     'Treat every named character as a distinct identity. State who is visible, their exact screen position, depth, orientation, eyeline, posture, wardrobe, expression, and relationship to the other characters before describing movement.',
     'Write one rich, continuous, chronological, ultra-cinematic description in real time. Do not summarize. Describe the shot unfolding second by second: opening state, first action, response, escalation, camera behavior, environmental evolution, lighting changes, and ending state.',
-    'THIS IS A CONVERSATIONAL MOVIE. When dialogue, conversation_reason, dialogue intent, quoted speech, or a speaking action is provided in the shot intent, speech is mandatory and must be explicitly written into the final LTX description.',
-    'Never replace supplied dialogue with phrases such as "they speak", "she talks", "he responds", "their voices overlap", or "the conversation continues". Name the speaker and write the actual spoken line in quotation marks.',
-    'Preserve every supplied exact dialogue line verbatim. You may add short natural connective lines or a responsive line from another visible character when the intent clearly establishes a conversation, but do not change the meaning, speaker, or story facts supplied by the shot.',
-    'For conversational shots, describe turn-taking clearly: identify who speaks first, where that speaker is in frame, how they deliver the line, how the other character reacts, and who speaks next. If one character remains silent, explicitly describe that silence and reaction.',
-    'Use dialogue as part of the physical action: describe facial reactions, breathing, gestures, gaze shifts, pauses, interruptions, and the way the words affect the other character in real time.',
+    'THIS IS A CONVERSATIONAL MOVIE. Dialogue is a first-class visual event. Whenever dialogue, conversation_reason, quoted speech, or speaking intent is present, the final prompt MUST contain actual spoken words, not a summary of speech.',
+    'Never replace dialogue with "they speak", "she talks", "he responds", "their voices overlap", "the conversation continues", "he says something", or similar abstractions. Every audible line must identify the speaker by name or unmistakable role and include the literal spoken words in quotation marks.',
+    'Preserve every supplied exact dialogue line verbatim. If a conversational intent is supplied without exact words, creatively write a short, natural, context-appropriate exchange that advances only the supplied beat and does not invent new plot facts.',
+    'For each conversational turn, explicitly describe speaker position, delivery, exact words, listener reaction, pause or interruption, and the next speaker. Make the turn-taking chronological and physically grounded in the frame.',
+    'Use dialogue as physical action: facial reactions, breathing, gestures, eyeline changes, posture shifts, pauses, interruptions and emotional responses must occur around the words in real time.',
     'Include camera movement, environmental evolution, lighting changes, ambience, music or sound effects when supported by the intent, but never let them replace the human dramatic action or dialogue.',
-    'Be creatively descriptive and cinematic while staying faithful to the supplied image and intent. Expand sparse intent into a vivid scene rather than compressing it into a short summary.',
-    'Do not invent characters, props, locations, or story events unrelated to the supplied image or shot intent. Creative expansion should clarify performance, timing, physical reactions, and cinematic movement, not rewrite the narrative.',
+    'Be creatively descriptive and cinematic while staying faithful to the supplied image and intent. Expand sparse intent into a vivid scene rather than compressing it into a summary.',
+    'Do not invent characters, props, locations, or consequential story events unrelated to the supplied image or shot intent. Creative expansion should clarify performance, timing and cinematic movement.',
     'Do not output analysis, labels, shot contracts, spatial maps, metadata, prompt instructions, negative prompts or implementation language.',
     'Return JSON with exactly one field named ltx_shot_description containing the complete final LTX prompt.',
   ].join(' ');
@@ -76,17 +73,13 @@ async function describeForLTX({ imageBuffer, imageMime = 'image/png', shot = {},
     'AUTHORITATIVE SHOT INTENT:',
     JSON.stringify(intent),
     'SCENE CONTEXT:',
-    JSON.stringify({
-      location: scene.location || '',
-      lighting_design: scene.lighting_design || '',
-      emotional_beat: scene.emotional_beat || '',
-    }),
+    JSON.stringify({ location: scene.location || '', lighting_design: scene.lighting_design || '', emotional_beat: scene.emotional_beat || '' }),
     'LOCKED CHARACTER HINTS:',
     JSON.stringify(characterHints),
     'DIALOGUE REQUIREMENT:',
     intent.dialogue || intent.conversation_reason
-      ? 'This shot must contain audible conversational performance. Preserve supplied lines exactly, identify every speaker, and write each spoken line into the final prompt in chronological turn order.'
-      : 'If no dialogue is supplied, keep the scene visually expressive and do not invent consequential story dialogue.',
+      ? 'This is a conversational shot. Audible speech is mandatory. Preserve supplied lines exactly when present; otherwise create a concise, natural exchange from the supplied beat. Identify every speaker, exact spoken words, delivery, listener reaction, and turn order.'
+      : 'No dialogue intent is supplied. Keep the shot visually expressive and do not invent consequential story dialogue.',
     'Inspect the attached final still and author the complete cinematic LTX image-to-video description.',
   ].join('\n');
 
@@ -111,10 +104,7 @@ async function describeForLTX({ imageBuffer, imageMime = 'image/png', shot = {},
           temperature: 0.55,
           response_format: { type: 'json_object' },
         },
-        {
-          headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
-          timeout: 180000,
-        }
+        { headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' }, timeout: 180000 }
       );
 
       const raw = response?.data?.choices?.[0]?.message?.content;
@@ -123,12 +113,13 @@ async function describeForLTX({ imageBuffer, imageMime = 'image/png', shot = {},
       if (!description) throw new Error('[LTXVision] Vision model returned an empty LTX description');
 
       const wordCount = description.split(/\s+/).filter(Boolean).length;
-      const hasSpeech = /\"[^\"]+\"/.test(description) || /“[^”]+”/.test(description);
-      if ((intent.dialogue || intent.conversation_reason) && (!hasSpeech || wordCount < 40)) {
+      const hasSpeech = /"[^"]+"/.test(description) || /“[^”]+”/.test(description);
+      const conversational = Boolean(intent.dialogue || intent.conversation_reason);
+      if (conversational && (!hasSpeech || wordCount < 40)) {
         throw new Error(`[LTXVision] Conversational shot description is under-specified (words=${wordCount}, hasQuotedSpeech=${hasSpeech})`);
       }
 
-      console.log(`[LTXVision] completed words=${wordCount} quotedSpeech=${hasSpeech} conversation=${Boolean(intent.dialogue || intent.conversation_reason)}`);
+      console.log(`[LTXVision] completed words=${wordCount} quotedSpeech=${hasSpeech} conversation=${conversational}`);
       return description;
     } catch (err) {
       lastError = err;
