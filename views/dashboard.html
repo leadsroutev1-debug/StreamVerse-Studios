@@ -235,6 +235,7 @@
     style="background:transparent;border:1px solid transparent;color:var(--muted);padding:9px 18px;border-radius:8px 8px 0 0;font-size:13px;font-weight:600;cursor:pointer">👥 Users</button>
   <button class="tab-btn" id="tabBtnAnnouncements" onclick="switchTab('announcements')"
     style="background:transparent;border:1px solid transparent;color:var(--muted);padding:9px 18px;border-radius:8px 8px 0 0;font-size:13px;font-weight:600;cursor:pointer">📣 Announcements</button>
+  <button class="tab-btn" id="tabBtnCheckpoints" onclick="switchTab('checkpoints')" style="background:transparent;border:1px solid transparent;color:var(--muted);padding:9px 18px;border-radius:8px 8px 0 0;font-size:13px;font-weight:600;cursor:pointer">🧭 Checkpoints</button>
 </nav>
 
 <main>
@@ -470,6 +471,19 @@
     </div>
   </div>
 
+
+  <div id="tabPanelCheckpoints" style="display:none">
+    <div class="card">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
+        <h3 style="display:inline-block">Production Checkpoints</h3>
+        <button class="refresh-btn" onclick="loadCheckpointEpisodes()">↻ Refresh</button>
+      </div>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:12px">Select a persisted checkpoint. Rollback removes downstream progress and resumes from the selected stage.</div>
+      <select id="checkpointEpisodeSelect" onchange="loadEpisodeCheckpoints(this.value)" style="width:100%;background:var(--surface);color:var(--text);border:1px solid var(--border);padding:8px;border-radius:6px;margin-bottom:12px"><option value="">Select an episode…</option></select>
+      <div id="checkpointStatus" style="font-size:12px;color:var(--muted);margin-bottom:10px"></div>
+      <div class="table-wrap"><table><thead><tr><th>Stage</th><th>Scene</th><th>Shot</th><th>Status</th><th>Created</th><th></th></tr></thead><tbody id="checkpointBody"><tr><td colspan="6" style="padding:20px;text-align:center;color:var(--muted)">Select an episode.</td></tr></tbody></table></div>
+    </div>
+  </div>
   <div id="tabPanelAnnouncements" style="display:none">
     <div class="sheet-card">
       <div class="sheet-toolbar"><div><h3>Send Announcement</h3><div class="muted-mini">Published messages appear in registered users' account pages.</div></div></div>
@@ -1675,14 +1689,43 @@
     const d=await r.json().catch(()=>({})); if(!r.ok||d.ok===false) throw new Error(d.error||`Request failed (${r.status})`); return d;
   }
 
+
+  async function loadCheckpointEpisodes() {
+    try {
+      const d = await adminFetch('/api/checkpoints/episodes');
+      const s = document.getElementById('checkpointEpisodeSelect');
+      s.innerHTML = '<option value="">Select an episode…</option>' + (d.episodes || []).map(e => `<option value="${esc(e.id)}">${esc(e.show_title)} S${e.season_number}E${e.episode_number} — ${esc(e.status)}</option>`).join('');
+    } catch(e) { document.getElementById('checkpointStatus').textContent = e.message; }
+  }
+
+  async function loadEpisodeCheckpoints(id) {
+    const body = document.getElementById('checkpointBody');
+    if (!id) return;
+    try {
+      const d = await adminFetch('/api/checkpoints?episode_id=' + encodeURIComponent(id));
+      body.innerHTML = (d.checkpoints || []).map(cp => `<tr><td><strong>${esc(cp.stage)}</strong></td><td>${cp.scene_number ?? '—'}</td><td>${cp.shot_index ?? '—'}</td><td>${esc(cp.status)}</td><td>${esc(cp.created_at || '')}</td><td><button class="shot-fail-btn" onclick="rollbackCheckpoint('${cp.id}')">Rollback here</button></td></tr>`).join('') || '<tr><td colspan="6" style="padding:20px;text-align:center">No checkpoints.</td></tr>';
+    } catch(e) { body.innerHTML = `<tr><td colspan="6" style="color:var(--danger);padding:20px">${esc(e.message)}</td></tr>`; }
+  }
+
+  async function rollbackCheckpoint(id) {
+    if (!confirm('Rollback to this checkpoint? Downstream production artifacts will be removed.')) return;
+    try {
+      const d = await adminFetch('/api/checkpoints/rollback', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({checkpoint_id:id})});
+      document.getElementById('checkpointStatus').textContent = 'Rolled back to ' + d.resumed_from_stage;
+      await loadEpisodeCheckpoints(document.getElementById('checkpointEpisodeSelect').value);
+      if (typeof loadDrafts === 'function') loadDrafts();
+      if (typeof loadRenderedShots === 'function') loadRenderedShots();
+    } catch(e) { alert('Rollback failed: ' + e.message); }
+  }
   function switchTab(tab) {
     _activeTab = tab;
-    const panels=['control','episodes','analytics','users','announcements'];
+    const panels=['control','episodes','analytics','users','announcements','checkpoints'];
     for(const name of panels){const panel=document.getElementById(`tabPanel${name[0].toUpperCase()+name.slice(1)}`); if(panel) panel.style.display=name===tab?'':'none';}
     const activeStyle='background:var(--surface);border:1px solid var(--border);border-bottom:none;color:var(--text);padding:9px 18px;border-radius:8px 8px 0 0;font-size:13px;font-weight:600;cursor:pointer';
     const inactiveStyle='background:transparent;border:1px solid transparent;color:var(--muted);padding:9px 18px;border-radius:8px 8px 0 0;font-size:13px;font-weight:600;cursor:pointer';
     for(const name of panels){const btn=document.getElementById(`tabBtn${name[0].toUpperCase()+name.slice(1)}`);if(btn)btn.style.cssText=name===tab?activeStyle:inactiveStyle;}
     if(tab==='episodes') loadEpisodesTab();
+    if(tab==='checkpoints') loadCheckpointEpisodes();
     if(['analytics','users','announcements'].includes(tab)) requireAdminAccess(()=>{ if(tab==='analytics')loadAnalytics(); if(tab==='users')loadUsers(); if(tab==='announcements')loadAnnouncements(); });
   }
 

@@ -24,6 +24,7 @@ const videoEngineClient = require('./services/videoEngineClient');
 const { safeJsonParse } = require('./src/util');
 const analytics = require('./src/analytics');
 const { searchCatalog } = require('./src/search');
+const pipelineIntegrity = require('./src/pipelineIntegrity');
 
 const app = express();
 app.use(express.json());
@@ -215,6 +216,37 @@ app.post('/api/resume', (req, res) => {
 app.post('/api/pause', (req, res) => {
   const result = pipeline.requestPause();
   res.json(result);
+});
+
+app.get('/api/checkpoints/episodes', auth.requireAdmin, async (req, res) => {
+  try {
+    await pipelineIntegrity.ensureSchema();
+    const rows = await db.query(`SELECT e.id,e.storyline_id,e.episode_number,e.season_number,e.status,e.scene_count,e.shot_count,e.updated_at,s.title AS show_title,COUNT(pc.id) AS checkpoint_count FROM episodes e JOIN storylines s ON s.id=e.storyline_id LEFT JOIN production_checkpoints pc ON pc.episode_id=e.id GROUP BY e.id,e.storyline_id,e.episode_number,e.season_number,e.status,e.scene_count,e.shot_count,e.updated_at,s.title ORDER BY e.updated_at DESC LIMIT 100`);
+    res.json({ok:true,episodes:rows});
+  } catch(e) { res.status(500).json({ok:false,error:e.message,episodes:[]}); }
+});
+
+app.get('/api/checkpoints', auth.requireAdmin, async (req, res) => {
+  try {
+    await pipelineIntegrity.ensureSchema();
+    const id=String(req.query.episode_id||'').trim();
+    if(!id) return res.status(400).json({ok:false,error:'episode_id is required'});
+    const existing=await db.queryOne('SELECT COUNT(*) AS n FROM production_checkpoints WHERE episode_id=?',[id]);
+    if(!Number(existing?.n||0)) {
+      const ep=await db.queryOne('SELECT id,episode_number,season_number,status,script,scene_count,shot_count,ready_at FROM episodes WHERE id=?',[id]);
+      if(!ep) return res.status(404).json({ok:false,error:'Episode not found'});
+      const script=safeJsonParse(ep.script,{});
+      const sceneNumbers=Array.isArray(script.scenes)?script.scenes.map(s=>Number(s.scene_number)).filter(Boolean):[];
+      const items=[['legacy_episode_blueprint','episode_blueprint',null,null], ...sceneNumbers.length?[['legacy_scene_shot_writing','scene_shot_writing',sceneNumbers[sceneNumbers.length-1],null]]:[], ...(ep.shot_count>0?[['legacy_media_generation','media_generation',null,null]]:[]), ...(ep.ready_at?[['legacy_episode_compile','episode_compile',null,null]]:[])];
+      for(const [key,stage,sceneNumber,shotIndex] of items) await pipelineIntegrity.createCheckpoint({episodeId:id,checkpointKey:key,stage,sceneNumber,shotIndex,metadata:{legacy:true,season_number:ep.season_number,episode_number:ep.episode_number}});
+    }
+    res.json({ok:true,checkpoints:await pipelineIntegrity.listCheckpoints(id)});
+  } catch(e) { res.status(500).json({ok:false,error:e.message,checkpoints:[]}); }
+});
+
+app.post('/api/checkpoints/rollback', auth.requireAdmin, async (req,res)=>{
+  try { await pipelineIntegrity.ensureSchema(); const id=String(req.body?.checkpoint_id||'').trim(); if(!id) return res.status(400).json({ok:false,error:'checkpoint_id is required'}); res.json(await pipelineIntegrity.rollbackToCheckpoint(id)); }
+  catch(e) { res.status(400).json({ok:false,error:e.message}); }
 });
 
 // ──────────────────────────────────────────────────────────────────────────────
