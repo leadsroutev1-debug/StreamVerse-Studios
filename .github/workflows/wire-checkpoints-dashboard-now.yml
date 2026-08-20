@@ -1,0 +1,78 @@
+name: Wire checkpoints dashboard now
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  wire:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch live source files
+        shell: python
+        run: |
+          from pathlib import Path
+
+          dash = Path('views/dashboard.html')
+          html = dash.read_text(encoding='utf-8')
+
+          if 'id="tabBtnCheckpoints"' not in html:
+              anchor = '  <button class="tab-btn" id="tabBtnAnnouncements" onclick="switchTab(\'announcements\')"'
+              p = html.find(anchor)
+              if p < 0: raise SystemExit('dashboard nav anchor not found')
+              q = html.find('</button>', p)
+              html = html[:q+9] + '''\n  <button class="tab-btn" id="tabBtnCheckpoints" onclick="switchTab('checkpoints')" style="background:transparent;border:1px solid transparent;color:var(--muted);padding:9px 18px;border-radius:8px 8px 0 0;font-size:13px;font-weight:600;cursor:pointer">🧭 Checkpoints</button>''' + html[q+9:]
+
+          html = html.replace("const panels=['control','episodes','analytics','users','announcements'];", "const panels=['control','episodes','analytics','users','announcements','checkpoints'];")
+
+          if 'id="tabPanelCheckpoints"' not in html:
+              panel = '''\n  <div id="tabPanelCheckpoints" style="display:none">\n    <div class="card">\n      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">\n        <h3 style="display:inline-block">Production Checkpoints</h3>\n        <button class="refresh-btn" onclick="loadCheckpointEpisodes()">↻ Refresh</button>\n      </div>\n      <div style="font-size:12px;color:var(--muted);margin-bottom:12px">Select a persisted checkpoint. Rollback removes downstream progress and resumes from the selected stage.</div>\n      <select id="checkpointEpisodeSelect" onchange="loadEpisodeCheckpoints(this.value)" style="width:100%;background:var(--surface);color:var(--text);border:1px solid var(--border);padding:8px;border-radius:6px;margin-bottom:12px"><option value="">Select an episode…</option></select>\n      <div id="checkpointStatus" style="font-size:12px;color:var(--muted);margin-bottom:10px"></div>\n      <div class="table-wrap"><table><thead><tr><th>Stage</th><th>Scene</th><th>Shot</th><th>Status</th><th>Created</th><th></th></tr></thead><tbody id="checkpointBody"><tr><td colspan="6" style="padding:20px;text-align:center;color:var(--muted)">Select an episode.</td></tr></tbody></table></div>\n    </div>\n  </div>\n'''
+              marker = '  <div id="tabPanelAnnouncements"'
+              p = html.find(marker)
+              if p < 0: raise SystemExit('announcements panel anchor not found')
+              html = html[:p] + panel + html[p:]
+
+          funcs = '''\n  async function loadCheckpointEpisodes() {\n    try {\n      const d = await adminFetch('/api/checkpoints/episodes');\n      const s = document.getElementById('checkpointEpisodeSelect');\n      s.innerHTML = '<option value="">Select an episode…</option>' + (d.episodes || []).map(e => `<option value="${esc(e.id)}">${esc(e.show_title)} S${e.season_number}E${e.episode_number} — ${esc(e.status)}</option>`).join('');\n    } catch(e) { document.getElementById('checkpointStatus').textContent = e.message; }\n  }\n\n  async function loadEpisodeCheckpoints(id) {\n    const body = document.getElementById('checkpointBody');\n    if (!id) return;\n    try {\n      const d = await adminFetch('/api/checkpoints?episode_id=' + encodeURIComponent(id));\n      body.innerHTML = (d.checkpoints || []).map(cp => `<tr><td><strong>${esc(cp.stage)}</strong></td><td>${cp.scene_number ?? '—'}</td><td>${cp.shot_index ?? '—'}</td><td>${esc(cp.status)}</td><td>${esc(cp.created_at || '')}</td><td><button class="shot-fail-btn" onclick="rollbackCheckpoint('${cp.id}')">Rollback here</button></td></tr>`).join('') || '<tr><td colspan="6" style="padding:20px;text-align:center">No checkpoints.</td></tr>';\n    } catch(e) { body.innerHTML = `<tr><td colspan="6" style="color:var(--danger);padding:20px">${esc(e.message)}</td></tr>`; }\n  }\n\n  async function rollbackCheckpoint(id) {\n    if (!confirm('Rollback to this checkpoint? Downstream production artifacts will be removed.')) return;\n    try {\n      const d = await adminFetch('/api/checkpoints/rollback', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({checkpoint_id:id})});\n      document.getElementById('checkpointStatus').textContent = 'Rolled back to ' + d.resumed_from_stage;\n      await loadEpisodeCheckpoints(document.getElementById('checkpointEpisodeSelect').value);\n      if (typeof loadDrafts === 'function') loadDrafts();\n      if (typeof loadRenderedShots === 'function') loadRenderedShots();\n    } catch(e) { alert('Rollback failed: ' + e.message); }\n  }\n'''
+          if 'async function loadCheckpointEpisodes()' not in html:
+              p = html.find('  function switchTab(tab) {')
+              if p < 0: raise SystemExit('switchTab anchor not found')
+              html = html[:p] + funcs + html[p:]
+
+          marker = "    if(tab==='episodes') loadEpisodesTab();"
+          if marker in html and "if(tab==='checkpoints') loadCheckpointEpisodes();" not in html:
+              html = html.replace(marker, marker + "\n    if(tab==='checkpoints') loadCheckpointEpisodes();")
+
+          dash.write_text(html, encoding='utf-8')
+
+          idx = Path('index.js')
+          src = idx.read_text(encoding='utf-8')
+          if "require('./src/pipelineIntegrity')" not in src:
+              src = src.replace("const { searchCatalog } = require('./src/search');", "const { searchCatalog } = require('./src/search');\nconst pipelineIntegrity = require('./src/pipelineIntegrity');")
+
+          if "app.get('/api/checkpoints/episodes'" not in src:
+              anchor = "app.post('/api/pause', (req, res) => {\n  const result = pipeline.requestPause();\n  res.json(result);\n});"
+              if anchor not in src: raise SystemExit('pause route anchor not found')
+              routes = '''\n\napp.get('/api/checkpoints/episodes', auth.requireAdmin, async (req, res) => {\n  try {\n    await pipelineIntegrity.ensureSchema();\n    const rows = await db.query(`SELECT e.id,e.storyline_id,e.episode_number,e.season_number,e.status,e.scene_count,e.shot_count,e.updated_at,s.title AS show_title,COUNT(pc.id) AS checkpoint_count FROM episodes e JOIN storylines s ON s.id=e.storyline_id LEFT JOIN production_checkpoints pc ON pc.episode_id=e.id GROUP BY e.id,e.storyline_id,e.episode_number,e.season_number,e.status,e.scene_count,e.shot_count,e.updated_at,s.title ORDER BY e.updated_at DESC LIMIT 100`);\n    res.json({ok:true,episodes:rows});\n  } catch(e) { res.status(500).json({ok:false,error:e.message,episodes:[]}); }\n});\n\napp.get('/api/checkpoints', auth.requireAdmin, async (req, res) => {\n  try {\n    await pipelineIntegrity.ensureSchema();\n    const id=String(req.query.episode_id||'').trim();\n    if(!id) return res.status(400).json({ok:false,error:'episode_id is required'});\n    const existing=await db.queryOne('SELECT COUNT(*) AS n FROM production_checkpoints WHERE episode_id=?',[id]);\n    if(!Number(existing?.n||0)) {\n      const ep=await db.queryOne('SELECT id,episode_number,season_number,status,script,scene_count,shot_count,ready_at FROM episodes WHERE id=?',[id]);\n      if(!ep) return res.status(404).json({ok:false,error:'Episode not found'});\n      const script=safeJsonParse(ep.script,{});\n      const sceneNumbers=Array.isArray(script.scenes)?script.scenes.map(s=>Number(s.scene_number)).filter(Boolean):[];\n      const items=[['legacy_episode_blueprint','episode_blueprint',null,null], ...sceneNumbers.length?[['legacy_scene_shot_writing','scene_shot_writing',sceneNumbers[sceneNumbers.length-1],null]]:[], ...(ep.shot_count>0?[['legacy_media_generation','media_generation',null,null]]:[]), ...(ep.ready_at?[['legacy_episode_compile','episode_compile',null,null]]:[])];\n      for(const [key,stage,sceneNumber,shotIndex] of items) await pipelineIntegrity.createCheckpoint({episodeId:id,checkpointKey:key,stage,sceneNumber,shotIndex,metadata:{legacy:true,season_number:ep.season_number,episode_number:ep.episode_number}});\n    }\n    res.json({ok:true,checkpoints:await pipelineIntegrity.listCheckpoints(id)});\n  } catch(e) { res.status(500).json({ok:false,error:e.message,checkpoints:[]}); }\n});\n\napp.post('/api/checkpoints/rollback', auth.requireAdmin, async (req,res)=>{\n  try { await pipelineIntegrity.ensureSchema(); const id=String(req.body?.checkpoint_id||'').trim(); if(!id) return res.status(400).json({ok:false,error:'checkpoint_id is required'}); res.json(await pipelineIntegrity.rollbackToCheckpoint(id)); }\n  catch(e) { res.status(400).json({ok:false,error:e.message}); }\n});'''
+              src = src.replace(anchor, anchor + routes)
+          idx.write_text(src, encoding='utf-8')
+
+      - name: Validate
+        run: |
+          node --check index.js
+          grep -q 'tabBtnCheckpoints' views/dashboard.html
+          grep -q 'tabPanelCheckpoints' views/dashboard.html
+          grep -q '/api/checkpoints/rollback' index.js
+
+      - name: Commit
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add index.js views/dashboard.html
+          git diff --cached --quiet && exit 0
+          git commit -m 'Add live production checkpoints dashboard tab'
+          git push
