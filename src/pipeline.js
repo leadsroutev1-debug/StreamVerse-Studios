@@ -4385,6 +4385,7 @@ function _buildLtxVideoPrompt(shot, storyline, orderedChars, positions, motionPa
 // ──────────────────────────────────────────────────────────────────────────────
 
 let _recompileRunning = false;
+let _hilRegenerationRunning = new Set();
 
 async function _getDraftContext() {
   const draft = await db.queryOne(
@@ -4751,10 +4752,12 @@ async function getShotDetail(sceneNumber, shotIndex, episodeId = null) {
 }
 
 async function regenerateShot(sceneNumber, shotIndex, opts = {}) {
-  if (_recompileRunning) return { ok: false, error: 'A regenerate/recompile is already running — try again once it finishes' };
-  const s = state.getState();
-  if (s.status !== state.STATES.IDLE && s.status !== state.STATES.ERROR && s.status !== state.STATES.PAUSED) {
-    return { ok: false, error: 'Pipeline is currently running — wait for it to finish first' };
+  // HIL is intentionally independent from the global production-state mutex.
+  // An operator must be able to regenerate any completed/failed shot while the
+  // rest of the pipeline continues running. Only the same shot is serialized.
+  const hilKey = `${opts.episodeId || 'draft'}:${sceneNumber}:${shotIndex}`;
+  if (_hilRegenerationRunning.has(hilKey)) {
+    return { ok: false, error: 'This shot is already being regenerated manually' };
   }
 
   const ctx = opts.episodeId ? await _getEpisodeContext(opts.episodeId) : await _getDraftContext();
@@ -4770,6 +4773,14 @@ async function regenerateShot(sceneNumber, shotIndex, opts = {}) {
   const shot = (sceneObj.shots || []).find(s => s.shot_index === shotIndex);
   if (!shot) return { ok: false, error: `Shot ${sceneNumber}/${shotIndex} not found in script` };
 
+  const currentRow = await db.queryOne(
+    `SELECT status, mh_job_id FROM shots WHERE episode_id = ? AND scene_number = ? AND shot_index = ?`,
+    [ctx.draft.id, sceneNumber, shotIndex]
+  );
+  if (currentRow && ['pending', 'mh_submitted'].includes(String(currentRow.status || '').toLowerCase())) {
+    return { ok: false, error: 'This shot already has an active regeneration in progress' };
+  }
+
   // Persist HIL prompt/duration overrides so episode edits survive reloads.
   const overrideUpdates = {};
   if (typeof opts.promptOverride === 'string' && opts.promptOverride.trim()) overrideUpdates.image_prompt_override = opts.promptOverride.trim();
@@ -4777,7 +4788,7 @@ async function regenerateShot(sceneNumber, shotIndex, opts = {}) {
   if (opts.duration != null && Number.isFinite(Number(opts.duration))) overrideUpdates.duration_override = Number(opts.duration);
   if (Object.keys(overrideUpdates).length) await updateShotRow(ctx.draft.id, sceneNumber, shotIndex, overrideUpdates);
 
-  _recompileRunning = true;
+  _hilRegenerationRunning.add(hilKey);
   // Mark it 'pending' synchronously (before returning) so an immediate
   // dashboard poll already reflects "regenerating" rather than the stale
   // failed/done row from before this call.
@@ -4788,7 +4799,7 @@ async function regenerateShot(sceneNumber, shotIndex, opts = {}) {
 
   _regenerateShotBackground(ctx, sceneNumber, shotIndex, shot, sceneObj, opts)
     .catch(err => console.error(`[RegenShot] Background failure S${sceneNumber}/idx${shotIndex}:`, err.message))
-    .finally(() => { _recompileRunning = false; });
+    .finally(() => { _hilRegenerationRunning.delete(hilKey); });
 
   return { ok: true, queued: true, sceneNumber, shotIndex };
 }
