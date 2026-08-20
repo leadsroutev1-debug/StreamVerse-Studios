@@ -11,7 +11,7 @@
  * Three validation passes:
  *
  *   1. Structural validation
- *      - Aspect ratio must be 9:16 vertical (1080×1920 or proportional)
+ *      - Aspect ratio must match the production 2:3 portrait frame (1024×1536 or proportional)
  *      - Minimum resolution / file-size thresholds
  *      - Detect wrong camera framing (landscape, square, film-strip)
  *
@@ -37,10 +37,10 @@ const sharp = require('sharp');
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
-const TARGET_ASPECT_RATIO = 9 / 16;   // 0.5625
+const TARGET_ASPECT_RATIO = 2 / 3;   // 0.666666... for 1024×1536 production frame
 const ASPECT_TOLERANCE    = 0.06;      // allow ±6% deviation
 const MIN_WIDTH           = 720;
-const MIN_HEIGHT          = 1280;
+const MIN_HEIGHT          = 1080;
 const MIN_FILE_BYTES      = 5000;
 const DRAFT_ACCEPT_SCORE  = 72;   // Good images advance; do not waste CF calls on cosmetic misses.
 const DRAFT_RETRY_SCORE   = 55;   // Only clearly weak images are regenerated in draft.
@@ -92,11 +92,11 @@ async function _validateStructure(imageBuffer) {
       type: 'structure',
       severity: SEVERITY.MEDIUM,
       message: `Resolution too low: ${w}×${h} (minimum ${MIN_WIDTH}×${MIN_HEIGHT})`,
-      correction: `CRITICAL: Generate at full resolution, minimum 1080×1920 pixels. Do not produce a low-resolution thumbnail.`,
+      correction: `CRITICAL: Generate at the production portrait resolution, preferably 1024×1536 pixels. Do not produce a low-resolution thumbnail.`,
     });
   }
 
-  // Aspect ratio check — must be 9:16 vertical
+  // Aspect ratio check — must match the canonical 2:3 portrait production frame
   if (w > 0 && h > 0) {
     const aspect = w / h;
     const deviation = Math.abs(aspect - TARGET_ASPECT_RATIO) / TARGET_ASPECT_RATIO;
@@ -104,18 +104,18 @@ async function _validateStructure(imageBuffer) {
     if (deviation > ASPECT_TOLERANCE) {
       const isLandscape = aspect > 1.0;
       const isSquare   = Math.abs(aspect - 1.0) < 0.1;
-      const isFilmStrip = aspect > 0.7 && w > h * 0.8 && w < h * 1.5;
+      const isWidePortrait = aspect > TARGET_ASPECT_RATIO && aspect < 1.0;
 
       let framingIssue = 'wrong aspect ratio';
       if (isLandscape) framingIssue = 'landscape orientation instead of vertical portrait';
       else if (isSquare) framingIssue = 'square orientation instead of vertical portrait';
-      else if (isFilmStrip) framingIssue = 'film-strip / multi-panel layout instead of single image';
+      else if (isWidePortrait) framingIssue = 'portrait frame wider than the canonical 2:3 target';
 
       violations.push({
         type: 'framing',
         severity: SEVERITY.HIGH,
-        message: `Wrong camera framing: ${framingIssue} (${w}×${h}, aspect ${aspect.toFixed(3)})`,
-        correction: `CRITICAL: Produce ONE single image in 9:16 VERTICAL PORTRAIT orientation, exactly 1080×1920 pixels. NO landscape layout. NO film strips. NO multiple panels. NO square. The image MUST be taller than it is wide.`,
+        message: `Wrong camera framing: ${framingIssue} (${w}×${h}, aspect ${aspect.toFixed(3)}; expected 2:3 ≈ 0.667)`,
+        correction: `CRITICAL: Produce ONE single image in the canonical 2:3 PORTRAIT frame, preferably exactly 1024×1536 pixels. NO landscape layout. NO film strips. NO multiple panels. NO square. Keep one continuous tall portrait frame.`,
       });
     }
   }
