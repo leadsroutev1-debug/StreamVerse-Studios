@@ -1,0 +1,85 @@
+name: Fix HIL regeneration availability
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Apply source-level HIL fix
+        shell: python
+        run: |
+          from pathlib import Path
+          import re
+
+          path = Path('src/pipeline.js')
+          source = path.read_text(encoding='utf-8')
+          original = source
+
+          marker = 'let _recompileRunning = false;'
+          if 'const _hilRegenerationRunning = new Set();' not in source:
+              if marker not in source:
+                  raise SystemExit('HIL patch: recompile mutex marker not found')
+              source = source.replace(
+                  marker,
+                  marker + "\nlet _hilRegenerationRunning = new Set();",
+                  1,
+              )
+
+          old_guard = """async function regenerateShot(sceneNumber, shotIndex, opts = {}) {\n  if (_recompileRunning) return { ok: false, error: 'A regenerate/recompile is already running — try again once it finishes' };\n  const s = state.getState();\n  if (s.status !== state.STATES.IDLE && s.status !== state.STATES.ERROR && s.status !== state.STATES.PAUSED) {\n    return { ok: false, error: 'Pipeline is currently running — wait for it to finish first' };\n  }\n"""
+          new_guard = """async function regenerateShot(sceneNumber, shotIndex, opts = {}) {\n  // HIL is intentionally independent from the global production-state mutex.\n  // An operator must be able to regenerate any completed/failed shot while the\n  // rest of the pipeline continues running. Only the same shot is serialized.\n  const hilKey = `${opts.episodeId || 'draft'}:${sceneNumber}:${shotIndex}`;\n  if (_hilRegenerationRunning.has(hilKey)) {\n    return { ok: false, error: 'This shot is already being regenerated manually' };\n  }\n"""
+          if old_guard in source:
+              source = source.replace(old_guard, new_guard, 1)
+          else:
+              if 'HIL is intentionally independent from the global production-state mutex.' not in source:
+                  raise SystemExit('HIL patch: regenerateShot guard block not found')
+
+          old_after_shot = """  const shot = (sceneObj.shots || []).find(s => s.shot_index === shotIndex);\n  if (!shot) return { ok: false, error: `Shot ${sceneNumber}/${shotIndex} not found in script` };\n\n  // Persist HIL prompt/duration overrides so episode edits survive reloads.\n"""
+          new_after_shot = """  const shot = (sceneObj.shots || []).find(s => s.shot_index === shotIndex);\n  if (!shot) return { ok: false, error: `Shot ${sceneNumber}/${shotIndex} not found in script` };\n\n  const currentRow = await db.queryOne(\n    `SELECT status, mh_job_id FROM shots WHERE episode_id = ? AND scene_number = ? AND shot_index = ?`,\n    [ctx.draft.id, sceneNumber, shotIndex]\n  );\n  if (currentRow && ['pending', 'mh_submitted'].includes(String(currentRow.status || '').toLowerCase())) {\n    return { ok: false, error: 'This shot already has an active regeneration in progress' };\n  }\n\n  // Persist HIL prompt/duration overrides so episode edits survive reloads.\n"""
+          if old_after_shot in source:
+              source = source.replace(old_after_shot, new_after_shot, 1)
+
+          old_lock = """  _recompileRunning = true;\n  // Mark it 'pending' synchronously (before returning) so an immediate\n"""
+          new_lock = """  _hilRegenerationRunning.add(hilKey);\n  // Mark it 'pending' synchronously (before returning) so an immediate\n"""
+          if old_lock in source:
+              source = source.replace(old_lock, new_lock, 1)
+
+          old_finally = """    .finally(() => { _recompileRunning = false; });\n\n  return { ok: true, queued: true, sceneNumber, shotIndex };\n}\n\nasync function _regenerateShotBackground"""
+          new_finally = """    .finally(() => { _hilRegenerationRunning.delete(hilKey); });\n\n  return { ok: true, queued: true, sceneNumber, shotIndex };\n}\n\nasync function _regenerateShotBackground"""
+          if old_finally in source:
+              source = source.replace(old_finally, new_finally, 1)
+
+          if source == original:
+              raise SystemExit('HIL patch produced no source changes')
+
+          path.write_text(source, encoding='utf-8')
+
+      - name: Syntax check
+        run: node --check src/pipeline.js && node --check src/ltxVisionDirector.js
+
+      - name: Commit source fix
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/pipeline.js
+          git diff --cached --quiet || git commit -m "Make HIL shot regeneration available anytime"
+          git push
+
+      - name: Remove migration workflow
+        shell: bash
+        run: |
+          rm -f .github/workflows/fix-hil-anytime.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/workflows/fix-hil-anytime.yml
+          git diff --cached --quiet || git commit -m "Remove completed HIL migration workflow"
+          git push
