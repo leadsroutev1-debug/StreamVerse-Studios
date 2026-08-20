@@ -1,0 +1,27 @@
+{
+  "name": "streamverse-engine",
+  "version": "1.0.0",
+  "description": "StreamVerse automated video generation and publishing engine",
+  "main": "index.js",
+  "scripts": {
+    "start": "bash start.sh",
+    "start:node": "node index.js",
+    "start:video": "bash video_engine/run.sh",
+    "dev": "vite",
+    "build": "vite build"
+  },
+  "dependencies": {
+    "axios": "^1.19.0",
+    "dotenv": "^16.6.1",
+    "express": "^4.22.2",
+    "form-data": "^4.0.6",
+    "mysql2": "^3.23.3",
+    "node-cron": "^3.0.3",
+    "nodemailer": "^6.10.1",
+    "sharp": "^0.35.3",
+    "uuid": "^10.0.0"
+  },
+  "devDependencies": {
+    "vite": "^6.4.3"
+  }
+}
