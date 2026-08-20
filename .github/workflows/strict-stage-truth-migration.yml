@@ -19,12 +19,10 @@ jobs:
         run: |
           from pathlib import Path
 
+          # scriptWriter: remove multi-generation reconciliation from the writer.
           p = Path('src/scriptWriter.js')
           s = p.read_text(encoding='utf-8')
-          original = s
 
-          # 1) Shot writing must consume the immediately previous stage only.
-          # Remove the older scene-memory/continuity merge from the writer prompt.
           old = '''    const memoryBlock = memory.length
       ? `\\
 ═══ STORY MEMORY — what happened so far ═══\\
@@ -74,26 +72,20 @@ ${continuityJson}
 '''
           if old not in s:
               raise SystemExit('Expected legacy stage-merge block not found in scriptWriter.js')
-          new = '''    const simulatedSceneShots = (shotSimulation?.shots || [])
+          s = s.replace(old, '''    const simulatedSceneShots = (shotSimulation?.shots || [])
       .filter(s => Number(s.scene_number) === Number(scene.scene_number))
       .sort((a, b) => Number(a.shot_index) - Number(b.shot_index));
 
     const shotSimulationBlock = `\\
 ═══ CURRENT STAGE TRUTH: SHOT ARCHITECTURE ═══\\
 ${JSON.stringify(simulatedSceneShots)}\\
-This is the ONLY creative source for this writing stage. Expand and clarify it into cinematic shot prose. Do not consult, reconcile, merge, or infer from older scene/shot generations. Preserve its shot order, character positions, start state, end state, handoff state, dialogue intent, and actions exactly unless a field is internally inconsistent enough to make generation impossible.\\
+This artifact is the only creative source for the writing stage. Expand it into cinematic shot prose without consulting, reconciling, merging, or backfilling older scene/shot generations. Preserve its shot order, character placements, start state, end state, handoff state, dialogue intent, and actions.\\
 `;
 
-    const shotUserPrompt = `You are writing the current scene from the immediately previous stage artifact.
-${shotSimulationBlock}
-'''
-          s = s.replace(old, new, 1)
+    const shotUserPrompt = `You are writing the current scene from the immediately previous stage artifact.\n${shotSimulationBlock}\n''', 1)
+          s = s.replace('${memoryBlock}${shotSimulationBlock}${inheritedStateBlock}', '${shotSimulationBlock}')
+          s = s.replace('\\n═══ GLOBAL CONTINUITY STATE — inherit before inventing new details ═══\\n${continuityJson}\\n', '\\n')
 
-          # Remove the second-level inherited-state prose in the main prompt.
-          s = s.replace("${memoryBlock}${shotSimulationBlock}${inheritedStateBlock}", "${shotSimulationBlock}")
-          s = s.replace("\n═══ GLOBAL CONTINUITY STATE — inherit before inventing new details ═══\n${continuityJson}\n", "\n")
-
-          # 2) Do not silently normalize shot indexes. The stage-3 artifact owns them.
           old_norm = '''        if (rawIndex !== expectedIndex) {
           console.warn(
             `[ScriptWriter] Normalizing scene-local shot index S${scene.scene_number}: model returned idx=${Number.isFinite(rawIndex) ? rawIndex : 'n/a'}, expected idx=${expectedIndex}`
@@ -112,7 +104,7 @@ ${shotSimulationBlock}
         };'''
           if old_norm not in s:
               raise SystemExit('Expected shot index normalization block not found')
-          new_norm = '''        if (rawIndex !== expectedIndex) {
+          s = s.replace(old_norm, '''        if (rawIndex !== expectedIndex) {
           throw new Error(
             `[ScriptWriter] Stage handoff violation S${scene.scene_number}: shot architecture index=${Number.isFinite(rawIndex) ? rawIndex : 'n/a'} but writer position=${expectedIndex}. Refusing to recalibrate.`
           );
@@ -122,17 +114,12 @@ ${shotSimulationBlock}
           ...sanitizedShot,
           scene_number: Number(scene.scene_number),
           shot_index: rawIndex,
-        };'''
-          s = s.replace(old_norm, new_norm, 1)
-
+        };''', 1)
           p.write_text(s, encoding='utf-8')
 
-          # 3) Disable legacy post-write mutation pipeline so written-shot truth
-          # flows directly to image generation. It remains available only for
-          # explicit future tooling, not the production stage handoff.
+          # pipeline: keep control registries, disable creative post-write mutation.
           pp = Path('src/pipeline.js')
           ps = pp.read_text(encoding='utf-8')
-          porig = ps
           old_gate = '''  const shouldPostProcessScript =
     !isResuming ||
     resumedIncompleteScript ||
@@ -142,10 +129,7 @@ ${shotSimulationBlock}
   if (shouldPostProcessScript) {'''
           if old_gate not in ps:
               raise SystemExit('Legacy post-write mutation gate not found in pipeline.js')
-          new_gate = '''  // STRICT STAGE HANDOFF: the current stage output is authoritative.\n  // Do not mutate already-written shots through legacy reconciliation layers.\n  const shouldPostProcessScript = false;\n\n  if (shouldPostProcessScript) {'''
-          ps = ps.replace(old_gate, new_gate, 1)
-          if ps == porig:
-              raise SystemExit('pipeline.js was not changed')
+          ps = ps.replace(old_gate, '''  // STRICT STAGE HANDOFF: creative artifacts are no longer rewritten after the writing stage.\n  // The existing block is retained for explicit legacy tooling, but production execution skips it.\n  const shouldPostProcessScript = false;\n\n  if (shouldPostProcessScript) {''', 1)
           pp.write_text(ps, encoding='utf-8')
 
       - name: Syntax check
