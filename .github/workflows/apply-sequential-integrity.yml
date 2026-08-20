@@ -1,0 +1,268 @@
+name: Apply deterministic pipeline integrity
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  migrate:
+    if: github.actor != 'github-actions[bot]' && !contains(github.event.head_commit.message, '[pipeline-integrity-migration]')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Apply source-level pipeline integrity migration
+        shell: python
+        run: |
+          from pathlib import Path
+          import re
+          import json
+
+          root = Path('.')
+
+          # ------------------------------------------------------------------
+          # db.js: initialize durable artifact/checkpoint tables on startup.
+          # ------------------------------------------------------------------
+          p = root / 'src/db.js'
+          s = p.read_text()
+          marker = "console.log('[DB] Schema ready.');"
+          if "pipelineIntegrity').ensureSchema" not in s:
+              if marker not in s:
+                  raise SystemExit('db.js schema-ready marker not found')
+              s = s.replace(marker, "await require('./pipelineIntegrity').ensureSchema();\n  " + marker, 1)
+              p.write_text(s)
+
+          # ------------------------------------------------------------------
+          # scriptWriter.js: stage handoff revisions. A shot simulation may
+          # only consume the exact current episode blueprint revision. The
+          # writer refuses stale artifacts instead of recalibrating them.
+          # ------------------------------------------------------------------
+          p = root / 'src/scriptWriter.js'
+          s = p.read_text()
+
+          if "createHash" not in s.split('\n', 30)[0:30].__str__():
+              s = "const crypto = require('crypto');\n" + s
+
+          helper = r'''
+function _stageRevision(value) {
+  return crypto.createHash('sha256').update(JSON.stringify(value ?? null)).digest('hex').slice(0, 24);
+}
+
+function _assertSceneShotHandoff({ blueprintRevision, shotSimulation, sceneNumber }) {
+  const supplied = shotSimulation?.source_blueprint_revision || null;
+  if (supplied && supplied !== blueprintRevision) {
+    throw new Error(`[ScriptWriter] STALE_STAGE_ARTIFACT scene=${sceneNumber} shot_simulation_revision=${supplied} blueprint_revision=${blueprintRevision}`);
+  }
+  if (shotSimulation?.source_scene_count != null && Number(shotSimulation.source_scene_count) <= 0) {
+    throw new Error(`[ScriptWriter] INVALID_STAGE_ARTIFACT scene=${sceneNumber} source_scene_count=${shotSimulation.source_scene_count}`);
+  }
+}
+'''
+          if '_assertSceneShotHandoff' not in s:
+              insert_at = s.find('\nasync function writeEpisodeScript(')
+              if insert_at < 0:
+                  raise SystemExit('writeEpisodeScript marker not found')
+              s = s[:insert_at] + '\n' + helper + s[insert_at:]
+
+          # Compute revision immediately after the blueprint is finalized.
+          anchor = "  blueprint.episode_trajectory = blueprint.episode_trajectory || currentEpisodeTrajectory;\n"
+          if "const episodeBlueprintRevision = _stageRevision(blueprint);" not in s:
+              if anchor not in s:
+                  raise SystemExit('episode blueprint revision anchor not found')
+              s = s.replace(anchor, anchor + "  const episodeBlueprintRevision = _stageRevision(blueprint);\n", 1)
+
+          # Pass revision into shot simulation and refuse an old persisted artifact.
+          old = "    existingShotSimulation: blueprint?.shot_simulation || existingScript?.shot_simulation || null,"
+          new = "    existingShotSimulation: (() => { const prior = blueprint?.shot_simulation || existingScript?.shot_simulation || null; return prior && prior.source_blueprint_revision === episodeBlueprintRevision ? prior : null; })(),\n    sourceBlueprintRevision: episodeBlueprintRevision,"
+          if old in s and 'sourceBlueprintRevision: episodeBlueprintRevision' not in s:
+              s = s.replace(old, new, 1)
+
+          # Tag the newly produced shot simulation with its exact parent blueprint.
+          anchor = "  blueprint.shot_simulation = shotSimulation;\n"
+          if anchor in s and "source_blueprint_revision: episodeBlueprintRevision" not in s[s.find(anchor):s.find(anchor)+500]:
+              s = s.replace(anchor, "  blueprint.shot_simulation = { ...shotSimulation, source_blueprint_revision: episodeBlueprintRevision, source_scene_count: blueprint.scenes.length, source_scene_numbers: blueprint.scenes.map(s => Number(s.scene_number)) };\n  const lockedShotSimulation = blueprint.shot_simulation;\n", 1)
+              s = s.replace("    shotSimulation,\n", "    shotSimulation: lockedShotSimulation,\n", 1)
+
+          # Ensure scene writer receives the same exact revision.
+          sig = "  checkpoint = null,\n}) {"
+          if sig in s and "blueprintRevision" not in s[s.find(sig)-300:s.find(sig)+300]:
+              s = s.replace(sig, "  checkpoint = null,\n  blueprintRevision = null,\n}) {", 1)
+
+          call_anchor = "    const simulatedSceneShots = (shotSimulation?.shots || [])\n"
+          if call_anchor in s:
+              guard = "    if (blueprintRevision) _assertSceneShotHandoff({ blueprintRevision, shotSimulation, sceneNumber: scene.scene_number });\n"
+              if guard not in s[s.find(call_anchor)-250:s.find(call_anchor)+100]:
+                  s = s.replace(call_anchor, guard + call_anchor, 1)
+
+          # Ensure writeEpisodeScript passes the revision into scene writer.
+          old = "    existingScenes,\n    checkpoint: async ({ sceneNumber, completedSceneNumbers, scenes: partialScenes }) => {"
+          new = "    existingScenes,\n    blueprintRevision: episodeBlueprintRevision,\n    checkpoint: async ({ sceneNumber, completedSceneNumbers, scenes: partialScenes }) => {"
+          if old in s and "blueprintRevision: episodeBlueprintRevision" not in s[s.find('_writeSceneShotsSequential({'):s.find('_writeSceneShotsSequential({')+900]:
+              s = s.replace(old, new, 1)
+
+          p.write_text(s)
+
+          # ------------------------------------------------------------------
+          # pipeline.js: semantic character reference-angle selection for the
+          # final still. This is source-level and applies only to shot images.
+          # ------------------------------------------------------------------
+          p = root / 'src/pipeline.js'
+          s = p.read_text()
+          if "characterReferenceSelector" not in s:
+              anchor = "const hardControl       = require('./hardControlLayers');\n"
+              if anchor not in s:
+                  raise SystemExit('pipeline import anchor not found')
+              s = s.replace(anchor, anchor + "const characterReferenceSelector = require('./characterReferenceSelector');\nconst pipelineIntegrity = require('./pipelineIntegrity');\n", 1)
+
+          # Find the function that submits the final shot image/video generation.
+          video_pos = s.find('videoGen.submitVideoJob(')
+          if video_pos < 0:
+              raise SystemExit('videoGen.submitVideoJob marker not found')
+          fn_start = s.rfind('async function ', 0, video_pos)
+          fn_end = s.find('\nasync function ', video_pos + 10)
+          if fn_end < 0:
+              fn_end = len(s)
+          fn = s[fn_start:fn_end]
+
+          if 'semanticReferenceSelections' not in fn:
+              insertion = r'''
+
+      // Choose reference portrait angle semantically for this exact shot.
+      // The character record may contain four canonical angles; the selector
+      // chooses the one that best matches framing, eyeline, pose and action.
+      const semanticReferenceSelections = characterReferenceSelector.selectReferenceAngles({
+        characters: characterList,
+        characterStaging: currentShot.character_staging || currentShot.characterStaging || [],
+        shot: currentShot,
+        maxReferences: 4,
+      });
+      const semanticReferenceUrls = semanticReferenceSelections.map(ref => ref.url).filter(Boolean);
+      if (semanticReferenceSelections.length) {
+        console.log(`[ReferenceSelector] S${currentShot.scene_number}/idx${currentShot.shot_index}: ` +
+          semanticReferenceSelections.map(ref => `${ref.name}=${ref.angle}`).join(', '));
+      }
+'''
+              # Insert immediately before the first image-generation call inside this function.
+              ig = fn.rfind('imageGen.generateImage(')
+              if ig < 0:
+                  raise SystemExit('shot imageGen.generateImage marker not found in generation function')
+              fn = fn[:ig] + insertion + '\n      ' + fn[ig:]
+              # Replace the first referenceImageUrls token after insertion with semanticReferenceUrls.
+              local = fn[ig + len(insertion):]
+              local = local.replace('referenceImageUrls', 'semanticReferenceUrls', 1)
+              fn = fn[:ig + len(insertion)] + local
+              s = s[:fn_start] + fn + s[fn_end:]
+
+          # ------------------------------------------------------------------
+          # index.js: checkpoint APIs + dashboard route link.
+          # ------------------------------------------------------------------
+          p = root / 'index.js'
+          s = p.read_text()
+          if "pipelineIntegrity" not in s:
+              anchor = "const { safeJsonParse } = require('./src/util');\n"
+              if anchor not in s:
+                  raise SystemExit('index import anchor not found')
+              s = s.replace(anchor, anchor + "const pipelineIntegrity = require('./src/pipelineIntegrity');\n", 1)
+
+          route_marker = "app.get('/api/status', (req, res) => {"
+          if "'/api/checkpoints'" not in s:
+              route = r'''
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Durable production checkpoints / rollback
+// ──────────────────────────────────────────────────────────────────────────────
+app.get('/api/checkpoints', async (req, res) => {
+  try {
+    let episodeId = String(req.query?.episode_id || '').trim();
+    if (!episodeId) {
+      const draft = await db.queryOne(`SELECT id FROM episodes WHERE status NOT IN ('posted','completed') ORDER BY updated_at DESC LIMIT 1`);
+      episodeId = draft?.id || '';
+    }
+    if (!episodeId) return res.json({ ok: true, episodeId: null, checkpoints: [] });
+    const checkpoints = await pipelineIntegrity.listCheckpoints(episodeId);
+    res.json({ ok: true, episodeId, checkpoints });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get('/api/checkpoint-episodes', async (req, res) => {
+  try {
+    const rows = await db.query(`SELECT id, storyline_id, season_number, episode_number, status, updated_at FROM episodes ORDER BY updated_at DESC LIMIT 100`);
+    res.json({ ok: true, episodes: rows });
+  } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
+});
+
+app.post('/api/checkpoints/:id/rollback', async (req, res) => {
+  try {
+    const result = await pipelineIntegrity.rollbackToCheckpoint(String(req.params.id));
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ ok: false, error: err.message });
+  }
+});
+'''
+              if route_marker not in s:
+                  raise SystemExit('status route marker not found')
+              s = s.replace(route_marker, route + '\n' + route_marker, 1)
+
+          # Dashboard route: add a durable navigation link to the checkpoint tab.
+          old = "app.get('/dashboard', (req, res) => res.sendFile(path.join(__dirname, 'views', 'dashboard.html')));"
+          new = "app.get('/dashboard', (req, res) => res.sendFile(path.join(__dirname, 'views', 'dashboard.html')));\napp.get('/checkpoints', (req, res) => res.sendFile(path.join(__dirname, 'views', 'checkpoints.html')));"
+          if old in s and "app.get('/checkpoints'" not in s:
+              s = s.replace(old, new, 1)
+          p.write_text(s)
+
+          # ------------------------------------------------------------------
+          # Dashboard Checkpoints tab/page. It is intentionally DB-backed and
+          # every rollback is destructive for downstream artifacts.
+          # ------------------------------------------------------------------
+          cp = root / 'views/checkpoints.html'
+          if not cp.exists():
+              cp.write_text(r'''<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>StreamVerse — Checkpoints</title>
+<style>
+body{margin:0;background:#0a0c10;color:#e2e8f0;font:14px system-ui}header{padding:18px 24px;background:#12161e;border-bottom:1px solid #1e2433;display:flex;gap:18px;align-items:center}a{color:#06b6d4;text-decoration:none}.wrap{max-width:1200px;margin:auto;padding:24px}.toolbar{display:flex;gap:10px;align-items:center;margin-bottom:18px}select,button{background:#12161e;color:#e2e8f0;border:1px solid #334155;border-radius:7px;padding:9px 12px}button.danger{border-color:#7f1d1d;color:#fca5a5}.cp{border:1px solid #1e2433;background:#12161e;border-radius:10px;padding:14px;margin:10px 0}.row{display:flex;gap:14px;align-items:center;justify-content:space-between}.muted{color:#94a3b8;font-size:12px}.stage{font-weight:700;color:#a78bfa}.warn{color:#fbbf24}
+</style></head><body>
+<header><strong>StreamVerse Studios</strong><a href="/dashboard">Dashboard</a><span>Checkpoints</span></header>
+<div class="wrap"><div class="toolbar"><select id="episode"></select><button onclick="load()">Refresh</button></div><div id="list"></div></div>
+<script>
+async function api(url,opt){const r=await fetch(url,opt);const j=await r.json();if(!r.ok||j.ok===false)throw new Error(j.error||'Request failed');return j}
+async function boot(){const j=await api('/api/checkpoint-episodes');const s=document.getElementById('episode');s.innerHTML=j.episodes.map(e=>`<option value="${e.id}">S${e.season_number}E${e.episode_number} — ${e.status}</option>`).join('');await load()}
+async function load(){const id=document.getElementById('episode').value;if(!id)return;const j=await api('/api/checkpoints?episode_id='+encodeURIComponent(id));document.getElementById('list').innerHTML=j.checkpoints.length?j.checkpoints.map(c=>`<div class="cp"><div class="row"><div><div class="stage">${c.stage}</div><div class="muted">${c.created_at} · scene ${c.scene_number??'—'} · shot ${c.shot_index??'—'}</div></div><button class="danger" ${c.status==='rolled_back'?'disabled':''} onclick="rollback('${c.id}')">Rollback to this checkpoint</button></div></div>`).join(''):'<div class="muted">No durable checkpoints yet.</div>'}
+async function rollback(id){if(!confirm('Rollback will invalidate and DELETE downstream production artifacts. Continue?'))return;try{await api('/api/checkpoints/'+id+'/rollback',{method:'POST',headers:{'Content-Type':'application/json'}});alert('Rollback complete. The selected checkpoint is now the resume boundary.');await load()}catch(e){alert(e.message)}}
+boot().catch(e=>document.getElementById('list').textContent=e.message)
+</script></body></html>''')
+
+          # ------------------------------------------------------------------
+          # Remove this one-shot workflow after it has produced its source commit.
+          # ------------------------------------------------------------------
+          wf = Path('.github/workflows/apply-sequential-integrity.yml')
+          # Do not delete here; it is removed after commit below.
+
+      - name: Validate source
+        run: |
+          node --check src/pipelineIntegrity.js
+          node --check src/characterReferenceSelector.js
+          node --check src/db.js
+          node --check src/scriptWriter.js
+          node --check src/pipeline.js
+          node --check index.js
+
+      - name: Commit source migration
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          rm -f .github/workflows/apply-sequential-integrity.yml
+          git add src/pipelineIntegrity.js src/characterReferenceSelector.js src/db.js src/scriptWriter.js src/pipeline.js index.js views/checkpoints.html .github/workflows/apply-sequential-integrity.yml
+          git diff --cached --quiet && { echo 'No changes to commit'; exit 0; }
+          git commit -m "Enforce sequential stage handoffs, semantic refs, and rollback checkpoints [pipeline-integrity-migration]"
+          git push origin HEAD:main
