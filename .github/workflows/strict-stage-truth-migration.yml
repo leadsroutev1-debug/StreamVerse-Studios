@@ -1,0 +1,161 @@
+name: Strict stage truth migration
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Apply strict stage handoff source changes
+        shell: python
+        run: |
+          from pathlib import Path
+
+          p = Path('src/scriptWriter.js')
+          s = p.read_text(encoding='utf-8')
+          original = s
+
+          # 1) Shot writing must consume the immediately previous stage only.
+          # Remove the older scene-memory/continuity merge from the writer prompt.
+          old = '''    const memoryBlock = memory.length
+      ? `\\
+═══ STORY MEMORY — what happened so far ═══\\
+${memory.slice(-MEMORY_WINDOW).join('\\\n')}\\
+`
+      : '\\
+═══ STORY MEMORY ═══\\
+This is the opening scene — there is nothing to recap yet.\\
+';
+
+    const continuitySnapshot = globalContinuity.buildGlobalContinuityState({ scenes: scenesWithShots });
+    const continuityJson = JSON.stringify(continuitySnapshot);
+
+    const simulatedSceneShots = (shotSimulation?.shots || [])
+      .filter(s => Number(s.scene_number) === Number(scene.scene_number))
+      .sort((a, b) => Number(a.shot_index) - Number(b.shot_index));
+
+    const shotSimulationBlock = `\\
+═══ LOCKED SHOT SIMULATION — DO NOT CONTRADICT ═══\\
+${JSON.stringify(simulatedSceneShots)}\\
+Use this as the causal blueprint for every shot in this scene. Preserve its start/end states, handoffs, character changes, dialogue intent, and order.\\
+`;
+
+    const previousScene = scenesWithShots.length
+      ? scenesWithShots[scenesWithShots.length - 1]
+      : null;
+    const previousEnd = previousScene?.shots?.length
+      ? previousScene.shots[previousScene.shots.length - 1]
+      : null;
+
+    const inheritedStateBlock = previousEnd
+      ? `\\
+═══ INHERITED STATE FROM PRIOR SCENE ═══\\
+${JSON.stringify({
+          scene_number: previousScene.scene_number,
+          last_shot_index: previousEnd.shot_index,
+          end_frame_state: previousEnd.end_frame_state || previousEnd.end_state || '',
+          next_shot_continuity: previousEnd.next_shot_continuity || previousEnd.handoff_to_next || '',
+        })}\\
+`
+      : '';
+
+    const shotUserPrompt = `You are ${idx + 1} of ${totalScenes} scenes into this episode.
+${memoryBlock}${shotSimulationBlock}${inheritedStateBlock}
+═══ GLOBAL CONTINUITY STATE — inherit before inventing new details ═══
+${continuityJson}
+'''
+          if old not in s:
+              raise SystemExit('Expected legacy stage-merge block not found in scriptWriter.js')
+          new = '''    const simulatedSceneShots = (shotSimulation?.shots || [])
+      .filter(s => Number(s.scene_number) === Number(scene.scene_number))
+      .sort((a, b) => Number(a.shot_index) - Number(b.shot_index));
+
+    const shotSimulationBlock = `\\
+═══ CURRENT STAGE TRUTH: SHOT ARCHITECTURE ═══\\
+${JSON.stringify(simulatedSceneShots)}\\
+This is the ONLY creative source for this writing stage. Expand and clarify it into cinematic shot prose. Do not consult, reconcile, merge, or infer from older scene/shot generations. Preserve its shot order, character positions, start state, end state, handoff state, dialogue intent, and actions exactly unless a field is internally inconsistent enough to make generation impossible.\\
+`;
+
+    const shotUserPrompt = `You are writing the current scene from the immediately previous stage artifact.
+${shotSimulationBlock}
+'''
+          s = s.replace(old, new, 1)
+
+          # Remove the second-level inherited-state prose in the main prompt.
+          s = s.replace("${memoryBlock}${shotSimulationBlock}${inheritedStateBlock}", "${shotSimulationBlock}")
+          s = s.replace("\n═══ GLOBAL CONTINUITY STATE — inherit before inventing new details ═══\n${continuityJson}\n", "\n")
+
+          # 2) Do not silently normalize shot indexes. The stage-3 artifact owns them.
+          old_norm = '''        if (rawIndex !== expectedIndex) {
+          console.warn(
+            `[ScriptWriter] Normalizing scene-local shot index S${scene.scene_number}: model returned idx=${Number.isFinite(rawIndex) ? rawIndex : 'n/a'}, expected idx=${expectedIndex}`
+          );
+        }
+        const sanitizedShot = _sanitizeDialogueOrActionSemantics(shot);
+        const normalizedStaging = shotStaging.getShotCharacterStaging(sanitizedShot, []);
+        sanitizedShot.character_staging = normalizedStaging;
+        sanitizedShot.character_positions = normalizedStaging.length
+          ? shotStaging.formatCharacterStagingBlock(normalizedStaging)
+          : (sanitizedShot.character_positions || '');
+        return {
+          ...sanitizedShot,
+          scene_number: Number(scene.scene_number),
+          shot_index: expectedIndex,
+        };'''
+          if old_norm not in s:
+              raise SystemExit('Expected shot index normalization block not found')
+          new_norm = '''        if (rawIndex !== expectedIndex) {
+          throw new Error(
+            `[ScriptWriter] Stage handoff violation S${scene.scene_number}: shot architecture index=${Number.isFinite(rawIndex) ? rawIndex : 'n/a'} but writer position=${expectedIndex}. Refusing to recalibrate.`
+          );
+        }
+        const sanitizedShot = _sanitizeDialogueOrActionSemantics(shot);
+        return {
+          ...sanitizedShot,
+          scene_number: Number(scene.scene_number),
+          shot_index: rawIndex,
+        };'''
+          s = s.replace(old_norm, new_norm, 1)
+
+          p.write_text(s, encoding='utf-8')
+
+          # 3) Disable legacy post-write mutation pipeline so written-shot truth
+          # flows directly to image generation. It remains available only for
+          # explicit future tooling, not the production stage handoff.
+          pp = Path('src/pipeline.js')
+          ps = pp.read_text(encoding='utf-8')
+          porig = ps
+          old_gate = '''  const shouldPostProcessScript =
+    !isResuming ||
+    resumedIncompleteScript ||
+    ['blueprint', 'shot_simulation', 'shot_simulation_complete', 'scene_shot_writing', 'script_complete', 'script_ready_for_processing']
+      .includes(loadedCheckpointStage);
+
+  if (shouldPostProcessScript) {'''
+          if old_gate not in ps:
+              raise SystemExit('Legacy post-write mutation gate not found in pipeline.js')
+          new_gate = '''  // STRICT STAGE HANDOFF: the current stage output is authoritative.\n  // Do not mutate already-written shots through legacy reconciliation layers.\n  const shouldPostProcessScript = false;\n\n  if (shouldPostProcessScript) {'''
+          ps = ps.replace(old_gate, new_gate, 1)
+          if ps == porig:
+              raise SystemExit('pipeline.js was not changed')
+          pp.write_text(ps, encoding='utf-8')
+
+      - name: Syntax check
+        run: node --check src/scriptWriter.js && node --check src/pipeline.js
+
+      - name: Commit source migration
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/scriptWriter.js src/pipeline.js
+          git diff --cached --quiet || git commit -m "Enforce strict sequential stage truth handoffs"
+          git push
