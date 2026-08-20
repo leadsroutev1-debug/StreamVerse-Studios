@@ -1,5 +1,8 @@
 name: Wire checkpoints dashboard now
 
+env:
+  MIGRATION_REVISION: "2"
+
 on:
   push:
     branches: [main]
