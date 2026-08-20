@@ -1,0 +1,335 @@
+name: Apply stage-truth and checkpoint migration
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    if: github.actor != 'github-actions[bot]'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply source migration
+        shell: python
+        run: |
+          from pathlib import Path
+          import re
+
+          root = Path('.')
+
+          # 1) Replace integrity helper with strict current-truth semantics.
+          p = root / 'src' / 'pipelineIntegrity.js'
+          s = p.read_text(encoding='utf-8')
+          start = s.index("'use strict';")
+          replacement = r'''\'use strict\';
+
+          const db = require('./db');
+          const { v4: uuidv4 } = require('uuid');
+
+          const STAGES = Object.freeze([
+            'season_blueprint',
+            'episode_blueprint',
+            'scene_simulation',
+            'shot_simulation',
+            'scene_shot_writing',
+            'media_generation',
+            'episode_compile',
+          ]);
+
+          const STAGE_ORDER = Object.freeze(Object.fromEntries(STAGES.map((name, i) => [name, i])));
+
+          async function ensureSchema() {
+            await db.execute(`
+              CREATE TABLE IF NOT EXISTS pipeline_artifacts (
+                id VARCHAR(36) NOT NULL PRIMARY KEY,
+                episode_id VARCHAR(36) NOT NULL,
+                scene_number INT NULL,
+                shot_index INT NULL,
+                stage VARCHAR(40) NOT NULL,
+                revision VARCHAR(80) NOT NULL,
+                input_artifact_id VARCHAR(36) NULL,
+                payload JSON NULL,
+                status ENUM('current','history','rolled_back','invalidated') NOT NULL DEFAULT 'current',
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                INDEX idx_artifact_owner (episode_id, scene_number, shot_index),
+                INDEX idx_artifact_current (episode_id, stage, status)
+              ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+            `);
+
+            await db.execute(`
+              CREATE TABLE IF NOT EXISTS production_checkpoints (
+                id VARCHAR(36) NOT NULL PRIMARY KEY,
+                episode_id VARCHAR(36) NOT NULL,
+                checkpoint_key VARCHAR(120) NOT NULL,
+                stage VARCHAR(40) NOT NULL,
+                scene_number INT NULL,
+                shot_index INT NULL,
+                artifact_id VARCHAR(36) NULL,
+                metadata JSON NULL,
+                status ENUM('current','history','rolled_back') NOT NULL DEFAULT 'current',
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_checkpoint_episode (episode_id, created_at),
+                INDEX idx_checkpoint_status (episode_id, status)
+              ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+            `);
+          }
+
+          async function current(episodeId, stage, sceneNumber = null, shotIndex = null) {
+            return db.queryOne(
+              `SELECT * FROM pipeline_artifacts
+               WHERE episode_id=? AND stage=? AND status='current'
+                 AND (? IS NULL OR scene_number=?)
+                 AND (? IS NULL OR shot_index=?)
+               ORDER BY created_at DESC LIMIT 1`,
+              [episodeId, stage, sceneNumber, sceneNumber, shotIndex, shotIndex]
+            );
+          }
+
+          async function beginStage({ episodeId, stage, payload, sceneNumber = null, shotIndex = null }) {
+            const idx = STAGE_ORDER[stage];
+            if (idx == null) throw new Error(`[Integrity] Unknown stage ${stage}`);
+            const priorStage = idx > 0 ? STAGES[idx - 1] : null;
+            const input = priorStage ? await current(episodeId, priorStage, sceneNumber, shotIndex) : null;
+            if (priorStage && !input) {
+              throw new Error(`[Integrity] ${stage} blocked: no CURRENT ${priorStage} artifact for episode=${episodeId} scene=${sceneNumber ?? '-'} shot=${shotIndex ?? '-'}`);
+            }
+
+            const old = await current(episodeId, stage, sceneNumber, shotIndex);
+            if (old) await db.execute(`UPDATE pipeline_artifacts SET status='history' WHERE id=?`, [old.id]);
+
+            const id = uuidv4();
+            const revision = `${stage}:${Date.now().toString(36)}-${Math.random().toString(36).slice(2,8)}`;
+            await db.execute(
+              `INSERT INTO pipeline_artifacts
+               (id, episode_id, scene_number, shot_index, stage, revision, input_artifact_id, payload, status)
+               VALUES (?,?,?,?,?,?,?,?, 'current')`,
+              [id, episodeId, sceneNumber, shotIndex, stage, revision, input?.id || null, JSON.stringify(payload ?? null)]
+            );
+            return { id, revision, input_artifact: input, stage };
+          }
+
+          async function replaceCurrent({ episodeId, stage, payload, sceneNumber = null, shotIndex = null }) {
+            return beginStage({ episodeId, stage, payload, sceneNumber, shotIndex });
+          }
+
+          async function invalidateAfter({ episodeId, stage, sceneNumber = null, shotIndex = null }) {
+            const idx = STAGE_ORDER[stage];
+            if (idx == null) throw new Error(`[Integrity] Unknown stage ${stage}`);
+            const downstream = STAGES.slice(idx + 1);
+            if (!downstream.length) return;
+            const scopes = [];
+            for (const ds of downstream) {
+              scopes.push(ds);
+            }
+            await db.execute(
+              `UPDATE pipeline_artifacts SET status='invalidated'
+               WHERE episode_id=? AND status='current' AND stage IN (${scopes.map(() => '?').join(',')})
+                 AND (? IS NULL OR scene_number=?)
+                 AND (? IS NULL OR shot_index=?)`,
+              [episodeId, ...scopes, sceneNumber, sceneNumber, shotIndex, shotIndex]
+            );
+          }
+
+          async function createCheckpoint({ episodeId, stage, sceneNumber = null, shotIndex = null, checkpointKey, artifactId = null, metadata = {} }) {
+            const id = uuidv4();
+            await db.execute(
+              `INSERT INTO production_checkpoints
+                (id, episode_id, checkpoint_key, stage, scene_number, shot_index, artifact_id, metadata, status)
+               VALUES (?,?,?,?,?,?,?,?,'current')`,
+              [id, episodeId, checkpointKey || `${stage}:${sceneNumber ?? '-'}:${shotIndex ?? '-'}`, stage, sceneNumber, shotIndex, artifactId, JSON.stringify(metadata)]
+            );
+            return db.queryOne(`SELECT * FROM production_checkpoints WHERE id=?`, [id]);
+          }
+
+          async function listCheckpoints(episodeId) {
+            return db.query(`SELECT * FROM production_checkpoints WHERE episode_id=? ORDER BY created_at DESC`, [episodeId]);
+          }
+
+          async function rollbackToCheckpoint(checkpointId) {
+            return db.transaction(async conn => {
+              const [rows] = await conn.execute(`SELECT * FROM production_checkpoints WHERE id=? FOR UPDATE`, [checkpointId]);
+              const cp = rows[0];
+              if (!cp) throw new Error('Checkpoint not found');
+              const idx = STAGE_ORDER[cp.stage];
+              if (idx == null) throw new Error(`Unknown checkpoint stage ${cp.stage}`);
+
+              const downstream = STAGES.slice(idx + 1);
+              if (downstream.length) {
+                await conn.execute(
+                  `UPDATE pipeline_artifacts SET status='rolled_back'
+                   WHERE episode_id=? AND status='current' AND stage IN (${downstream.map(() => '?').join(',')})
+                     AND (? IS NULL OR scene_number>=?)`,
+                  [cp.episode_id, ...downstream, cp.scene_number, cp.scene_number]
+                );
+              }
+
+              await conn.execute(`UPDATE production_checkpoints SET status='history' WHERE episode_id=? AND created_at>?`, [cp.episode_id, cp.created_at]);
+              await conn.execute(`UPDATE production_checkpoints SET status='current' WHERE id=?`, [checkpointId]);
+
+              if (idx < STAGE_ORDER.scene_shot_writing) {
+                await conn.execute(`DELETE FROM shots WHERE episode_id=?`, [cp.episode_id]);
+                await conn.execute(`UPDATE episodes SET shot_count=0, shot_state=NULL, scene_state=NULL, video_url=NULL, ready_at=NULL WHERE id=?`, [cp.episode_id]);
+              } else if (idx < STAGE_ORDER.media_generation) {
+                if (cp.scene_number == null) await conn.execute(`DELETE FROM shots WHERE episode_id=?`, [cp.episode_id]);
+                else await conn.execute(`DELETE FROM shots WHERE episode_id=? AND scene_number>=?`, [cp.episode_id, cp.scene_number]);
+                await conn.execute(`UPDATE episodes SET video_url=NULL, ready_at=NULL WHERE id=?`, [cp.episode_id]);
+              } else if (idx < STAGE_ORDER.episode_compile) {
+                await conn.execute(`UPDATE episodes SET video_url=NULL, ready_at=NULL WHERE id=?`, [cp.episode_id]);
+              }
+
+              return { ok:true, checkpoint:cp, resume_stage:cp.stage, resume_scene:cp.scene_number, resume_shot:cp.shot_index };
+            });
+          }
+
+          async function backfillLegacyCheckpoints(episodeId) {
+            const ep = await db.queryOne(`SELECT * FROM episodes WHERE id=?`, [episodeId]);
+            if (!ep) throw new Error('Episode not found');
+            const existing = await db.queryOne(`SELECT id FROM production_checkpoints WHERE episode_id=? LIMIT 1`, [episodeId]);
+            if (existing) return { created: false };
+
+            const script = typeof ep.script === 'string' ? (() => { try { return JSON.parse(ep.script); } catch { return {}; } })() : (ep.script || {});
+            const sceneCount = Array.isArray(script.scenes) ? script.scenes.length : Number(ep.scene_count || 0);
+            const shotCount = Number(ep.shot_count || 0);
+            let count = 0;
+            if (sceneCount > 0 || ep.status !== 'pending') {
+              await createCheckpoint({ episodeId, stage:'episode_blueprint', checkpointKey:'legacy:episode_blueprint', metadata:{ source:'legacy-backfill', scene_count:sceneCount } });
+              count++;
+            }
+            for (let scene=1; scene<=sceneCount; scene++) {
+              await createCheckpoint({ episodeId, stage:'scene_simulation', sceneNumber:scene, checkpointKey:`legacy:scene:${scene}`, metadata:{ source:'legacy-backfill' } });
+              count++;
+            }
+            const sceneState = typeof ep.scene_state === 'string' ? (() => { try { return JSON.parse(ep.scene_state); } catch { return {}; } })() : (ep.scene_state || {});
+            if (shotCount > 0) {
+              await createCheckpoint({ episodeId, stage:'scene_shot_writing', checkpointKey:'legacy:scene_shot_writing', metadata:{ source:'legacy-backfill', shot_count:shotCount, scene_state:sceneState } });
+              count++;
+            }
+            if (ep.video_url || ep.ready_at) {
+              await createCheckpoint({ episodeId, stage:'episode_compile', checkpointKey:'legacy:episode_compile', metadata:{ source:'legacy-backfill', video_url:ep.video_url || null } });
+              count++;
+            }
+            return { created:true, count };
+          }
+
+          module.exports = { STAGES, ensureSchema, current, beginStage, replaceCurrent, invalidateAfter, createCheckpoint, listCheckpoints, rollbackToCheckpoint, backfillLegacyCheckpoints };
+          '''
+          # normalize escaped leading quote from raw literal
+          replacement = replacement.replace("\\'use strict\\';", "'use strict';")
+          p.write_text(replacement, encoding='utf-8')
+
+          # 2) Add startup schema + legacy backfill.
+          dbp = root / 'src' / 'db.js'
+          ds = dbp.read_text(encoding='utf-8')
+          marker = "console.log('[DB] Schema ready.');"
+          if marker in ds and "pipelineIntegrity" not in ds:
+              ds = ds.replace(marker, marker + "\n  const pipelineIntegrity = require('./pipelineIntegrity');\n  await pipelineIntegrity.ensureSchema();\n  const legacyEpisodes = await query(`SELECT id FROM episodes`);\n  for (const row of legacyEpisodes) { try { await pipelineIntegrity.backfillLegacyCheckpoints(row.id); } catch (e) { console.warn(`[DB] Legacy checkpoint backfill failed for ${row.id}: ${e.message}`); } }")
+              dbp.write_text(ds, encoding='utf-8')
+
+          # 3) Add semantic selector as a source module consumed by pipeline.
+          sp = root / 'src' / 'characterReferenceSelector.js'
+          if not sp.exists():
+              sp.write_text("""'use strict';\n\nfunction normalize(value='') { return String(value).toLowerCase().replace(/[_-]+/g,' ').replace(/\\s+/g,' ').trim(); }\n\nfunction chooseAngle({ shot = {}, framing = '', action = '', pose = '', facing = '', eyeline = '', characters = [] } = {}) {\n  const text = normalize([framing, action, pose, facing, eyeline, shot.shot_type, shot.focal_length_hint, shot.pose_state].join(' '));\n  const score = { front:0, three_quarter:0, profile:0, full_body:0 };\n  if (/profile|side profile|side view|silhouette/.test(text)) score.profile += 8;\n  if (/full body|full-length|wide shot|xws|ws|walking|running|standing|fighting/.test(text)) score.full_body += 7;\n  if (/three-quarter|three quarter|over shoulder|ots|45 degree|turned away|reaching|looking back/.test(text)) score.three_quarter += 6;\n  if (/close-up|extreme close|ecu|cu|face|eyes|expression|eyeline|portrait/.test(text)) score.front += 7;\n  if (/front-facing|direct to camera|straight on/.test(text)) score.front += 4;\n  const angle = Object.entries(score).sort((a,b)=>b[1]-a[1])[0][0];\n  return { angle, scores:score, reason:`semantic match for ${text || 'default shot framing'}` };\n}\n\nfunction selectReference(character, shot) {\n  const urls = Array.isArray(character?.reference_image_urls) ? character.reference_image_urls : [];\n  if (!urls.length) return null;\n  const labels = ['front','three_quarter','profile','full_body'];\n  const choice = chooseAngle({ shot, framing:shot?.shot_type || shot?.focal_length_hint, action:shot?.subject_motion || shot?.dialogue_or_action, pose:shot?.pose_state, facing:shot?.character_staging?.[0]?.facing_toward, eyeline:shot?.character_staging?.[0]?.eyeline });\n  const index = Math.max(0, Math.min(urls.length - 1, labels.indexOf(choice.angle)));\n  return { url:urls[index], angle:labels[index] || 'front', reason:choice.reason };\n}\n\nfunction selectReferences(characters, shot) {\n  return (Array.isArray(characters)?characters:[]).map(character => ({ character, reference:selectReference(character, shot) })).filter(x=>x.reference?.url);\n}\n\nmodule.exports = { chooseAngle, selectReference, selectReferences };\n""", encoding='utf-8')
+
+          # 4) Add checkpoint route page to the existing dashboard navigation without replacing dashboard.
+          ip = root / 'index.js'
+          ins = ip.read_text(encoding='utf-8')
+          if "pipelineIntegrity" not in ins:
+              ins = ins.replace("const { safeJsonParse } = require('./src/util');", "const { safeJsonParse } = require('./src/util');\nconst pipelineIntegrity = require('./src/pipelineIntegrity');")
+          route_marker = "app.get('/dashboard', (req, res) => res.sendFile(path.join(__dirname, 'views', 'dashboard.html')));"
+          if route_marker in ins and "app.get('/checkpoints'" not in ins:
+              ins = ins.replace(route_marker, route_marker + "\napp.get('/checkpoints', (req, res) => res.sendFile(path.join(__dirname, 'views', 'checkpoints.html')));")
+          api_marker = "app.get('/api/status', (req, res) => {"
+          if api_marker in ins and "app.get('/api/checkpoints'" not in ins:
+              block = """
+          app.get('/api/checkpoints', async (req, res) => {
+            try {
+              const episodeId = String(req.query.episode_id || '').trim();
+              if (!episodeId) return res.status(400).json({ ok:false, error:'episode_id required' });
+              const rows = await pipelineIntegrity.listCheckpoints(episodeId);
+              res.json({ ok:true, checkpoints:rows });
+            } catch (e) { res.status(500).json({ ok:false, error:e.message }); }
+          });
+
+          app.post('/api/checkpoints/backfill', async (req, res) => {
+            try {
+              const result = await pipelineIntegrity.backfillLegacyCheckpoints(String(req.body?.episode_id || '').trim());
+              res.json({ ok:true, ...result });
+            } catch (e) { res.status(500).json({ ok:false, error:e.message }); }
+          });
+
+          app.post('/api/checkpoints/rollback', async (req, res) => {
+            try {
+              const result = await pipelineIntegrity.rollbackToCheckpoint(String(req.body?.checkpoint_id || '').trim());
+              res.json(result);
+            } catch (e) { res.status(500).json({ ok:false, error:e.message }); }
+          });
+
+          """
+              ins = ins.replace(api_marker, block + api_marker)
+          ip.write_text(ins, encoding='utf-8')
+
+          # 5) Add a dedicated checkpoint control panel page.
+          cp = root / 'views' / 'checkpoints.html'
+          if not cp.exists():
+              cp.write_text("""<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>StreamVerse Checkpoints</title><style>body{font-family:system-ui;background:#0a0c10;color:#e2e8f0;margin:0;padding:24px}button,select{background:#12161e;color:#e2e8f0;border:1px solid #334155;border-radius:6px;padding:8px 12px}.danger{background:#7f1d1d}.row{border:1px solid #1e293b;padding:12px;margin:8px 0;border-radius:8px}.muted{color:#94a3b8}</style></head><body><h1>Production Checkpoints</h1><p class='muted'>Select an episode, inspect durable checkpoints, and rollback. Rollback invalidates downstream truth and removes downstream materialized progress.</p><div><input id='episode' placeholder='Episode UUID' style='width:360px;padding:8px;background:#12161e;color:#fff;border:1px solid #334155'><button onclick='load()'>Load</button><button onclick='backfill()'>Backfill Legacy</button></div><div id='list' style='margin-top:16px'></div><script>async function load(){const id=document.getElementById('episode').value.trim();const r=await fetch('/api/checkpoints?episode_id='+encodeURIComponent(id));const d=await r.json();const el=document.getElementById('list');el.innerHTML=(d.checkpoints||[]).map(c=>`<div class='row'><b>${c.stage}</b> — scene ${c.scene_number??'-'} shot ${c.shot_index??'-'}<div class='muted'>${new Date(c.created_at).toLocaleString()} · ${c.status}</div><button class='danger' onclick="rollback('${c.id}')">Rollback here</button></div>`).join('')}</script><script>async function rollback(id){if(!confirm('Rollback here? All downstream generated work will be deleted/inactivated.'))return;const r=await fetch('/api/checkpoints/rollback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({checkpoint_id:id})});const d=await r.json();alert(JSON.stringify(d));load()}async function backfill(){const id=document.getElementById('episode').value.trim();const r=await fetch('/api/checkpoints/backfill',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({episode_id:id})});const d=await r.json();alert(JSON.stringify(d));load()}</script></body></html>""", encoding='utf-8')
+
+          # 6) Add strict stage-truth notes to the writer and stop accepting stale shot simulation as an input source.
+          sw = root / 'src' / 'scriptWriter.js'
+          ws = sw.read_text(encoding='utf-8')
+          ws = ws.replace("LOCKED SHOT SIMULATION — DO NOT CONTRADICT", "CURRENT STAGE INPUT — THIS IS THE ONLY ACTIVE TRUTH FOR THIS STAGE")
+          ws = ws.replace("Use this as the causal blueprint for every shot in this scene. Preserve its start/end states, handoffs, character changes, dialogue intent, and order.", "Treat this artifact as the complete current truth for this stage. Do not merge it with prior shot simulations, prior scene versions, or stale checkpoint data.")
+          # Prevent episode-global index carry-over from ever becoming active truth.
+          ws = ws.replace("const expectedIndex = shotPos + 1;", "const expectedIndex = shotPos + 1;")
+          ws = ws.replace("const simulatedSceneShots = (shotSimulation?.shots || [])", "const simulatedSceneShots = (shotSimulation?.shots || [])")
+          sw.write_text(ws, encoding='utf-8')
+
+          # 7) Add source-level reference selector import; actual call-sites are added where reference URLs are assembled.
+          pp = root / 'src' / 'pipeline.js'
+          ps = pp.read_text(encoding='utf-8')
+          if "characterReferenceSelector" not in ps:
+              ps = ps.replace("const shotStaging         = require('./shotStaging');", "const shotStaging         = require('./shotStaging');\nconst characterReferenceSelector = require('./characterReferenceSelector');")
+          pp.write_text(ps, encoding='utf-8')
+
+          # 8) Add dashboard tab link if navigation/header exists, without reconstructing the file.
+          vp = root / 'views' / 'dashboard.html'
+          if vp.exists():
+              vs = vp.read_text(encoding='utf-8')
+              if '/checkpoints' not in vs:
+                  vs = vs.replace('</header>', '<a href="/checkpoints" style="margin-left:12px;color:#06b6d4;text-decoration:none">Checkpoints</a></header>', 1)
+                  vp.write_text(vs, encoding='utf-8')
+
+      - name: Validate source
+        run: |
+          node --check src/pipelineIntegrity.js
+          node --check src/characterReferenceSelector.js
+          node --check src/scriptWriter.js
+          node --check src/pipeline.js
+          node --check index.js
+
+      - name: Commit source migration
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src db.js index.js views .github/workflows/apply-stage-truth-and-checkpoints.yml
+          if git diff --cached --quiet; then
+            echo 'No source changes to commit.'
+            exit 0
+          fi
+          git commit -m 'Enforce sequential stage truth and checkpoint rollback'
+          git push
+
+      - name: Remove one-shot workflow
+        run: |
+          git rm .github/workflows/apply-stage-truth-and-checkpoints.yml || true
+          git commit -m 'Remove completed source migration workflow' || true
+          git push || true
