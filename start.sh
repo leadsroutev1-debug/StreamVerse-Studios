@@ -43,15 +43,13 @@ done
 
 echo "[start.sh] Applying idempotent LTX/movie pipeline contracts..."
 node src/ensureLtxPipelineContracts.js
-
 echo "[start.sh] Applying scene transition contract..."
 node src/ensureSceneTransitionContract.js
-
 echo "[start.sh] Applying scene fade/master cut editing contract..."
 node src/ensureSceneEditContract.js
-
+echo "[start.sh] Applying shot-ID integrity contract..."
+node src/ensureShotIdIntegrityContract.js
 echo "[start.sh] Reconciling stale persisted shot rows before backend resume..."
 node src/reconcileShotState.js || true
-
 echo "[start.sh] Starting StreamVerse Node backend on port ${PORT:-5000}..."
 exec node index.js
