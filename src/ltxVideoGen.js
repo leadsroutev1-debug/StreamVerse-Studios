@@ -15,6 +15,14 @@
  *   LTX-2.3 image-to-video prompt
  *
  * The prompt engine performs cleanup only. It does not truncate or summarize.
+ *
+ * Dialogue integrity is validated twice:
+ *   1. Inside ltxVisionDirector while authoring the cinematic description.
+ *   2. Here, after prompt preparation and immediately before video submission.
+ *
+ * A dialogue mismatch is a semantic/model-output failure, NOT a provider/API
+ * failure. The vision director owns targeted repair; this layer must not turn
+ * every semantic mismatch into an API-key rotation.
  * ============================================================================
  */
 
@@ -40,17 +48,28 @@ const HIGH_RES_HEIGHT = 1536;
 const MAX_SEED = 2 ** 31 - 1;
 const MAX_VISION_REPAIR_ATTEMPTS = 3;
 
-function _getPositiveNumber(value, fallback) { const n = Number(value); return Number.isFinite(n) && n > 0 ? n : fallback; }
+function _getPositiveNumber(value, fallback) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
 function _resolveResolution(shotMeta = {}) {
   const configuredWidth = _getPositiveNumber(config.ltxWidth, HIGH_RES_WIDTH);
   const configuredHeight = _getPositiveNumber(config.ltxHeight, HIGH_RES_HEIGHT);
-  return { width: Math.floor(_getPositiveNumber(shotMeta.width, configuredWidth)), height: Math.floor(_getPositiveNumber(shotMeta.height, configuredHeight)) };
+  return {
+    width: Math.floor(_getPositiveNumber(shotMeta.width, configuredWidth)),
+    height: Math.floor(_getPositiveNumber(shotMeta.height, configuredHeight)),
+  };
 }
+
 function _resolveSeed(shotMeta = {}) {
   const suppliedSeed = Number(shotMeta.seed);
-  if (Number.isFinite(suppliedSeed) && suppliedSeed >= 0) return Math.min(MAX_SEED, Math.floor(suppliedSeed));
+  if (Number.isFinite(suppliedSeed) && suppliedSeed >= 0) {
+    return Math.min(MAX_SEED, Math.floor(suppliedSeed));
+  }
   return Math.floor(Math.random() * MAX_SEED);
 }
+
 function _resolveDuration(shotMeta = {}) {
   const minDuration = _getPositiveNumber(config.ltxMinDuration, DEFAULT_MIN_DURATION);
   const maxDuration = Math.max(minDuration, _getPositiveNumber(config.ltxMaxDuration, DEFAULT_MAX_DURATION));
@@ -58,17 +77,54 @@ function _resolveDuration(shotMeta = {}) {
   const duration = Number.isFinite(requested) ? requested : minDuration;
   return Math.min(maxDuration, Math.max(minDuration, duration));
 }
+
 function _quotedDialogue(text) {
   return [...String(text || '').matchAll(/"([^"]+)"|“([^”]+)”/g)]
     .map(match => (match[1] || match[2] || '').trim())
     .filter(Boolean);
 }
+
 function _normalizeDialogue(text) {
-  return String(text || '').replace(/[“”]/g, '"').replace(/\s+/g, ' ').trim();
+  return String(text || '')
+    .replace(/[“”]/g, '"')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function _validateAuthoredDialogue(sourceLines, prompt) {
+  const normalizedSource = sourceLines.map(_normalizeDialogue);
+  if (!normalizedSource.length) {
+    return { valid: true, missingLines: [], outputLines: _quotedDialogue(prompt) };
+  }
+
+  const outputLines = _quotedDialogue(prompt);
+  const normalizedOutput = outputLines.map(_normalizeDialogue);
+  const missingLines = normalizedSource.filter(line => !normalizedOutput.includes(line));
+
+  // Exact order check. Presence alone is not sufficient because authored
+  // dialogue is immutable source material and must remain in story order.
+  let cursor = 0;
+  const outOfOrder = [];
+  for (const required of normalizedSource) {
+    const index = normalizedOutput.indexOf(required, cursor);
+    if (index === -1) continue;
+    if (index !== cursor) outOfOrder.push(required);
+    cursor = index + 1;
+  }
+
+  return {
+    valid: missingLines.length === 0 && outOfOrder.length === 0,
+    missingLines,
+    outOfOrder,
+    outputLines,
+  };
 }
 
 async function _resolvePrompt(imageBuffer, shotMeta) {
-  const override = typeof shotMeta._ltxPromptOverride === 'string' ? shotMeta._ltxPromptOverride.trim() : '';
+  const override = typeof shotMeta._ltxPromptOverride === 'string'
+    ? shotMeta._ltxPromptOverride.trim()
+    : '';
+
   if (override) {
     console.log('[LTXVideoGen] Using explicit human-edited LTX prompt override; vision director bypassed for this regeneration.');
     return ltxPromptEngine.prepareImageToVideoPrompt(override);
@@ -88,11 +144,13 @@ async function _resolvePrompt(imageBuffer, shotMeta) {
     }
   }
 
+  // The vision director owns semantic repair. The outer loop remains only as
+  // a bounded recovery layer for provider/transient failures in the director.
   let repairInstruction = '';
+
   for (let visionAttempt = 1; visionAttempt <= MAX_VISION_REPAIR_ATTEMPTS; visionAttempt++) {
-    let description;
     try {
-      description = await ltxVisionDirector.describeForLTX({
+      const description = await ltxVisionDirector.describeForLTX({
         imageBuffer,
         imageMime: visionContext.imageMime || 'image/png',
         shot: visionShot,
@@ -100,52 +158,76 @@ async function _resolvePrompt(imageBuffer, shotMeta) {
         characters: visionContext.characters || [],
         repairInstruction,
       });
+
+      const finalPrompt = ltxPromptEngine.prepareImageToVideoPrompt(description);
+      const validation = _validateAuthoredDialogue(sourceLines, finalPrompt);
+
+      console.log(
+        `[LTXVideoGen] Vision-authored LTX prompt generated ` +
+        `(attempt=${visionAttempt} ` +
+        `words=${finalPrompt.split(/\s+/).filter(Boolean).length} ` +
+        `quotedDialogue=${validation.outputLines.length}/${sourceLines.length} ` +
+        `preserved=${sourceLines.length - validation.missingLines.length}/${sourceLines.length}).`
+      );
+
+      if (validation.valid) return finalPrompt;
+
+      // This should normally be unreachable because ltxVisionDirector performs
+      // the same semantic validation before returning. Keep the final boundary
+      // defensive, but do not ask the provider-key retry loop to repair it.
+      const missingText = validation.missingLines.map(line => `"${line}"`).join('; ');
+      const orderText = validation.outOfOrder?.length
+        ? ` Dialogue order drift detected for: ${validation.outOfOrder.map(line => `"${line}"`).join('; ')}.`
+        : '';
+
+      throw new LTXGenerationError(
+        `[LTXVideoGen] Vision director returned a prompt that failed final authored-dialogue integrity. ` +
+        `Missing exact line(s): ${missingText || 'none'}.${orderText}`
+      );
     } catch (err) {
+      // Do NOT reinterpret a semantic dialogue failure as a reason to mutate
+      // provider keys. The director already owns targeted dialogue repair.
+      if (err instanceof LTXGenerationError) throw err;
+
       if (visionAttempt >= MAX_VISION_REPAIR_ATTEMPTS) throw err;
-      repairInstruction = `The previous vision attempt failed. Re-inspect the supplied final still and regenerate the complete cinematic LTX description. Preserve all authored dialogue and character staging. Failure: ${err.message}`;
-      console.warn(`[LTXVideoGen] Vision attempt ${visionAttempt}/${MAX_VISION_REPAIR_ATTEMPTS} failed; requesting repair from vision director: ${err.message}`);
-      continue;
+
+      repairInstruction = [
+        'The previous vision request failed before producing an acceptable result.',
+        'Re-inspect the supplied final still and regenerate the complete cinematic LTX description.',
+        'Preserve all authored dialogue and character staging.',
+        `Failure detail: ${err.message}`,
+      ].join(' ');
+
+      console.warn(
+        `[LTXVideoGen] Vision provider/transient attempt ${visionAttempt}/${MAX_VISION_REPAIR_ATTEMPTS} failed; ` +
+        `requesting another vision-authoring attempt: ${err.message}`
+      );
     }
-
-    const finalPrompt = ltxPromptEngine.prepareImageToVideoPrompt(description);
-    const outputLines = _quotedDialogue(finalPrompt);
-    const outputNormalized = outputLines.map(_normalizeDialogue);
-    const missingLines = sourceLines
-      .map(_normalizeDialogue)
-      .filter(line => !outputNormalized.includes(line));
-
-    console.log(`[LTXVideoGen] Vision-authored LTX prompt generated (attempt=${visionAttempt} words=${finalPrompt.split(/\s+/).filter(Boolean).length}, quotedDialogue=${outputLines.length}/${sourceLines.length}, preserved=${sourceLines.length - missingLines.length}/${sourceLines.length}).`);
-
-    if (!missingLines.length) return finalPrompt;
-
-    const missingText = missingLines.map(line => `"${line}"`).join('; ');
-    if (visionAttempt >= MAX_VISION_REPAIR_ATTEMPTS) {
-      throw new LTXGenerationError(`[LTXVideoGen] Vision director could not preserve authored dialogue after ${MAX_VISION_REPAIR_ATTEMPTS} attempts. Missing exact line(s): ${missingText}`);
-    }
-
-    repairInstruction = [
-      'CRITICAL REPAIR REQUIRED.',
-      `The authored shot contains exact dialogue that must survive unchanged. The previous vision response omitted or altered these required lines: ${missingText}`,
-      'Regenerate the entire cinematic description from the supplied still.',
-      'Preserve every required line verbatim inside quotation marks.',
-      'Identify the speaker, their screen position, delivery, listener reaction, pause, and next turn in chronological order.',
-      'Do not summarize, paraphrase, shorten, translate, or replace the dialogue with descriptions such as "speaks" or "responds".',
-    ].join(' ');
-    console.warn(`[LTXVideoGen] Vision director dropped authored dialogue; retrying vision attempt ${visionAttempt + 1}/${MAX_VISION_REPAIR_ATTEMPTS}. Missing=${missingText}`);
   }
 
   throw new LTXGenerationError('[LTXVideoGen] Vision prompt resolution exhausted unexpectedly.');
 }
 
 async function submitVideoJob(imageBuffer, shotMeta = {}) {
-  if (!Buffer.isBuffer(imageBuffer) || imageBuffer.length === 0) throw new LTXGenerationError('[LTXVideoGen] submitVideoJob received an empty image buffer.');
+  if (!Buffer.isBuffer(imageBuffer) || imageBuffer.length === 0) {
+    throw new LTXGenerationError('[LTXVideoGen] submitVideoJob received an empty image buffer.');
+  }
 
   let prompt;
-  try { prompt = await _resolvePrompt(imageBuffer, shotMeta); }
-  catch (err) { throw err instanceof LTXGenerationError ? err : new LTXGenerationError(`[LTXVideoGen] Failed to author LTX image-to-video prompt: ${err.message}`); }
+  try {
+    prompt = await _resolvePrompt(imageBuffer, shotMeta);
+  } catch (err) {
+    throw err instanceof LTXGenerationError
+      ? err
+      : new LTXGenerationError(`[LTXVideoGen] Failed to author LTX image-to-video prompt: ${err.message}`);
+  }
 
   const validation = ltxPromptEngine.validateImageToVideoPrompt(prompt);
-  if (!validation.valid) throw new LTXGenerationError(`[LTXVideoGen] LTX prompt contract violation: ${validation.violations.join(', ')}`);
+  if (!validation.valid) {
+    throw new LTXGenerationError(
+      `[LTXVideoGen] LTX prompt contract violation: ${validation.violations.join(', ')}`
+    );
+  }
 
   const duration = _resolveDuration(shotMeta);
   const { width, height } = _resolveResolution(shotMeta);
@@ -154,12 +236,28 @@ async function submitVideoJob(imageBuffer, shotMeta = {}) {
   const enhancePrompt = false;
 
   try {
-    const { jobId } = await videoEngineClient.submitJob({ provider: 'ltx', imageBuffer, prompt, duration, width, height, seed, randomizeSeed, enhancePrompt });
+    const { jobId } = await videoEngineClient.submitJob({
+      provider: 'ltx',
+      imageBuffer,
+      prompt,
+      duration,
+      width,
+      height,
+      seed,
+      randomizeSeed,
+      enhancePrompt,
+    });
     return { jobId, apiKey: 'video-engine-managed' };
   } catch (err) {
     const status = err.response?.status;
-    if (status === 401) throw new LTXGenerationError(`[LTXVideoGen] Video engine rejected the internal request (401): ${err.message}`);
-    throw new LTXGenerationError(`[LTXVideoGen] Failed to submit job to video engine: ${err.message}`);
+    if (status === 401) {
+      throw new LTXGenerationError(
+        `[LTXVideoGen] Video engine rejected the internal request (401): ${err.message}`
+      );
+    }
+    throw new LTXGenerationError(
+      `[LTXVideoGen] Failed to submit job to video engine: ${err.message}`
+    );
   }
 }
 
@@ -174,8 +272,16 @@ async function pollVideoJob(jobId, _apiKey) {
     if (err.message?.includes('did not complete after')) throw new LTXTransientPollError(err.message);
     throw new LTXGenerationError(err.message);
   }
-  if (!job.video_url) throw new LTXGenerationError(`[LTXVideoGen] Job ${jobId} completed with no video_url.`);
+  if (!job.video_url) {
+    throw new LTXGenerationError(`[LTXVideoGen] Job ${jobId} completed with no video_url.`);
+  }
   return job.video_url;
 }
 
-module.exports = { submitVideoJob, pollVideoJob, LTXQuotaExhaustedError, LTXGenerationError, LTXTransientPollError };
+module.exports = {
+  submitVideoJob,
+  pollVideoJob,
+  LTXQuotaExhaustedError,
+  LTXGenerationError,
+  LTXTransientPollError,
+};
