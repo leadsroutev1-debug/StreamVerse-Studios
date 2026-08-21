@@ -8,6 +8,7 @@
  */
 
 const db = require('./db');
+const { v4: uuidv4 } = require('uuid');
 
 const STAGES = Object.freeze([
   'season_blueprint',
@@ -55,10 +56,23 @@ async function ensureSchema() {
       status ENUM('active','rolled_back','superseded') NOT NULL DEFAULT 'active',
       metadata JSON NULL,
       created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE KEY uq_episode_checkpoint (episode_id, checkpoint_key),
-      INDEX idx_checkpoint_episode (episode_id, created_at)
+      INDEX idx_checkpoint_episode (episode_id, created_at),
+      INDEX idx_checkpoint_key (episode_id, checkpoint_key)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-  `);
+  `).catch(async err => {
+    // Existing installations created the old UNIQUE(ep, checkpoint_key) index.
+    // Remove it so each real persisted checkpoint is retained as history.
+    const msg = String(err?.message || '').toLowerCase();
+    if (!msg.includes('duplicate') && !msg.includes('already exists')) throw err;
+  });
+
+  // Migrate the original schema's unique checkpoint key into a normal index.
+  try {
+    await db.execute(`ALTER TABLE production_checkpoints DROP INDEX uq_episode_checkpoint`);
+  } catch (_) {}
+  try {
+    await db.execute(`ALTER TABLE production_checkpoints ADD INDEX idx_checkpoint_key (episode_id, checkpoint_key)`);
+  } catch (_) {}
 }
 
 async function latest(episodeId, stage, sceneNumber = null, shotIndex = null) {
@@ -79,7 +93,7 @@ async function writeArtifact({ episodeId, stage, payload, sceneNumber = null, sh
     await db.execute(`UPDATE pipeline_artifacts SET status='superseded' WHERE id=?`, [previous.id]);
   }
   const revision = `${stage}:${_token()}`;
-  const id = require('uuid').v4();
+  const id = uuidv4();
   await db.execute(
     `INSERT INTO pipeline_artifacts
       (id, episode_id, scene_number, shot_index, stage, revision, parent_stage, parent_revision, payload, status)
@@ -112,26 +126,101 @@ async function invalidateDownstream(episodeId, stage, sceneNumber = null, shotIn
 }
 
 async function createCheckpoint({ episodeId, checkpointKey, stage, sceneNumber = null, shotIndex = null, artifactRevision = null, metadata = {} }) {
-  const id = require('uuid').v4();
+  const id = uuidv4();
   await db.execute(
     `INSERT INTO production_checkpoints
       (id, episode_id, checkpoint_key, stage, scene_number, shot_index, artifact_revision, status, metadata)
-     VALUES (?,?,?,?,?,?,?,'active',?)
-     ON DUPLICATE KEY UPDATE stage=VALUES(stage), scene_number=VALUES(scene_number), shot_index=VALUES(shot_index), artifact_revision=VALUES(artifact_revision), status='active', metadata=VALUES(metadata)`,
+     VALUES (?,?,?,?,?,?,?,'active',?)`,
     [id, episodeId, checkpointKey, stage, sceneNumber, shotIndex, artifactRevision, JSON.stringify(metadata)]
   );
-  return db.queryOne(`SELECT * FROM production_checkpoints WHERE episode_id=? AND checkpoint_key=?`, [episodeId, checkpointKey]);
+  return db.queryOne(`SELECT * FROM production_checkpoints WHERE id=?`, [id]);
 }
 
+/**
+ * Complete durable checkpoint history.
+ *
+ * A checkpoint is not merely the latest state of a stage. Every persisted
+ * artifact revision and every explicit checkpoint event is part of the
+ * rollback history, including scene/shot-specific revisions.
+ */
 async function listCheckpoints(episodeId) {
-  return db.query(`SELECT * FROM production_checkpoints WHERE episode_id=? ORDER BY created_at DESC`, [episodeId]);
+  await ensureSchema();
+
+  const checkpoints = await db.query(
+    `SELECT
+       id,
+       episode_id,
+       checkpoint_key,
+       stage,
+       scene_number,
+       shot_index,
+       artifact_revision,
+       status,
+       metadata,
+       created_at,
+       'checkpoint' AS source_type,
+       id AS source_id
+     FROM production_checkpoints
+    WHERE episode_id=?`,
+    [episodeId]
+  );
+
+  const artifacts = await db.query(
+    `SELECT
+       id,
+       episode_id,
+       CONCAT('artifact:', stage, ':', revision) AS checkpoint_key,
+       stage,
+       scene_number,
+       shot_index,
+       revision AS artifact_revision,
+       status,
+       payload AS metadata,
+       created_at,
+       'artifact' AS source_type,
+       id AS source_id
+     FROM pipeline_artifacts
+    WHERE episode_id=?
+    ORDER BY created_at DESC`,
+    [episodeId]
+  );
+
+  return [...checkpoints, ...artifacts].sort((a, b) => {
+    const at = new Date(a.created_at || 0).getTime();
+    const bt = new Date(b.created_at || 0).getTime();
+    return bt - at;
+  });
 }
 
 async function rollbackToCheckpoint(checkpointId) {
   return db.transaction(async conn => {
-    const [rows] = await conn.execute(`SELECT * FROM production_checkpoints WHERE id=? FOR UPDATE`, [checkpointId]);
-    const cp = rows[0];
-    if (!cp) throw new Error('Checkpoint not found');
+    let cp;
+    let sourceType = 'checkpoint';
+
+    let [rows] = await conn.execute(`SELECT * FROM production_checkpoints WHERE id=? FOR UPDATE`, [checkpointId]);
+    if (rows[0]) {
+      cp = { ...rows[0], source_type: 'checkpoint' };
+    } else {
+      [rows] = await conn.execute(`SELECT * FROM pipeline_artifacts WHERE id=? FOR UPDATE`, [checkpointId]);
+      if (rows[0]) {
+        sourceType = 'artifact';
+        cp = {
+          id: rows[0].id,
+          episode_id: rows[0].episode_id,
+          checkpoint_key: `artifact:${rows[0].stage}:${rows[0].revision}`,
+          stage: rows[0].stage,
+          scene_number: rows[0].scene_number,
+          shot_index: rows[0].shot_index,
+          artifact_revision: rows[0].revision,
+          status: rows[0].status,
+          metadata: rows[0].payload,
+          created_at: rows[0].created_at,
+          source_type: 'artifact',
+        };
+      }
+    }
+
+    if (!cp) throw new Error('Checkpoint or persisted artifact not found');
 
     const stageIndex = STAGES.indexOf(cp.stage);
     if (stageIndex < 0) throw new Error(`Unknown checkpoint stage ${cp.stage}`);
@@ -146,10 +235,15 @@ async function rollbackToCheckpoint(checkpointId) {
     }
 
     await conn.execute(`UPDATE production_checkpoints SET status='rolled_back' WHERE episode_id=? AND created_at>?`, [cp.episode_id, cp.created_at]);
-    await conn.execute(`UPDATE production_checkpoints SET status='active' WHERE id=?`, [checkpointId]);
 
-    // Remove downstream materialized shot/media rows so the checkpoint becomes
-    // the actual resume boundary rather than merely a label in the UI.
+    if (sourceType === 'checkpoint') {
+      await conn.execute(`UPDATE production_checkpoints SET status='active' WHERE id=?`, [checkpointId]);
+    } else {
+      await conn.execute(`UPDATE pipeline_artifacts SET status='active' WHERE id=?`, [checkpointId]);
+    }
+
+    // Remove downstream materialized shot/media rows so the selected revision
+    // becomes the actual resume boundary rather than merely a dashboard label.
     if (stageIndex < STAGES.indexOf('scene_shot_writing')) {
       await conn.execute(`DELETE FROM shots WHERE episode_id=?`, [cp.episode_id]);
       await conn.execute(`UPDATE episodes SET shot_count=0, shot_state=NULL, scene_state=NULL, video_url=NULL, ready_at=NULL WHERE id=?`, [cp.episode_id]);
@@ -164,7 +258,7 @@ async function rollbackToCheckpoint(checkpointId) {
       await conn.execute(`UPDATE episodes SET video_url=NULL, ready_at=NULL WHERE id=?`, [cp.episode_id]);
     }
 
-    return { ok: true, checkpoint: cp, resumed_from_stage: keepStages[keepStages.length - 1], removed_stages: removeStages };
+    return { ok: true, checkpoint: cp, source_type: sourceType, resumed_from_stage: keepStages[keepStages.length - 1], removed_stages: removeStages };
   });
 }
 
