@@ -5,7 +5,7 @@
   "main": "index.js",
   "scripts": {
     "start": "bash start.sh",
-    "start:node": "node src/ensureLtxPipelineContracts.js && node src/ensureSceneTransitionContract.js && node index.js",
+    "start:node": "node src/ensureLtxPipelineContracts.js && node src/ensureSceneTransitionContract.js && node src/ensureSceneEditContract.js && node index.js",
     "start:video": "bash video_engine/run.sh",
     "dev": "vite",
     "build": "vite build"
