@@ -136,11 +136,10 @@ async function describeForLTX({
   ].join(' ');
 
   const sourceLines = _quotedDialogue(intent.dialogue || '');
-  const repairText = repairInstruction
-    ? `A previous attempt needs correction. ${repairInstruction}`
-    : '';
+  let activeRepairInstruction = repairInstruction || '';
+  let previousDescription = '';
 
-  const user = [
+  const buildUser = (extraRepair = '') => [
     'AUTHORITATIVE SHOT INTENT:',
     JSON.stringify(intent),
     'SCENE CONTEXT:',
@@ -154,20 +153,35 @@ async function describeForLTX({
     'DIALOGUE REQUIREMENT:',
     intent.dialogue || intent.conversation_reason
       ? [
-          'This is a conversational shot. Audible speech should be present.',
-          'Use exact supplied dialogue when present.',
-          'For each turn, identify speaker, exact words, delivery, listener response, and turn order.',
+          'THIS IS A CONVERSATIONAL SHOT. SPOKEN WORDS ARE MANDATORY WHEN AUTHORED DIALOGUE IS PRESENT.',
+          'Treat authored dialogue as immutable source material, not optional inspiration.',
+          'Reproduce every supplied exact dialogue line verbatim inside quotation marks.',
+          'Do not summarize, paraphrase, shorten, replace, sanitize, or omit any supplied line.',
           sourceLines.length
-            ? `Required exact lines: ${sourceLines.map(line => `"${line}"`).join(' ')}`
-            : 'No exact lines were supplied; create the natural exchange needed to realize the stated conversational beat without changing the story.',
+            ? `REQUIRED LINES — EACH ONE MUST APPEAR VERBATIM IN THE FINAL OUTPUT: ${sourceLines.map(line => `"${line}"`).join(' ')}`
+            : 'No exact lines were supplied; create only the natural exchange required by the supplied conversational beat.',
+          'Place each spoken line at the moment it is performed, identify the speaker, and describe the listener reaction and next turn around it.',
+          'The final LTX description is incomplete if any required authored line is absent.',
         ].join(' ')
       : 'No dialogue intent is supplied. Keep the shot visually expressive and do not invent consequential dialogue.',
-    repairText,
+    extraRepair ? `REPAIR INSTRUCTION: ${extraRepair}` : '',
+    previousDescription ? `PREVIOUS ATTEMPT TO PRESERVE: ${previousDescription}` : '',
     'Now inspect the attached final still and write the complete cinematic LTX image-to-video description. Favor concrete, observable detail and a clear beginning-to-end progression. Do not return a terse label or summary.',
   ].filter(Boolean).join('\n');
 
-  const content = [
-    { type: 'text', text: user },
+  const buildRepairInstruction = (missingLines) => {
+    if (!missingLines.length) return activeRepairInstruction || '';
+    return [
+      'The previous response omitted authored dialogue that is mandatory for this shot.',
+      `Restore these exact missing line(s) verbatim: ${missingLines.map(line => `"${line}"`).join(' ')}`,
+      'Keep the existing visual action, staging, camera, environment and ending state unless changing them is necessary to naturally place the dialogue.',
+      'Return the COMPLETE rewritten ltx_shot_description, not a patch, summary, explanation, or abbreviated replacement.',
+      'Do not drop any previously supplied dialogue line while fixing the missing ones.',
+    ].join(' ');
+  };
+
+  const makeContent = () => [
+    { type: 'text', text: buildUser(activeRepairInstruction || '') },
     { type: 'image_url', image_url: _imageDataUrl(imageBuffer, imageMime) },
   ];
 
@@ -188,7 +202,7 @@ async function describeForLTX({
           model,
           messages: [
             { role: 'system', content: system },
-            { role: 'user', content },
+            { role: 'user', content: makeContent() },
           ],
           temperature: 0.55,
           response_format: { type: 'json_object' },
@@ -218,11 +232,9 @@ async function describeForLTX({
         .map(_normalizeDialogue)
         .filter(line => !normalizedOutput.includes(line));
 
-      // There is deliberately NO arbitrary word-count / character-count threshold.
-      // The model is instructed to expand the intent into a complete cinematic shot.
-      // The only semantic rejection here is when authored dialogue was required but
-      // the model omitted or changed the exact supplied lines.
       if (missing.length) {
+        previousDescription = description;
+        activeRepairInstruction = buildRepairInstruction(missing);
         throw new Error(
           `[LTXVision] Required authored dialogue missing or altered: ` +
           `${missing.map(line => `"${line}"`).join('; ')}`
