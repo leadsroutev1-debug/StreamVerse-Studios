@@ -3,13 +3,10 @@
 # StreamVerse Studio — combined startup
 # ============================================================================
 # Starts the Python Video Engine (internal, port 8000 by default) as a
-# background sidecar, waits for it to report healthy, then reconciles any
-# stale persisted shot rows against the authoritative episode script before
-# starting the Node application in the FOREGROUND.
-#
-# Using `exec` for the Node process means it becomes PID 1 in this script's
-# place, so Replit's deploy supervisor tracks it directly and only has to
-# watch a single process; the video engine is a child of this shell.
+# background sidecar, waits for it to report healthy, applies the idempotent
+# LTX/movie pipeline contract migration before Node loads src/pipeline.js,
+# reconciles stale persisted shot rows, then starts the Node application in
+# the FOREGROUND.
 # ============================================================================
 set -e
 
@@ -43,6 +40,9 @@ for i in $(seq 1 30); do
     echo "[start.sh] WARNING: video engine did not report healthy after 30s — starting Node anyway."
   fi
 done
+
+echo "[start.sh] Applying idempotent LTX/movie pipeline contracts..."
+node src/ensureLtxPipelineContracts.js
 
 echo "[start.sh] Reconciling stale persisted shot rows before backend resume..."
 node src/reconcileShotState.js || true
