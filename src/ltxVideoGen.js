@@ -62,6 +62,9 @@ function _quotedDialogue(text) {
     .map(match => (match[1] || match[2] || '').trim())
     .filter(Boolean);
 }
+function _normalizeDialogue(text) {
+  return String(text || '').replace(/\s+/g, ' ').trim();
+}
 
 async function _resolvePrompt(imageBuffer, shotMeta) {
   const override = typeof shotMeta._ltxPromptOverride === 'string' ? shotMeta._ltxPromptOverride.trim() : '';
@@ -75,13 +78,14 @@ async function _resolvePrompt(imageBuffer, shotMeta) {
   // prompt to the vision director; never let a stale visionContext.shot field replace it.
   const authoredIntent = typeof shotMeta.videoPrompt === 'string' ? shotMeta.videoPrompt.trim() : '';
   const visionShot = { ...(visionContext.shot || {}) };
+  const sourceLines = _quotedDialogue(authoredIntent);
+
   if (authoredIntent) {
     visionShot.shot_description = authoredIntent;
     visionShot.authored_ltx_intent = authoredIntent;
 
     // A quoted line in the authored Stage-4 prompt is a hard conversational requirement.
     // Make that requirement explicit even when an older/stale vision context lacks dialogue fields.
-    const sourceLines = _quotedDialogue(authoredIntent);
     if (sourceLines.length) {
       visionShot.dialogue = sourceLines.map(line => `"${line}"`).join(' ');
       visionShot.conversation_reason = visionShot.conversation_reason || 'Authored shot contains explicit spoken dialogue; preserve it verbatim.';
@@ -97,12 +101,18 @@ async function _resolvePrompt(imageBuffer, shotMeta) {
   });
 
   const finalPrompt = ltxPromptEngine.prepareImageToVideoPrompt(description);
-  const quotedCount = _quotedDialogue(finalPrompt).length;
-  const sourceQuotedCount = _quotedDialogue(authoredIntent).length;
-  console.log(`[LTXVideoGen] Vision-authored LTX prompt generated (${finalPrompt.split(/\s+/).filter(Boolean).length} words, quotedDialogue=${quotedCount}/${sourceQuotedCount}).`);
-  if (sourceQuotedCount > 0 && quotedCount === 0) {
-    throw new LTXGenerationError('[LTXVideoGen] Vision director returned a prompt that lost the authored dialogue. Refusing to send a silent conversational shot to LTX.');
+  const outputLines = _quotedDialogue(finalPrompt);
+  const outputNormalized = outputLines.map(_normalizeDialogue);
+  const missingLines = sourceLines
+    .map(_normalizeDialogue)
+    .filter(line => !outputNormalized.includes(line));
+
+  console.log(`[LTXVideoGen] Vision-authored LTX prompt generated (${finalPrompt.split(/\s+/).filter(Boolean).length} words, quotedDialogue=${outputLines.length}/${sourceLines.length}, preserved=${sourceLines.length - missingLines.length}/${sourceLines.length}).`);
+
+  if (missingLines.length) {
+    throw new LTXGenerationError(`[LTXVideoGen] Vision director dropped authored dialogue: ${missingLines.length}/${sourceLines.length} exact line(s) missing. Refusing to send a silent/altered conversational shot to LTX.`);
   }
+
   return finalPrompt;
 }
 
