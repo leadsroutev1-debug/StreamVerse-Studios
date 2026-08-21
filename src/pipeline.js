@@ -1481,6 +1481,25 @@ async function _ensureSceneBackground({ episodeId, storyline, globalEpisodeNumbe
   if (episodeId) await db.execute(`UPDATE episodes SET scene_background_state=? WHERE id=?`, [JSON.stringify(savedState), episodeId]);
   return savedState[key];
 }
+function _attachLtxPromptCapture(shot, { episodeId, sceneNumber, shotIndex }) {
+  const base = shot && typeof shot === 'object' ? shot : {};
+  return {
+    ...base,
+    _promptCapture: typeof episodeId === 'string' && episodeId
+      ? async (prompt) => {
+          const exact = typeof prompt === 'string' ? prompt : String(prompt || '');
+          await updateShotRow(episodeId, sceneNumber, shotIndex, {
+            last_prompt: exact,
+          });
+          console.log(
+            `[Pipeline] EXACT LTX PROMPT persisted | S${sceneNumber}/idx${shotIndex} ` +
+            `chars=${exact.length}`
+          );
+        }
+      : null,
+  };
+}
+
 async function generateShot(shot, storyline, characterList, globalEpisodeNumber, onMhSubmitted, prevShot = null, sceneBgImageUrl = null, onImageGenerated = null, reuseImageUrl = null, faceLockRegistry = new Map()) {
   const maxRetries  = config.shotMaxRetries;  // per-attempt retries inside generateShot
   let   lastError;
@@ -1866,6 +1885,7 @@ async function generateShot(shot, storyline, characterList, globalEpisodeNumber,
           // in the dashboard's shot editor, send that literal text instead of
           // rebuilding it — otherwise build it fresh as usual.
           videoPrompt: currentShot._ltxPromptOverride || _buildLtxVideoPrompt(currentShot, storyline, orderedChars, characterPositions, motionParams),
+          _promptCapture: typeof currentShot._promptCapture === 'function' ? currentShot._promptCapture : null,
           lockPrompt:  true,
           width:       config.ltxWidth,
           height:      config.ltxHeight,
@@ -2486,8 +2506,9 @@ async function _runPipeline() {
       ]
     );
 
+    const persistedStage = safeScript.checkpoint_state?.stage || stage;
     console.log(
-      `[Pipeline] 💾 Script checkpoint persisted | stage=${stage}` +
+      `[Pipeline] 💾 Script checkpoint persisted | stage=${persistedStage}` +
       `${sceneNumber != null ? ` scene=${sceneNumber}` : ''}` +
       ` scenes=${sceneCount} shots=${shotCount}`
     );
@@ -2497,31 +2518,42 @@ async function _runPipeline() {
   const loadedScenes = Array.isArray(loadedDraftScript?.scenes) ? loadedDraftScript.scenes : [];
   const loadedCheckpointStage = loadedDraftScript?.checkpoint_state?.stage || null;
   const loadedCheckpointRank = _pipelineCheckpointRank(loadedCheckpointStage);
-  const hasDurableProductionArtifacts = Boolean(loadedDraftScript?.narrative_simulation || loadedDraftScript?.scene_simulation || loadedDraftScript?.shot_simulation || loadedCheckpointRank >= PIPELINE_CHECKPOINT_STAGE_ORDER.blueprint);
-  const resumedIncompleteScript =
-    isResuming && (!hasDurableProductionArtifacts || loadedScenes.length === 0 || loadedScenes.some(scene => !Array.isArray(scene?.shots) || scene.shots.length < Math.max(2, Math.min(5, Number(scene?.shot_count_target) || 3))));
 
-  const sceneIsCompleteForBlueprint = (scene) => {
-    if (!scene) return false;
-    const target = Math.max(2, Math.min(5, Number(scene.shot_count_target) || 3));
-    return Array.isArray(scene.shots) && scene.shots.length === target;
-  };
+  // CHECKPOINT IS THE RESUME CURSOR.
+  // Never infer the current production stage from the number of scenes currently
+  // present in the script. A scene_shot_writing checkpoint can legitimately
+  // contain only the scenes written so far; that is exactly what the next resume
+  // must continue from.
+  const resumeStage = loadedCheckpointStage || null;
+  if (isResuming) {
+    console.log(
+      `[Pipeline] ↺ Resume cursor from persisted checkpoint: stage=${resumeStage || 'none'} ` +
+      `lastScene=${loadedDraftScript?.checkpoint_state?.last_scene_number ?? 'n/a'} ` +
+      `lastShot=${loadedDraftScript?.checkpoint_state?.last_shot_index ?? 'n/a'}`
+    );
+  }
+  const resumeNeedsScriptWriting = !isResuming
+    || !loadedDraftScript
+    || !loadedDraftScript.episode_title
+    || loadedCheckpointRank <= PIPELINE_CHECKPOINT_STAGE_ORDER.scene_shot_writing;
 
-  const hasIncompleteSceneWork =
-    loadedScenes.length > 0 &&
-    loadedScenes.some(scene => !sceneIsCompleteForBlueprint(scene));
+  // These values remain diagnostic only. They MUST NOT decide resume behavior.
+  const hasDurableProductionArtifacts = Boolean(
+    loadedDraftScript?.narrative_simulation ||
+    loadedDraftScript?.scene_simulation ||
+    loadedDraftScript?.shot_simulation ||
+    loadedCheckpointRank >= PIPELINE_CHECKPOINT_STAGE_ORDER.blueprint
+  );
+  const resumedIncompleteScript = Boolean(
+    isResuming &&
+    resumeStage === 'scene_shot_writing'
+  );
 
-  if (
-    !isResuming ||
-    !loadedDraftScript ||
-    !loadedDraftScript.episode_title ||
-    loadedScenes.length === 0 ||
-    hasIncompleteSceneWork
-  ) {
+  if (resumeNeedsScriptWriting) {
     state.setStatus(
       state.STATES.WRITING,
-      hasIncompleteSceneWork
-        ? `Resuming incomplete scene work for S${currentSeason}E${currentEpisode}...`
+      resumedIncompleteScript
+        ? `Resuming from checkpoint=${resumeStage} for S${currentSeason}E${currentEpisode}...`
         : `Writing episode script for S${currentSeason}E${currentEpisode}...`
     );
 
@@ -2578,11 +2610,28 @@ async function _runPipeline() {
     episodeScript.scene_simulation = episodeSimulation;
   }
 
-  // Persist the post-write authoritative state before downstream processing.
-  await persistScriptCheckpoint({
-    stage: 'script_ready_for_processing',
-    script: episodeScript,
-  });
+  // The checkpoint stage is authoritative. Do not advance a scene_shot_writing
+  // checkpoint to script_ready_for_processing unless the writer actually returned
+  // a complete script checkpoint. This prevents a one-scene partial script from
+  // becoming the apparent production universe after a restart.
+  let effectiveCheckpointStage = episodeScript?.checkpoint_state?.stage || loadedCheckpointStage || null;
+  if (!isResuming || ['script_complete', 'script_ready_for_processing'].includes(String(effectiveCheckpointStage || '').toLowerCase())) {
+    await persistScriptCheckpoint({
+      stage: 'script_ready_for_processing',
+      script: episodeScript,
+    });
+    effectiveCheckpointStage = episodeScript?.checkpoint_state?.stage || 'script_ready_for_processing';
+  } else {
+    console.log(
+      `[Pipeline] ↺ Checkpoint remains authoritative: stage=${effectiveCheckpointStage || 'unknown'} ` +
+      `scene=${episodeScript?.checkpoint_state?.last_scene_number ?? 'n/a'} — downstream media processing not started`
+    );
+    state.setStatus(
+      state.STATES.GENERATING,
+      `Checkpoint ${effectiveCheckpointStage || 'unknown'} requires continuation before media generation.`
+    );
+    return;
+  }
 
   // ── Enforce scene speech coverage before any downstream rendering layers ──
   // Every character-led scene must contain meaningful audible speech: spoken
@@ -2610,8 +2659,9 @@ async function _runPipeline() {
   const shouldPostProcessScript =
     !isResuming ||
     resumedIncompleteScript ||
-    ['blueprint', 'shot_simulation', 'shot_simulation_complete', 'scene_shot_writing', 'script_complete', 'script_ready_for_processing']
-      .includes(loadedCheckpointStage);
+    ['script_complete', 'script_ready_for_processing'].includes(
+      String(effectiveCheckpointStage || '').toLowerCase()
+    );
 
   if (shouldPostProcessScript) {
     // LLM JSON can drift in scalar-vs-object shape; normalize before any
@@ -3107,7 +3157,7 @@ async function _runPipeline() {
 
     try {
       const { clipUrl, imageTmpPublicId } = await generateShot(
-        shot, storyline, characterList, globalEpisodeNumber,
+        _attachLtxPromptCapture(shot, { episodeId: draftEpisodeId, sceneNumber: shot.scene_number, shotIndex: shot.shot_index }), storyline, characterList, globalEpisodeNumber,
         // onMhSubmitted: write job ID to DB before polling so a restart can resume the poll
         async (jobId, apiKey, imgTmpPubId) => {
           await updateShotRow(draftEpisodeId, shot.scene_number, shot.shot_index, {
@@ -3285,7 +3335,7 @@ async function _runPipeline() {
         });
         try {
           const { clipUrl, imageTmpPublicId } = await generateShot(
-            shot, storyline, characterList, globalEpisodeNumber,
+            _attachLtxPromptCapture(shot, { episodeId: draftEpisodeId, sceneNumber: shot.scene_number, shotIndex: shot.shot_index }), storyline, characterList, globalEpisodeNumber,
             async (jobId, apiKey, imgTmpPubId) => {
               await updateShotRow(draftEpisodeId, shot.scene_number, shot.shot_index, {
                 status: 'mh_submitted', mh_job_id: jobId, mh_api_key: apiKey,
@@ -4713,7 +4763,9 @@ async function getShotDetail(sceneNumber, shotIndex, episodeId = null) {
         ok: true, sceneNumber, shotIndex, status: row.status || null,
         imageUrl, clipUrl: _effectiveEditorialClip(row), originalClipUrl: row.clip_url || null,
         enabled: Number(row.enabled ?? 1) === 1, trimStart: row.trim_start ?? null, trimEnd: row.trim_end ?? null,
-        imagePrompt: row.image_prompt_override || row.last_prompt || '', videoPrompt: row.video_prompt_override || row.last_prompt || '',
+        imagePrompt: row.image_prompt_override || '',
+        videoPrompt: row.last_prompt || row.video_prompt_override || '',
+        promptSource: row.last_prompt ? 'submitted_to_ltx' : (row.video_prompt_override ? 'manual_override' : 'unresolved'),
         duration: row.duration_override || row.clip_duration || config.ltxMinDuration || 4,
         videoProvider: config.videoProvider,
         lastError: row.last_error || null, failureReason: row.failure_reason || null,
@@ -4741,8 +4793,13 @@ async function getShotDetail(sceneNumber, shotIndex, episodeId = null) {
     imageUrl,
     clipUrl: _effectiveEditorialClip(row), originalClipUrl: row?.clip_url || null,
     enabled: Number(row?.enabled ?? 1) === 1, trimStart: row?.trim_start ?? null, trimEnd: row?.trim_end ?? null,
-    imagePrompt: row?.image_prompt_override || shot.image_prompt || row?.last_prompt || '',
-    videoPrompt: row?.video_prompt_override || shot._ltxPromptOverride || videoPrompt || row?.last_prompt || '',
+    imagePrompt: row?.image_prompt_override || shot.image_prompt || '',
+    videoPrompt: row?.last_prompt || row?.video_prompt_override || shot._ltxPromptOverride || videoPrompt || '',
+    promptSource: row?.last_prompt
+      ? 'submitted_to_ltx'
+      : (row?.video_prompt_override || shot._ltxPromptOverride
+        ? 'manual_override'
+        : (videoPrompt ? 'reconstructed_preview' : 'unresolved')),
     duration: row?.duration_override || shot.duration || row?.clip_duration || config.ltxMinDuration || 4,
     videoProvider: config.videoProvider,
     lastError: row?.last_error || null,
@@ -4854,7 +4911,7 @@ async function _regenerateShotBackground(ctx, sceneNumber, shotIndex, shotFromSc
 
     // Regenerate the shot
     const { clipUrl } = await generateShot(
-      shot, storyline, characters, globalEpisodeNumber,
+      _attachLtxPromptCapture(shot, { episodeId: draft.id, sceneNumber, shotIndex }), storyline, characters, globalEpisodeNumber,
       async (jobId, apiKey, imgTmpPubId) => {
         await updateShotRow(draft.id, sceneNumber, shotIndex, {
           status: 'mh_submitted', mh_job_id: jobId, mh_api_key: apiKey, image_url: imgTmpPubId || null,
@@ -4968,7 +5025,7 @@ async function _regenerateSceneBackground(ctx, sceneNumber, sceneObj, shots) {
 
       try {
         const { clipUrl } = await generateShot(
-          shot, storyline, characters, globalEpisodeNumber,
+          _attachLtxPromptCapture(shot, { episodeId: draft.id, sceneNumber, shotIndex: dbShotIndex }), storyline, characters, globalEpisodeNumber,
           async (jobId, apiKey) => {
             await updateShotRow(draft.id, sceneNumber, dbShotIndex, {
               status: 'mh_submitted', mh_job_id: jobId, mh_api_key: apiKey,
@@ -5115,7 +5172,7 @@ async function regenerateEpisodeVideos(episodeId) {
 
       try {
         const { clipUrl } = await generateShot(
-          shot, storyline, characterList, globalEpisodeNumber,
+          _attachLtxPromptCapture(shot, { episodeId, sceneNumber: shot.scene_number, shotIndex: shot.shot_index }), storyline, characterList, globalEpisodeNumber,
           async (jobId, apiKey) => {
             await updateShotRow(episodeId, shot.scene_number, shot.shot_index, {
               status: 'mh_submitted', mh_job_id: jobId, mh_api_key: apiKey,
