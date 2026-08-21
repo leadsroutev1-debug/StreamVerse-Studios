@@ -45,43 +45,45 @@ if (text.includes(oldPromptCap)) {
 
 const masterStart = '  // ── 8. Merge the original shot assets → final master ──────────────────────';
 const masterEnd = '  const finalVideoUrl = await compiler.pollFFmpegJob(mergeJobId);';
-const masterReplacement = `  // ── 8. Merge compiled scene outputs → final master ───────────────────────
-  // Scene compilation is the editorial boundary for the movie. The final master
-  // consumes the already-compiled scene assets, not individual shot clips. This
-  // preserves scene-level pacing/transitions and reduces merge fan-out from O(shots)
-  // to O(scenes).
-  state.setStatus(state.STATES.COMPILING, 'Merging compiled scenes into final episode...');
-
-  const orderedSceneUrls = sceneNums
-    .map(sceneNum => savedSceneState[sceneNum] || null)
-    .filter(Boolean);
-
-  if (!orderedSceneUrls.length) {
-    const reason = 'No compiled scene assets are available for the final master merge.';
-    console.error(\\`[Pipeline] \\${reason}\\`);
-    await saveDraftProgress(draftEpisodeId, savedSceneState, reason);
-    state.setStatus(state.STATES.PAUSED, \\`⏸ \\${reason}\\`);
-    await telegram.sendTelegram(\\`⏸ <b>Episode paused — no compiled scene assets for master merge</b>\\`).catch(() => {});
-    return;
-  }
-
-  if (orderedSceneUrls.length !== sceneNums.length) {
-    const reason = \\`Final scene merge mismatch: found \\${orderedSceneUrls.length}/\\${sceneNums.length} compiled scenes. Refusing to build an incomplete final episode.\\`;
-    console.error(\\`[Pipeline] \\${reason}\\`);
-    await saveDraftProgress(draftEpisodeId, savedSceneState, reason);
-    state.setStatus(state.STATES.PAUSED, \\`⏸ \\${reason}\\`);
-    await telegram.sendTelegram(\\`⏸ <b>Episode paused — compiled scene source mismatch</b>\\n\\${reason}\\`).catch(() => {});
-    return;
-  }
-
-  console.log(\\`[Pipeline] Final master source = \\${orderedSceneUrls.length} compiled scenes (not \\${allShots.length} individual shots)\\`);
-  const episodeTransition = episodeScript?.episode_transition || null;
-  const mergeJobId = await compiler.mergeScenes(orderedSceneUrls, {
-    introBumperUrl: process.env.INTRO_BUMPER_URL || null,
-    outroBumperUrl: process.env.OUTRO_BUMPER_URL || null,
-    transition: episodeTransition,
-  });
-  const finalVideoUrl = await compiler.pollFFmpegJob(mergeJobId);`;
+const masterReplacement = [
+  '  // ── 8. Merge compiled scene outputs → final master ───────────────────────',
+  '  // Scene compilation is the editorial boundary for the movie. The final master',
+  '  // consumes the already-compiled scene assets, not individual shot clips. This',
+  '  // preserves scene-level pacing/transitions and reduces merge fan-out from O(shots)',
+  '  // to O(scenes).',
+  "  state.setStatus(state.STATES.COMPILING, 'Merging compiled scenes into final episode...');",
+  '',
+  '  const orderedSceneUrls = sceneNums',
+  '    .map(sceneNum => savedSceneState[sceneNum] || null)',
+  '    .filter(Boolean);',
+  '',
+  "  if (!orderedSceneUrls.length) {",
+  "    const reason = 'No compiled scene assets are available for the final master merge.';",
+  '    console.error(`[Pipeline] ${reason}`);',
+  '    await saveDraftProgress(draftEpisodeId, savedSceneState, reason);',
+  '    state.setStatus(state.STATES.PAUSED, `⏸ ${reason}`);',
+  '    await telegram.sendTelegram(`⏸ <b>Episode paused — no compiled scene assets for master merge</b>`).catch(() => {});',
+  '    return;',
+  '  }',
+  '',
+  '  if (orderedSceneUrls.length !== sceneNums.length) {',
+  '    const reason = `Final scene merge mismatch: found ${orderedSceneUrls.length}/${sceneNums.length} compiled scenes. Refusing to build an incomplete final episode.`;',
+  '    console.error(`[Pipeline] ${reason}`);',
+  '    await saveDraftProgress(draftEpisodeId, savedSceneState, reason);',
+  '    state.setStatus(state.STATES.PAUSED, `⏸ ${reason}`);',
+  '    await telegram.sendTelegram(`⏸ <b>Episode paused — compiled scene source mismatch</b>\\n${reason}`).catch(() => {});',
+  '    return;',
+  '  }',
+  '',
+  '  console.log(`[Pipeline] Final master source = ${orderedSceneUrls.length} compiled scenes (not ${allShots.length} individual shots)`);',
+  '  const episodeTransition = episodeScript?.episode_transition || null;',
+  '  const mergeJobId = await compiler.mergeScenes(orderedSceneUrls, {',
+  '    introBumperUrl: process.env.INTRO_BUMPER_URL || null,',
+  '    outroBumperUrl: process.env.OUTRO_BUMPER_URL || null,',
+  '    transition: episodeTransition,',
+  '  });',
+  '  const finalVideoUrl = await compiler.pollFFmpegJob(mergeJobId);',
+].join('\n');
 
 const masterStartIndex = text.indexOf(masterStart);
 if (masterStartIndex >= 0) {
