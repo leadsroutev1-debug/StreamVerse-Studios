@@ -59,21 +59,247 @@ function _parseStructuredContent(content) {
   }
 }
 
-function _extractDescription(parsed) {
-  const description = _cleanText(
-    parsed?.ltx_shot_description
+function _isPlainObject(value) {
+  return Boolean(value && typeof value === 'object' && !Array.isArray(value));
+}
+
+function _sentence(value) {
+  const text = _cleanText(value);
+  if (!text) return '';
+  return /[.!?]["”']?$/.test(text) ? text : `${text}.`;
+}
+
+function _flattenValue(value) {
+  if (value == null) return '';
+
+  if (
+    typeof value === 'string' ||
+    typeof value === 'number' ||
+    typeof value === 'boolean'
+  ) {
+    return _cleanText(String(value));
+  }
+
+  if (Array.isArray(value)) {
+    return value
+      .map(item => _flattenValue(item))
+      .filter(Boolean)
+      .join(' ');
+  }
+
+  if (_isPlainObject(value)) {
+    return Object.entries(value)
+      .map(([key, child]) => _flattenField(key, child))
+      .filter(Boolean)
+      .join(' ');
+  }
+
+  return '';
+}
+
+function _flattenDialogueNode(node) {
+  if (!_isPlainObject(node)) return _flattenValue(node);
+
+  const speaker = _cleanText(node.speaker || '');
+  const spokenWords = _cleanText(
+    node.spoken_words ||
+    node.spokenWords ||
+    node.dialogue ||
+    node.line ||
+    ''
   );
+  const delivery = _cleanText(node.delivery || '');
+  const placement = _cleanText(node.placement || '');
+  const listenerReaction =
+    node.listener_reaction ||
+    node.listenerReaction ||
+    '';
+
+  const parts = [];
+
+  if (spokenWords) {
+    const cleanWords = spokenWords.replace(/^["“]|["”]$/g, '').trim();
+    if (speaker) {
+      parts.push(
+        `${speaker}${placement ? ` ${_sentence(placement)}` : ''} ` +
+        `${_sentence(delivery || 'speaks')} ` +
+        `"${cleanWords}"`
+      );
+    } else {
+      parts.push(`"${cleanWords}"`);
+    }
+  }
+
+  if (listenerReaction) {
+    parts.push(`The listener reacts: ${_flattenValue(listenerReaction)}`);
+  }
+
+  const handled = new Set([
+    'speaker',
+    'spoken_words',
+    'spokenWords',
+    'dialogue',
+    'line',
+    'delivery',
+    'placement',
+    'listener_reaction',
+    'listenerReaction',
+  ]);
+
+  for (const [key, value] of Object.entries(node)) {
+    if (handled.has(key)) continue;
+    const rendered = _flattenField(key, value);
+    if (rendered) parts.push(rendered);
+  }
+
+  return parts.join(' ');
+}
+
+function _flattenField(key, value) {
+  const normalizedKey = String(key || '');
+  const lowerKey = normalizedKey.toLowerCase();
+
+  if (value == null) return '';
+
+  if (
+    lowerKey === 'dialogue_initiation' ||
+    lowerKey === 'dialogue' ||
+    lowerKey === 'spoken_dialogue' ||
+    lowerKey === 'conversation'
+  ) {
+    if (_isPlainObject(value)) return _flattenDialogueNode(value);
+    if (Array.isArray(value)) {
+      return value.map(_flattenDialogueNode).filter(Boolean).join(' ');
+    }
+    return _sentence(value);
+  }
+
+  if (
+    lowerKey === 'action_sequence' ||
+    lowerKey === 'actions'
+  ) {
+    if (Array.isArray(value)) {
+      return value.map(item => {
+        if (_isPlainObject(item) && item.moment) {
+          const duration = item.duration ? ` It lasts ${item.duration}.` : '';
+          return `${_sentence(item.moment)}${duration}`;
+        }
+        return _flattenValue(item);
+      }).filter(Boolean).join(' ');
+    }
+  }
+
+  if (lowerKey === 'action_progression') {
+    if (_isPlainObject(value)) {
+      return Object.entries(value)
+        .map(([childKey, childValue]) => _flattenField(childKey, childValue))
+        .filter(Boolean)
+        .join(' ');
+    }
+  }
+
+  if (lowerKey === 'opening_state' || lowerKey === 'initial_state') {
+    return `At the beginning, ${_flattenValue(value)}`;
+  }
+
+  if (lowerKey === 'terminal_state' || lowerKey === 'final_state') {
+    return `By the end of the shot, ${_flattenValue(value)}`;
+  }
+
+  if (lowerKey === 'camera_movement' || lowerKey === 'camera') {
+    return `The camera ${_flattenValue(value)}`;
+  }
+
+  if (lowerKey === 'lighting_evolution') {
+    return `The lighting changes as follows: ${_flattenValue(value)}`;
+  }
+
+  if (lowerKey === 'sound' || lowerKey === 'ambience' || lowerKey === 'atmosphere') {
+    return `The sound and atmosphere are ${_flattenValue(value)}`;
+  }
+
+  if (_isPlainObject(value)) {
+    return Object.entries(value)
+      .map(([childKey, childValue]) => _flattenField(childKey, childValue))
+      .filter(Boolean)
+      .join(' ');
+  }
+
+  if (Array.isArray(value)) {
+    return value.map(_flattenValue).filter(Boolean).join(' ');
+  }
+
+  return _sentence(value);
+}
+
+function _serializeStructuredShot(value) {
+  if (typeof value === 'string') {
+    const description = _cleanText(value);
+    if (!description) {
+      throw new Error('[LTXVision] ltx_shot_description string was empty');
+    }
+    return description;
+  }
+
+  if (!_isPlainObject(value)) {
+    const error = new Error(
+      '[LTXVision] ltx_shot_description must be a string or structured object'
+    );
+    error.code = 'LTX_VISION_INVALID_STRUCTURED_OUTPUT';
+    throw error;
+  }
+
+  // Preserve the model's chronological section order when present.
+  const orderedSections = [
+    'opening_state',
+    'action_sequence',
+    'action_progression',
+    'camera_movement',
+    'lighting_evolution',
+    'terminal_state',
+  ];
+
+  const consumed = new Set();
+  const parts = [];
+
+  for (const section of orderedSections) {
+    if (!Object.prototype.hasOwnProperty.call(value, section)) continue;
+    const rendered = _flattenField(section, value[section]);
+    if (rendered) parts.push(rendered);
+    consumed.add(section);
+  }
+
+  for (const [key, child] of Object.entries(value)) {
+    if (consumed.has(key)) continue;
+    const rendered = _flattenField(key, child);
+    if (rendered) parts.push(rendered);
+  }
+
+  const description = _cleanText(parts.join(' '));
 
   if (!description) {
     const error = new Error(
-      '[LTXVision] Vision model returned structured JSON without a non-empty ltx_shot_description field'
+      '[LTXVision] Structured ltx_shot_description could not be serialized'
+    );
+    error.code = 'LTX_VISION_INVALID_STRUCTURED_OUTPUT';
+    error.structuredResponse = value;
+    throw error;
+  }
+
+  return description;
+}
+
+function _extractDescription(parsed) {
+  if (!Object.prototype.hasOwnProperty.call(parsed || {}, 'ltx_shot_description')) {
+    const error = new Error(
+      '[LTXVision] Vision model returned structured JSON without ltx_shot_description'
     );
     error.code = 'LTX_VISION_INVALID_STRUCTURED_OUTPUT';
     error.structuredResponse = parsed;
     throw error;
   }
 
-  return description;
+  return _serializeStructuredShot(parsed.ltx_shot_description);
 }
 
 function _quotedDialogue(text) {
@@ -311,7 +537,9 @@ async function describeForLTX({
     'Do not invent characters, props, locations, wardrobe changes, or consequential events absent from the supplied image, scene context, or shot intent.',
     'Do not output analysis, labels, shot contracts, spatial maps, metadata, prompt instructions, negative prompts, implementation language, or editing commands.',
     'Return JSON with exactly one field: ltx_shot_description.',
-    'The field value must be the actual finished cinematic description that can be sent directly to LTX.',
+    'The value of ltx_shot_description MUST be a STRING containing one complete chronological cinematic description.',
+    'Never return an object, array, scene graph, nested timeline, or structured outline inside ltx_shot_description.',
+    'The string must be directly usable by the LTX image-to-video prompt pipeline.',
   ].join(' ');
 
   const sourceLines = _quotedDialogue(intent.dialogue || '');
