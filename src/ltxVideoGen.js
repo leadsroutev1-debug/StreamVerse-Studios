@@ -57,6 +57,11 @@ function _resolveDuration(shotMeta = {}) {
   const duration = Number.isFinite(requested) ? requested : minDuration;
   return Math.min(maxDuration, Math.max(minDuration, duration));
 }
+function _quotedDialogue(text) {
+  return [...String(text || '').matchAll(/"([^"]+)"|“([^”]+)”/g)]
+    .map(match => (match[1] || match[2] || '').trim())
+    .filter(Boolean);
+}
 
 async function _resolvePrompt(imageBuffer, shotMeta) {
   const override = typeof shotMeta._ltxPromptOverride === 'string' ? shotMeta._ltxPromptOverride.trim() : '';
@@ -66,12 +71,22 @@ async function _resolvePrompt(imageBuffer, shotMeta) {
   }
 
   const visionContext = shotMeta.visionContext || {};
-  // The existing pipeline already supplies videoPrompt as the authored shot
-  // description. Feed it into the vision director as intent while the actual
-  // final still remains the visual ground truth.
-  const authoredIntent = typeof shotMeta.videoPrompt === 'string' ? shotMeta.videoPrompt : '';
+  // Stage 4 output is the authored shot intent. Always hand the COMPLETE authored
+  // prompt to the vision director; never let a stale visionContext.shot field replace it.
+  const authoredIntent = typeof shotMeta.videoPrompt === 'string' ? shotMeta.videoPrompt.trim() : '';
   const visionShot = { ...(visionContext.shot || {}) };
-  if (authoredIntent && !visionShot.shot_description) visionShot.shot_description = authoredIntent;
+  if (authoredIntent) {
+    visionShot.shot_description = authoredIntent;
+    visionShot.authored_ltx_intent = authoredIntent;
+
+    // A quoted line in the authored Stage-4 prompt is a hard conversational requirement.
+    // Make that requirement explicit even when an older/stale vision context lacks dialogue fields.
+    const sourceLines = _quotedDialogue(authoredIntent);
+    if (sourceLines.length) {
+      visionShot.dialogue = sourceLines.map(line => `"${line}"`).join(' ');
+      visionShot.conversation_reason = visionShot.conversation_reason || 'Authored shot contains explicit spoken dialogue; preserve it verbatim.';
+    }
+  }
 
   const description = await ltxVisionDirector.describeForLTX({
     imageBuffer,
@@ -81,8 +96,14 @@ async function _resolvePrompt(imageBuffer, shotMeta) {
     characters: visionContext.characters || [],
   });
 
-  console.log(`[LTXVideoGen] Vision-authored LTX prompt generated (${description.split(/\s+/).filter(Boolean).length} words).`);
-  return ltxPromptEngine.prepareImageToVideoPrompt(description);
+  const finalPrompt = ltxPromptEngine.prepareImageToVideoPrompt(description);
+  const quotedCount = _quotedDialogue(finalPrompt).length;
+  const sourceQuotedCount = _quotedDialogue(authoredIntent).length;
+  console.log(`[LTXVideoGen] Vision-authored LTX prompt generated (${finalPrompt.split(/\s+/).filter(Boolean).length} words, quotedDialogue=${quotedCount}/${sourceQuotedCount}).`);
+  if (sourceQuotedCount > 0 && quotedCount === 0) {
+    throw new LTXGenerationError('[LTXVideoGen] Vision director returned a prompt that lost the authored dialogue. Refusing to send a silent conversational shot to LTX.');
+  }
+  return finalPrompt;
 }
 
 async function submitVideoJob(imageBuffer, shotMeta = {}) {
