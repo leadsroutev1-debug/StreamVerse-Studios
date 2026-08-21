@@ -3,9 +3,9 @@
 # StreamVerse Studio — combined startup
 # ============================================================================
 # Starts the Python Video Engine (internal, port 8000 by default) as a
-# background sidecar, waits for it to report healthy, then execs the Node
-# main application in the FOREGROUND on $PORT (default 5000 — this is the
-# port Replit's autoscale deployment / port-forwarding watches).
+# background sidecar, waits for it to report healthy, then reconciles any
+# stale persisted shot rows against the authoritative episode script before
+# starting the Node application in the FOREGROUND.
 #
 # Using `exec` for the Node process means it becomes PID 1 in this script's
 # place, so Replit's deploy supervisor tracks it directly and only has to
@@ -18,7 +18,6 @@ VIDEO_ENGINE_PORT="${VIDEO_ENGINE_PORT:-8000}"
 
 echo "[start.sh] Installing Python video engine dependencies..."
 bash video_engine/install.sh
-
 echo "[start.sh] Starting Python Video Engine on ${VIDEO_ENGINE_HOST}:${VIDEO_ENGINE_PORT}..."
 bash video_engine/run.sh &
 VIDEO_ENGINE_PID=$!
@@ -44,6 +43,9 @@ for i in $(seq 1 30); do
     echo "[start.sh] WARNING: video engine did not report healthy after 30s — starting Node anyway."
   fi
 done
+
+echo "[start.sh] Reconciling stale persisted shot rows before backend resume..."
+node src/reconcileShotState.js || true
 
 echo "[start.sh] Starting StreamVerse Node backend on port ${PORT:-5000}..."
 exec node index.js
