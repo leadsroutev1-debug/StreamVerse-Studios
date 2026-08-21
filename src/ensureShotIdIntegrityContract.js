@@ -4,9 +4,9 @@
  * StreamVerse Studio — shot-ID integrity migration.
  *
  * Never silently renumber model-generated or checkpointed shot IDs.
- * A scene-local mismatch triggers targeted LLM repair; if the repaired scene
- * still returns invalid IDs, the scene fails instead of being persisted with
- * mutated identifiers.
+ * A scene-local mismatch triggers targeted LLM repair and keeps retrying until
+ * the exact required scene/shot identifiers are returned. Every failed repair
+ * feeds the observed IDs and validation error back to Mistral.
  */
 const fs = require('fs');
 const path = require('path');
@@ -96,53 +96,73 @@ const newShotBlock = `    let result = await callLLM(systemPrompt, userPrompt, u
     );
 
     if (!idsAreValid(result.shots)) {
-      const badIds = result.shots.map(shot =>
-        \`S\${Number.isFinite(Number(shot?.scene_number)) ? Number(shot.scene_number) : 'n/a'}/idx\${Number.isFinite(Number(shot?.shot_index)) ? Number(shot.shot_index) : 'n/a'}\`
-      ).join(', ');
-      console.warn(
-        \`[ScriptWriter] Shot-ID mismatch S\${sceneNo}: model returned [\${badIds}], expected local IDs S\${sceneNo}/idx1..idx\${target}. Refusing to normalize; requesting targeted scene-ID repair.\`
-      );
+      let repairAttempt = 0;
+      let lastValidationError = '';
+      let repaired = null;
 
-      const repairSystem = \`\${DIRECTOR_PERSONA}\nYou are repairing the shot IDs for ONE already-authored scene simulation. Return JSON only. Preserve every story, action, dialogue, continuity, and staging field exactly. Do not rewrite the scene content.\`;
-      const repairPrompt = \`
+      while (true) {
+        repairAttempt += 1;
+        const badIds = Array.isArray(result?.shots)
+          ? result.shots.map(shot =>
+              \`S\${Number.isFinite(Number(shot?.scene_number)) ? Number(shot.scene_number) : 'n/a'}/idx\${Number.isFinite(Number(shot?.shot_index)) ? Number(shot.shot_index) : 'n/a'}\`
+            ).join(', ')
+          : 'missing shots array';
+        lastValidationError =
+          \`Expected exactly \${target} shots for S\${sceneNo} with local shot_index 1..\${target}; received [\${badIds}].\`;
+
+        console.warn(
+          \`[ScriptWriter] Shot-ID mismatch S\${sceneNo}: \${lastValidationError} Targeted repair attempt \${repairAttempt}; refusing to normalize.\`
+        );
+
+        const repairSystem = \`\${DIRECTOR_PERSONA}\nYou are repairing the shot identifiers for ONE already-authored scene simulation. Return JSON only. Preserve every story, action, dialogue, continuity, staging, and ordering field exactly. Only correct the identifiers. Never use episode-global numbering.\`;
+        const repairPrompt = \`
 EPISODE: S\${seasonNumber}E\${episodeNumber}
 SCENE: \${sceneNo}
 EXPECTED SHOT COUNT: \${target}
 
-THE MODEL RETURNED THESE SHOTS WITH INVALID IDENTIFIERS:
-\${JSON.stringify(result.shots)}
+VALIDATION ERROR FROM THE PREVIOUS RESPONSE:
+\${lastValidationError}
+
+THE PREVIOUS MODEL RESPONSE WAS:
+\${JSON.stringify(result?.shots || null)}
 
 CORRECT IDENTIFIER CONTRACT:
-- Every shot belongs to scene \${sceneNo}.
+- Every shot MUST have scene_number = \${sceneNo}.
 - Local shot_index MUST be exactly 1, 2, 3 ... \${target}.
-- Do not use episode-global shot numbers.
-- Do not reorder the story.
-- Preserve every non-ID field from the supplied shots exactly.
+- Do NOT use episode-global shot numbers.
+- Do NOT renumber by inference outside this requested contract.
+- Preserve every non-ID field exactly.
+- Return the SAME \${target} shot objects in the SAME story order, changing ONLY scene_number and shot_index.
 
 Return exactly:
 {
   \"shots\": [
-    // the same \${target} shot objects, with only scene_number and shot_index corrected
+    { \"scene_number\": \${sceneNo}, \"shot_index\": 1, ... },
+    { \"scene_number\": \${sceneNo}, \"shot_index\": 2, ... }
   ]
 }
 \`;
 
-      let repaired = null;
-      for (let repairAttempt = 1; repairAttempt <= 2; repairAttempt++) {
-        repaired = await callLLM(repairSystem, repairPrompt, undefined, { useStream: false, temperature: 0.05 });
-        if (repaired && Array.isArray(repaired.shots) && idsAreValid(repaired.shots)) break;
-        console.warn(\`[ScriptWriter] Targeted shot-ID repair S\${sceneNo} attempt \${repairAttempt}/2 still returned invalid IDs; retrying.\`);
-      }
+        repaired = await callLLM(repairSystem, repairPrompt, undefined, {
+          useStream: false,
+          temperature: 0.02,
+        });
 
-      if (!repaired || !Array.isArray(repaired.shots) || !idsAreValid(repaired.shots)) {
-        throw new Error(\`[ScriptWriter] Shot-ID mismatch for S\${seasonNumber}E\${episodeNumber} scene \${sceneNo} could not be repaired. Scene was not checkpointed.\`);
-      }
+        if (repaired && Array.isArray(repaired.shots) && idsAreValid(repaired.shots)) {
+          result = repaired;
+          console.log(
+            \`[ScriptWriter] Targeted shot-ID repair succeeded for S\${seasonNumber}E\${episodeNumber} scene \${sceneNo} after \${repairAttempt} attempt(s); exact local IDs verified.\`
+          );
+          break;
+        }
 
-      result = repaired;
-      console.log(\`[ScriptWriter] Targeted shot-ID repair succeeded for S\${seasonNumber}E\${episodeNumber} scene \${sceneNo}; exact local IDs verified.\`);
+        // Keep the exact bad response in context so the next repair call can correct
+        // the specific format error instead of repeating a generic instruction.
+        result = repaired && Array.isArray(repaired?.shots) ? repaired : result;
+      }
     }
 
-    // IDs are already validated; do not mutate them here.
+    // IDs have been validated. Never mutate them here.
     const sceneShots = result.shots.map(shot => ({ ...shot }));`;
 
 if (text.includes(oldShotBlock)) {
@@ -153,13 +173,16 @@ if (text.includes(oldShotBlock)) {
 if (text.includes('Normalizing simulation S${sceneNo}')) {
   throw new Error('[ShotIdIntegrityContract] Legacy shot-ID normalization block is still present');
 }
-if (!text.includes('Refusing to normalize; requesting targeted scene-ID repair.')) {
-  throw new Error('[ShotIdIntegrityContract] Shot-ID repair contract was not installed');
+if (!text.includes('Targeted repair attempt ${repairAttempt}; refusing to normalize.')) {
+  throw new Error('[ShotIdIntegrityContract] Retry-until-valid shot-ID repair contract was not installed');
+}
+if (text.includes('could not be repaired. Scene was not checkpointed')) {
+  throw new Error('[ShotIdIntegrityContract] Scene-failure fallback is still present');
 }
 
 if (changed) {
   fs.writeFileSync(scriptPath, text, 'utf8');
-  console.log('[ShotIdIntegrityContract] Shot IDs now validate/repair instead of silently renumbering.');
+  console.log('[ShotIdIntegrityContract] Shot IDs now validate and retry with exact validation feedback instead of silently renumbering or failing the scene.');
 } else {
   console.log('[ShotIdIntegrityContract] Shot-ID integrity contract already present.');
 }
