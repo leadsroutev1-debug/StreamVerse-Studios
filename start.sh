@@ -4,9 +4,9 @@
 # ============================================================================
 # Starts the Python Video Engine (internal, port 8000 by default) as a
 # background sidecar, waits for it to report healthy, applies the idempotent
-# LTX/movie pipeline contract migration before Node loads src/pipeline.js,
-# reconciles stale persisted shot rows, then starts the Node application in
-# the FOREGROUND.
+# LTX/movie and scene-transition pipeline contract migrations before Node
+# loads src/pipeline.js, reconciles stale persisted shot rows, then starts
+# the Node application in the FOREGROUND.
 # ============================================================================
 set -e
 
@@ -43,6 +43,9 @@ done
 
 echo "[start.sh] Applying idempotent LTX/movie pipeline contracts..."
 node src/ensureLtxPipelineContracts.js
+
+echo "[start.sh] Applying scene transition contract..."
+node src/ensureSceneTransitionContract.js
 
 echo "[start.sh] Reconciling stale persisted shot rows before backend resume..."
 node src/reconcileShotState.js || true
