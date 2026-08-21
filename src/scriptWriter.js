@@ -1665,6 +1665,8 @@ async function simulateEpisodeShots({
     : {};
   const existingShots = Array.isArray(existing.shots) ? existing.shots : [];
 
+  // Persisted shot-simulation checkpoints are authoritative. Never renumber them.
+  // A checkpoint is reusable only when its scene-local IDs are already exact.
   const normalizedExisting = [];
   for (const scene of plannedScenes) {
     const sceneNo = Number(scene.scene_number);
@@ -1673,13 +1675,19 @@ async function simulateEpisodeShots({
       .filter(s => Number(s.scene_number) === sceneNo)
       .sort((a, b) => Number(a.shot_index) - Number(b.shot_index));
 
-    if (prior.length === target) {
-      normalizedExisting.push(...prior.map((shot, i) => ({
-        ...shot,
-        scene_number: sceneNo,
-        shot_index: i + 1,
-      })));
+    const validCheckpoint = prior.length === target && prior.every((shot, i) =>
+      Number(shot.scene_number) === sceneNo &&
+      Number(shot.shot_index) === i + 1
+    );
+
+    if (validCheckpoint) {
+      normalizedExisting.push(...prior);
       console.log(`[ScriptWriter] ↺ Restored shot simulation checkpoint S${seasonNumber}E${episodeNumber} scene ${sceneNo} (${target}/${target} shots)`);
+    } else if (prior.length) {
+      console.warn(
+        `[ScriptWriter] Discarding invalid shot simulation checkpoint S${seasonNumber}E${episodeNumber} scene ${sceneNo}: ` +
+        `expected local IDs S${sceneNo}/1..${target}; found ${prior.map(s => `S${Number.isFinite(Number(s.scene_number)) ? s.scene_number : 'n/a'}/${Number.isFinite(Number(s.shot_index)) ? s.shot_index : 'n/a'}`).join(', ')}`
+      );
     }
   }
 
@@ -1721,7 +1729,11 @@ async function simulateEpisodeShots({
     const target = counts[sceneNo];
     const already = working.shots.filter(s => Number(s.scene_number) === sceneNo);
 
-    if (already.length === target) continue;
+    if (already.length === target && already.every((shot, i) =>
+      Number(shot.scene_number) === sceneNo && Number(shot.shot_index) === i + 1
+    )) {
+      continue;
+    }
 
     const rawSim = simulatedScenes.find(s => Number(s.scene_number) === sceneNo) || {};
     const compactSceneSimulation = {
@@ -1749,8 +1761,7 @@ async function simulateEpisodeShots({
 ${MULTI_SPEAKER_LTX_RULES}
 You are the continuity director performing a PRE-GENERATION SHOT SIMULATION for ONE SCENE.
 Do not write prose outside JSON. Do not generate images, videos, or final prompts.
-This scene is part of a locked cinematic episode. Preserve the causal state handed into the scene
-and produce exactly the requested number of sequential local shots.`;
+The requested shot IDs are scene-local and immutable. The causal shot plan is sequential and must preserve continuity.`;
 
     const userPrompt = `
 SERIES: ${_compactLLMText(storyline.title || '', 300)}
@@ -1779,15 +1790,16 @@ ${JSON.stringify({
 LOCKED SCENE SIMULATION:
 ${JSON.stringify(compactSceneSimulation)}
 
-STATE INHERITED FROM PREVIOUS SHOT:
+INHERITED NARRATIVE/VISUAL STATE FROM PRIOR SHOT:
 ${JSON.stringify(previousShot ? {
-      scene_number: previousShot.scene_number,
-      shot_index: previousShot.shot_index,
       end_state: previousShot.end_state || '',
       handoff_to_next: previousShot.handoff_to_next || '',
     } : { opening_state: sceneOpeningState })}
 
 Produce exactly ${target} shots for SCENE ${sceneNo}.
+Shot IDs are scene-local and MUST be exactly:
+${Array.from({ length: target }, (_, i) => `S${sceneNo}/${i + 1}`).join(', ')}
+
 The first shot MUST begin from the inherited state above.
 Each subsequent shot MUST inherit the immediately previous shot's end_state/handoff.
 The final shot MUST end on the scene's locked closing state or a concrete state that causally leads to it.
@@ -1816,7 +1828,7 @@ Return exactly:
 HARD REQUIREMENTS:
 - Exactly ${target} shots.
 - All shots belong to scene ${sceneNo}.
-- Shot indices are local and serial: 1, 2, 3... ${target}.
+- IDs are scene-local and immutable: S${sceneNo}/1 through S${sceneNo}/${target}.
 - Do NOT use episode-global shot numbering.
 - Do NOT skip or duplicate a local index.
 - Do NOT change scene number.
@@ -1824,29 +1836,63 @@ HARD REQUIREMENTS:
 - Preserve the emotional and causal progression.
 `;
 
-    const result = await callLLM(systemPrompt, userPrompt, undefined, { useStream: false, temperature: 0.2 });
-    if (!result || !Array.isArray(result.shots)) {
-      throw new Error(`[ScriptWriter] Shot simulation invalid for S${seasonNumber}E${episodeNumber} scene ${sceneNo}: missing shots array`);
-    }
-    if (result.shots.length !== target) {
-      throw new Error(`[ScriptWriter] Shot simulation invalid for S${seasonNumber}E${episodeNumber} scene ${sceneNo}: expected ${target} shots, got ${result.shots.length}`);
+    let result = await callLLM(systemPrompt, userPrompt, undefined, { useStream: false, temperature: 0.2 });
+    let repairAttempt = 0;
+
+    const validate = (candidate) => {
+      const shots = Array.isArray(candidate?.shots) ? candidate.shots : [];
+      if (shots.length !== target) {
+        return {
+          ok: false,
+          error: `Scene S${sceneNo} requires exactly ${target} shots; model returned ${shots.length}.`,
+          returned: shots.map(s => `S${Number.isFinite(Number(s?.scene_number)) ? Number(s.scene_number) : 'n/a'}/${Number.isFinite(Number(s?.shot_index)) ? Number(s.shot_index) : 'n/a'}`),
+        };
+      }
+      const returnedIds = shots.map(s =>
+        `S${Number.isFinite(Number(s?.scene_number)) ? Number(s.scene_number) : 'n/a'}/${Number.isFinite(Number(s?.shot_index)) ? Number(s.shot_index) : 'n/a'}`
+      );
+      const exact = shots.every((shot, i) =>
+        Number(shot?.scene_number) === sceneNo &&
+        Number(shot?.shot_index) === i + 1
+      );
+      return exact
+        ? { ok: true, shots }
+        : {
+            ok: false,
+            error: `Scene S${sceneNo} requires exact local IDs ${Array.from({ length: target }, (_, i) => `S${sceneNo}/${i + 1}`).join(', ')}; model returned ${returnedIds.join(', ')}.`,
+            returned: returnedIds,
+          };
+    };
+
+    while (!validate(result).ok) {
+      repairAttempt += 1;
+      const check = validate(result);
+      console.warn(`[ScriptWriter] Shot-ID mismatch S${sceneNo}: ${check.error} repairAttempt=${repairAttempt}`);
+
+      result = await callLLM(
+        `${DIRECTOR_PERSONA}
+You are repairing ONLY the identifiers of an already-authored pre-generation shot sequence.
+Preserve every non-ID field and story order exactly. Never invent or remove shots.
+Return JSON only.`,
+        `SCENE: S${sceneNo}
+EXPECTED SHOT IDS: ${Array.from({ length: target }, (_, i) => `S${sceneNo}/${i + 1}`).join(', ')}
+VALIDATION ERROR: ${check.error}
+PREVIOUS SHOT SEQUENCE:
+${JSON.stringify(result?.shots || [])}
+
+Return the SAME ${target} shot objects with only scene_number and shot_index corrected to the exact
+scene-local IDs. Do not alter purpose, start_state, action_arc, dialogue, character state, environment,
+end_state, handoff_to_next, or ordering.`,
+        undefined,
+        { useStream: false, temperature: 0.02 }
+      );
     }
 
-    const sceneShots = result.shots.map((shot, i) => {
-      const rawScene = Number(shot?.scene_number);
-      const rawIndex = Number(shot?.shot_index);
-      const expectedIndex = i + 1;
-      if (rawScene !== sceneNo || rawIndex !== expectedIndex) {
-        console.warn(
-          `[ScriptWriter] Normalizing simulation S${sceneNo}: model returned S${Number.isFinite(rawScene) ? rawScene : 'n/a'}/idx${Number.isFinite(rawIndex) ? rawIndex : 'n/a'}, expected S${sceneNo}/idx${expectedIndex}`
-        );
-      }
-      return {
-        ...shot,
-        scene_number: sceneNo,
-        shot_index: expectedIndex,
-      };
-    });
+    const sceneShots = result.shots.map(shot => ({
+      ...shot,
+      scene_number: Number(shot.scene_number),
+      shot_index: Number(shot.shot_index),
+    }));
 
     working.shots = working.shots.filter(s => Number(s.scene_number) !== sceneNo);
     working.shots.push(...sceneShots);
@@ -2767,9 +2813,7 @@ async function _writeSceneShotsSequential({
   existingScenes = [],
   checkpoint = null,
 }) {
-  const totalScenes = scenes.length;
-  const MEMORY_WINDOW = 5;
-  const memory = [];
+  const totalScenes = Array.isArray(scenes) ? scenes.length : 0;
   const scenesWithShots = [];
 
   const priorByScene = new Map(
@@ -2777,51 +2821,63 @@ async function _writeSceneShotsSequential({
       .map(scene => [Number(scene.scene_number), scene])
   );
 
-  // Restore only the contiguous completed prefix. Production checkpoints are
-  // written in serial order; never let a stray later checkpoint jump ahead and
-  // poison the causal memory of the scene currently being resumed.
+  // Resume only from an ordered, valid prefix. Never renumber persisted scene-shot data.
   for (const scene of scenes) {
     const prior = priorByScene.get(Number(scene.scene_number));
-    const target = Math.max(2, Math.min(5, Number(scene.shot_count_target) || 3));
-    if (!prior || !Array.isArray(prior.shots) || prior.shots.length !== target) break;
+    const persistedPlan = (shotSimulation?.shots || [])
+      .filter(s => Number(s.scene_number) === Number(scene.scene_number))
+      .sort((a, b) => Number(a.shot_index) - Number(b.shot_index));
+    const target = persistedPlan.length;
+
+    if (!prior || !Array.isArray(prior.shots) || prior.shots.length !== target || target === 0) break;
+
+    const idsValid = prior.shots.every((shot, i) =>
+      Number(shot.scene_number) === Number(scene.scene_number) &&
+      Number(shot.shot_index) === Number(persistedPlan[i].shot_index)
+    );
+
+    if (!idsValid) {
+      console.warn(
+        `[ScriptWriter] Discarding invalid scene-shot checkpoint S${scene.scene_number}; ` +
+        `rebuilding that scene from the persisted shot_simulation schema without renumbering.`
+      );
+      break;
+    }
 
     const restored = {
       ...scene,
       ...prior,
-      shots: prior.shots.map((shot, i) => ({
-        ...shot,
-        scene_number: Number(scene.scene_number),
-        shot_index: i + 1,
-      })),
+      shots: prior.shots.map(shot => ({ ...shot })),
     };
     scenesWithShots.push(restored);
-    memory.push(_summarizeSceneForMemory(restored));
     console.log(`[ScriptWriter] ↺ Restored scene-shot checkpoint S${scene.scene_number} (${target}/${target} shots)`);
   }
 
   for (let idx = scenesWithShots.length; idx < totalScenes; idx++) {
     const scene = scenes[idx];
-    const existing = priorByScene.get(Number(scene.scene_number));
-    const alreadyCompleted = scenesWithShots.some(s => Number(s.scene_number) === Number(scene.scene_number));
-    if (alreadyCompleted) continue;
-
+    const sceneNo = Number(scene.scene_number);
     const isFirst = idx === 0;
     const isLast = idx === totalScenes - 1;
-    const targetShots = Math.max(2, Math.min(5, Number(scene.shot_count_target) || 3));
 
-    const memoryBlock = memory.length
-      ? `\n═══ STORY MEMORY — what happened so far ═══\n${memory.slice(-MEMORY_WINDOW).join('\n')}\n`
-      : '\n═══ STORY MEMORY ═══\nThis is the opening scene — there is nothing to recap yet.\n';
-
-    const continuitySnapshot = globalContinuity.buildGlobalContinuityState({ scenes: scenesWithShots });
-    const continuityJson = JSON.stringify(continuitySnapshot);
-
+    // The DB-persisted shot simulation is the only authoritative source for
+    // this scene's shot identities and order.
     const simulatedSceneShots = (shotSimulation?.shots || [])
-      .filter(s => Number(s.scene_number) === Number(scene.scene_number))
+      .filter(s => Number(s.scene_number) === sceneNo)
       .sort((a, b) => Number(a.shot_index) - Number(b.shot_index));
 
-    const shotSimulationBlock = `\n═══ LOCKED SHOT SIMULATION — DO NOT CONTRADICT ═══\n${JSON.stringify(simulatedSceneShots)}\nUse this as the causal blueprint for every shot in this scene. Preserve its start/end states, handoffs, character changes, dialogue intent, and order.\n`;
+    if (!simulatedSceneShots.length) {
+      throw new Error(`[ScriptWriter] Scene ${sceneNo} has no persisted shot_simulation checkpoint; refusing to invent shots.`);
+    }
 
+    const expectedIds = simulatedSceneShots.map(s => ({
+      scene_number: Number(s.scene_number),
+      shot_index: Number(s.shot_index),
+    }));
+
+    const targetShots = simulatedSceneShots.length;
+
+    // Carry only the immediately previous scene's terminal visual/narrative state.
+    // Never carry its shot number into this scene's prompt.
     const previousScene = scenesWithShots.length
       ? scenesWithShots[scenesWithShots.length - 1]
       : null;
@@ -2830,85 +2886,145 @@ async function _writeSceneShotsSequential({
       : null;
 
     const inheritedStateBlock = previousEnd
-      ? `\n═══ INHERITED STATE FROM PRIOR SCENE ═══\n${JSON.stringify({
-          scene_number: previousScene.scene_number,
-          last_shot_index: previousEnd.shot_index,
+      ? `\n═══ INHERITED NARRATIVE/VISUAL STATE FROM PRIOR SCENE — NO SHOT NUMBER INHERITED ═══\n${JSON.stringify({
+          prior_scene_number: Number(previousScene.scene_number),
           end_frame_state: previousEnd.end_frame_state || previousEnd.end_state || '',
           next_shot_continuity: previousEnd.next_shot_continuity || previousEnd.handoff_to_next || '',
-        })}\n`
-      : '';
+        })}\nThe prior scene's shot numbering is irrelevant. This scene begins with its persisted local IDs.\n`
+      : '\n═══ INHERITED NARRATIVE/VISUAL STATE ═══\nThis is the opening scene; use the persisted shot simulation opening state.\n';
 
-    const shotUserPrompt = `You are ${idx + 1} of ${totalScenes} scenes into this episode.
-${memoryBlock}${shotSimulationBlock}${inheritedStateBlock}
-═══ GLOBAL CONTINUITY STATE — inherit before inventing new details ═══
-${continuityJson}
+    const shotSimulationBlock = `\n═══ LOCKED PERSISTED SHOT SIMULATION — AUTHORITATIVE ═══
+${JSON.stringify(simulatedSceneShots)}
+LOCKED PERSISTED IDS: ${expectedIds.map(x => `S${x.scene_number}/${x.shot_index}`).join(', ')}
+Preserve the exact causal order, start/end states, handoffs, character changes, dialogue intent, and shot identities from this persisted schema.
+Do not continue numbering from another scene. Do not invent, skip, duplicate, or reorder shots.
+`;
 
+    const shotUserPrompt = `You are writing ${idx + 1} of ${totalScenes} scenes in this episode.
+${shotSimulationBlock}${inheritedStateBlock}
 ═══ WHAT TO WRITE NEXT ═══
-Generate ${targetShots} shots for SCENE ${scene.scene_number}${isFirst ? ' (OPENING — first 2 shots MUST be "hook" type)' : ''}${isLast ? ' (FINAL SCENE — last shot MUST be the cliffhanger)' : ''}:
-Description: ${scene.scene_description}
+Write the cinematic realization of ONLY Scene ${sceneNo}'s persisted shot simulation.
+Generate exactly ${targetShots} shots.
+
+Scene description: ${scene.scene_description}
 Emotional beat: ${scene.emotional_beat || ''}
 Location: ${scene.location || ''}
 Lighting: ${scene.lighting_design || ''}
 Camera language: ${scene.camera_language || ''}
 Characters present: ${(scene.characters_present || []).join(', ')}
 
-SHOT-TO-SHOT CONTINUITY: Write the shots as a causal sequence, never independent prompts.
-The first shot MUST inherit the supplied prior-scene state when one exists.
-Every following shot MUST inherit the prior shot's terminal state.
+SHOT-TO-SHOT CONTINUITY:
+- The first shot begins from the inherited terminal state when one exists.
+- Each following shot inherits the immediately previous shot's terminal state.
+- Do not introduce continuity facts that contradict the persisted shot simulation.
+- ${isFirst ? 'This is the opening scene; the persisted opening shot must establish the episode hook.' : ''}
+- ${isLast ? 'This is the final scene; the persisted final shot must preserve its cliffhanger/handoff.' : ''}
 
 CAST identity locks:
 ${characterBlock}
 
 ${SHOT_SCHEMA}`;
 
-    try {
-      const result = await callLLM(SHOT_SYSTEM_PROMPT, shotUserPrompt, undefined, { useStream: false, temperature: 0.35 });
-      const rawShots = Array.isArray(result?.shots) ? result.shots : [];
+    let result = await callLLM(
+      SHOT_SYSTEM_PROMPT,
+      shotUserPrompt,
+      undefined,
+      { useStream: false, temperature: 0.35 }
+    );
 
-      if (rawShots.length !== targetShots) {
-        throw new Error(
-          `[ScriptWriter] Scene ${scene.scene_number} shot sequence invalid: expected ${targetShots} shots, got ${rawShots.length}`
+    const idsMatch = (shots) =>
+      Array.isArray(shots) &&
+      shots.length === expectedIds.length &&
+      shots.every((shot, i) =>
+        Number(shot?.scene_number) === expectedIds[i].scene_number &&
+        Number(shot?.shot_index) === expectedIds[i].shot_index
+      );
+
+    let repairAttempt = 0;
+    while (!idsMatch(result?.shots)) {
+      repairAttempt += 1;
+      const returnedIds = Array.isArray(result?.shots)
+        ? result.shots.map(shot =>
+            `S${Number.isFinite(Number(shot?.scene_number)) ? Number(shot.scene_number) : 'n/a'}/${Number.isFinite(Number(shot?.shot_index)) ? Number(shot.shot_index) : 'n/a'}`
+          )
+        : [];
+
+      const validationError = `Scene ${sceneNo} requires exact persisted shot IDs ${expectedIds.map(x => `S${x.scene_number}/${x.shot_index}`).join(', ')} in this order; model returned ${returnedIds.join(', ') || 'no usable shots'}.`;
+
+      console.warn(
+        `[ScriptWriter] Shot-ID mismatch S${sceneNo}: ${validationError} repairAttempt=${repairAttempt}`
+      );
+
+      const repaired = await callLLM(
+        `${DIRECTOR_PERSONA}
+You are repairing ONLY shot identifiers for one already-authored cinematic scene.
+The persisted shot_simulation checkpoint is authoritative.
+Preserve every non-ID field, continuity fact, dialogue, staging, action, and ordering exactly.
+Never rewrite, summarize, omit, or invent shots. Return JSON only.`,
+        `SCENE: S${sceneNo}
+EXPECTED PERSISTED IDS:
+${expectedIds.map((x, i) => `${i + 1}. S${x.scene_number}/${x.shot_index}`).join('\n')}
+
+VALIDATION ERROR:
+${validationError}
+
+PREVIOUS CINEMATIC SHOTS:
+${JSON.stringify(result?.shots || [])}
+
+Return ONLY:
+{
+  "shots": [
+    {
+      "scene_number": ${sceneNo},
+      "shot_index": 1,
+      "...all original fields preserved..."
+    }
+  ]
+}
+
+Return the same ${targetShots} shot objects in the same order. Correct ONLY scene_number and shot_index to match the persisted IDs.
+`,
+        undefined,
+        { useStream: false, temperature: 0.02 }
+      );
+
+      // An empty/malformed repair must never erase the previous usable payload.
+      if (Array.isArray(repaired?.shots) && repaired.shots.length === targetShots) {
+        result = { ...result, ...repaired, shots: repaired.shots };
+      } else {
+        console.warn(
+          `[ScriptWriter] Shot-ID repair S${sceneNo} returned no usable shot sequence; ` +
+          `preserving the previous cinematic response for the next retry.`
         );
       }
+    }
 
-      const orderedShots = rawShots.map((shot, shotPos) => {
-        const expectedIndex = shotPos + 1;
-        const rawIndex = Number(shot?.shot_index);
-        if (rawIndex !== expectedIndex) {
-          console.warn(
-            `[ScriptWriter] Normalizing scene-local shot index S${scene.scene_number}: model returned idx=${Number.isFinite(rawIndex) ? rawIndex : 'n/a'}, expected idx=${expectedIndex}`
-          );
-        }
-        const sanitizedShot = _sanitizeDialogueOrActionSemantics(shot);
-        const normalizedStaging = shotStaging.getShotCharacterStaging(sanitizedShot, []);
-        sanitizedShot.character_staging = normalizedStaging;
-        sanitizedShot.character_positions = normalizedStaging.length
-          ? shotStaging.formatCharacterStagingBlock(normalizedStaging)
-          : (sanitizedShot.character_positions || '');
-        return {
-          ...sanitizedShot,
-          scene_number: Number(scene.scene_number),
-          shot_index: expectedIndex,
-        };
+    const orderedShots = result.shots.map((shot, shotPos) => {
+      const sanitizedShot = _sanitizeDialogueOrActionSemantics({ ...shot });
+      const normalizedStaging = shotStaging.getShotCharacterStaging(sanitizedShot, []);
+      sanitizedShot.character_staging = normalizedStaging;
+      sanitizedShot.character_positions = normalizedStaging.length
+        ? shotStaging.formatCharacterStagingBlock(normalizedStaging)
+        : (sanitizedShot.character_positions || '');
+
+      // No renumbering: use the already-validated persisted identity exactly.
+      return {
+        ...sanitizedShot,
+        scene_number: expectedIds[shotPos].scene_number,
+        shot_index: expectedIds[shotPos].shot_index,
+      };
+    });
+
+    const sceneWithShots = { ...scene, shots: orderedShots };
+    scenesWithShots.push(sceneWithShots);
+
+    if (typeof checkpoint === 'function') {
+      await checkpoint({
+        sceneNumber: sceneNo,
+        completedSceneNumbers: scenesWithShots.map(s => Number(s.scene_number)),
+        scenes: scenesWithShots.slice(),
       });
-
-      const sceneWithShots = { ...scene, shots: orderedShots };
-      scenesWithShots.push(sceneWithShots);
-      memory.push(_summarizeSceneForMemory(sceneWithShots));
-
-      if (typeof checkpoint === 'function') {
-        await checkpoint({
-          sceneNumber: Number(scene.scene_number),
-          completedSceneNumbers: scenesWithShots.map(s => Number(s.scene_number)),
-          scenes: scenesWithShots.slice(),
-        });
-        console.log(`[Pipeline] 💾 Scene-shot checkpoint persisted: S${sceneWithShots[0]?.season_number || ''} scene ${scene.scene_number}/${totalScenes}`);
-      }
-    } catch (err) {
-      // Do not silently replace an LLM failure with permanent fallback content.
-      // The durable checkpoint keeps prior completed scenes; this scene will retry on resume.
-      console.error(`[ScriptWriter] Scene ${scene.scene_number} shot generation failed; preserving earlier checkpoints: ${err.message}`);
-      throw err;
+      console.log(`[Pipeline] 💾 Scene-shot checkpoint persisted: S${scene.season_number || ''} scene ${sceneNo}/${totalScenes}`);
     }
   }
 
