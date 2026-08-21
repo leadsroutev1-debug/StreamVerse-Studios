@@ -7,11 +7,15 @@ const DEFAULT_MODEL = process.env.LTX_VISION_MODEL || 'mistral-large-2512';
 const MAX_TARGETED_REPAIRS_PER_KEY = 2;
 
 function _keys() {
-  if (Array.isArray(config.mistralKeys) && config.mistralKeys.length) return config.mistralKeys;
+  if (Array.isArray(config.mistralKeys) && config.mistralKeys.length) {
+    return config.mistralKeys;
+  }
   if (process.env.MISTRAL_KEYS) {
     return process.env.MISTRAL_KEYS.split(',').map(s => s.trim()).filter(Boolean);
   }
-  if (process.env.MISTRAL_API_KEY) return [process.env.MISTRAL_API_KEY];
+  if (process.env.MISTRAL_API_KEY) {
+    return [process.env.MISTRAL_API_KEY];
+  }
   return [];
 }
 
@@ -29,14 +33,47 @@ function _cleanText(value) {
     .trim();
 }
 
-function _parseContent(content) {
-  if (typeof content === 'object' && content !== null) return content;
-  const text = String(content || '').trim();
-  try {
-    return JSON.parse(text);
-  } catch (_) {
-    return { ltx_shot_description: text };
+function _parseStructuredContent(content) {
+  if (content && typeof content === 'object' && !Array.isArray(content)) {
+    return content;
   }
+
+  const text = String(content || '').trim();
+  if (!text) {
+    throw new Error('[LTXVision] Vision model returned empty message.content');
+  }
+
+  try {
+    const parsed = JSON.parse(text);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('JSON root is not an object');
+    }
+    return parsed;
+  } catch (err) {
+    const parseError = new Error(
+      `[LTXVision] Vision model returned non-JSON structured content: ${err.message}`
+    );
+    parseError.code = 'LTX_VISION_INVALID_STRUCTURED_OUTPUT';
+    parseError.rawContent = text;
+    throw parseError;
+  }
+}
+
+function _extractDescription(parsed) {
+  const description = _cleanText(
+    parsed?.ltx_shot_description
+  );
+
+  if (!description) {
+    const error = new Error(
+      '[LTXVision] Vision model returned structured JSON without a non-empty ltx_shot_description field'
+    );
+    error.code = 'LTX_VISION_INVALID_STRUCTURED_OUTPUT';
+    error.structuredResponse = parsed;
+    throw error;
+  }
+
+  return description;
 }
 
 function _quotedDialogue(text) {
@@ -58,10 +95,9 @@ function _dialogueIntegrity(sourceLines, description) {
   const output = outputLines.map(_normalizeDialogue);
   const missingLines = required.filter(line => !output.includes(line));
 
-  // Verify the authored lines occur in their original order. Presence by itself
-  // would permit Mistral to reorder turns, which changes the dramatic event.
   let cursor = 0;
   const outOfOrder = [];
+
   for (const line of required) {
     const index = output.indexOf(line, cursor);
     if (index === -1) continue;
@@ -77,11 +113,13 @@ function _dialogueIntegrity(sourceLines, description) {
   };
 }
 
-function _repairToken(error) {
-  return {
-    semantic: true,
-    message: error?.message || String(error || ''),
-  };
+function _safeLog(label, value) {
+  console.log(label);
+  try {
+    console.log(typeof value === 'string' ? value : JSON.stringify(value, null, 2));
+  } catch (_) {
+    console.log(String(value));
+  }
 }
 
 function _buildTargetedRepairInstruction({
@@ -105,14 +143,21 @@ function _buildTargetedRepairInstruction({
     order,
     'Do not rewrite the shot from scratch unless necessary to make the exact dialogue occur naturally.',
     'Keep the established opening composition, character identity, staging, physical action, camera movement, environment, lighting progression, emotional beat, and ending state intact.',
-    'Do not alter, paraphrase, translate, shorten, sanitize, reorder, or replace any authored dialogue line.',
+    'Do not alter, paraphrase, translate, shorten, sanitize, reorder, replace, or omit any authored dialogue line.',
     'Do not invent a new plot event, character, prop, location, wardrobe change, or consequential story fact.',
     'Return the COMPLETE ltx_shot_description as one coherent chronological cinematic description, not a patch, explanation, diff, or commentary.',
     'Every required authored line must appear verbatim inside quotation marks in the original source order.',
   ].filter(Boolean).join(' ');
 }
 
-function _buildInitialUser({ intent, scene, characterHints, repairInstruction, previousDescription, sourceLines }) {
+function _buildInitialUser({
+  intent,
+  scene,
+  characterHints,
+  repairInstruction,
+  previousDescription,
+  sourceLines,
+}) {
   const dialogueRequirement = intent.dialogue || intent.conversation_reason
     ? [
         'THIS IS A CONVERSATIONAL SHOT.',
@@ -145,7 +190,15 @@ function _buildInitialUser({ intent, scene, characterHints, repairInstruction, p
   ].filter(Boolean).join('\n');
 }
 
-async function _requestVision({ key, model, system, userText, imageBuffer, imageMime }) {
+async function _requestVision({
+  key,
+  model,
+  system,
+  userText,
+  imageBuffer,
+  imageMime,
+  attemptLabel,
+}) {
   const response = await axios.post(
     'https://api.mistral.ai/v1/chat/completions',
     {
@@ -172,17 +225,34 @@ async function _requestVision({ key, model, system, userText, imageBuffer, image
     }
   );
 
-  const raw = response?.data?.choices?.[0]?.message?.content;
-  const parsed = _parseContent(raw);
-  const description = _cleanText(
-    parsed?.ltx_shot_description || parsed?.description || raw
+  const message = response?.data?.choices?.[0]?.message;
+  const rawContent = message?.content;
+
+  _safeLog(
+    `[LTXVision] VISION RESPONSE ${attemptLabel}:`,
+    rawContent
   );
 
-  if (!description) {
-    throw new Error('[LTXVision] Vision model returned an empty LTX description');
-  }
+  const parsed = _parseStructuredContent(rawContent);
 
-  return description;
+  _safeLog(
+    `[LTXVision] PARSED VISION OBJECT ${attemptLabel}:`,
+    parsed
+  );
+
+  const description = _extractDescription(parsed);
+
+  _safeLog(
+    `[LTXVision] SHOT DESCRIPTION ${attemptLabel}:`,
+    description
+  );
+
+  return {
+    description,
+    rawContent,
+    parsed,
+    response,
+  };
 }
 
 async function describeForLTX({
@@ -195,7 +265,9 @@ async function describeForLTX({
   repairInstruction = '',
 }) {
   const keys = _keys();
-  if (!keys.length) throw new Error('[LTXVision] No Mistral keys configured');
+  if (!keys.length) {
+    throw new Error('[LTXVision] No Mistral keys configured');
+  }
 
   const intent = {
     shot_purpose: shot.shot_purpose || shot.purpose || '',
@@ -207,13 +279,17 @@ async function describeForLTX({
     environment: shot.scene_environment || scene.location || scene.scene_environment || '',
     dialogue: shot.dialogue_or_action || shot.dialogue || shot.conversation || '',
     conversation_reason: shot.conversation_reason || '',
-    characters_in_shot: Array.isArray(shot.characters_in_shot) ? shot.characters_in_shot : [],
+    characters_in_shot: Array.isArray(shot.characters_in_shot)
+      ? shot.characters_in_shot
+      : [],
   };
 
   const characterHints = (characters || [])
-    .filter(c => intent.characters_in_shot.some(
-      name => String(name).toLowerCase() === String(c.name || '').toLowerCase()
-    ))
+    .filter(c =>
+      intent.characters_in_shot.some(
+        name => String(name).toLowerCase() === String(c.name || '').toLowerCase()
+      )
+    )
     .map(c => ({
       name: c.name,
       visual_anchor: c.visual_anchor || c.description || '',
@@ -252,10 +328,11 @@ async function describeForLTX({
         `${currentRepairInstruction ? ' mode=targeted-repair' : ' mode=initial'}`
       );
 
-      // One provider request can produce the first description followed by a
-      // bounded number of targeted semantic repairs. Semantic mismatch does NOT
-      // advance keyIndex because the key is healthy and the request succeeded.
-      for (let repairAttempt = 0; repairAttempt <= MAX_TARGETED_REPAIRS_PER_KEY; repairAttempt++) {
+      for (
+        let repairAttempt = 0;
+        repairAttempt <= MAX_TARGETED_REPAIRS_PER_KEY;
+        repairAttempt++
+      ) {
         const userText = _buildInitialUser({
           intent,
           scene,
@@ -265,15 +342,18 @@ async function describeForLTX({
           sourceLines,
         });
 
-        let description;
+        let vision;
         try {
-          description = await _requestVision({
+          vision = await _requestVision({
             key,
             model,
             system,
             userText,
             imageBuffer,
             imageMime,
+            attemptLabel:
+              `keyIndex=${keyIndex + 1}/${keys.length} ` +
+              `repairAttempt=${repairAttempt}/${MAX_TARGETED_REPAIRS_PER_KEY}`,
           });
         } catch (err) {
           const status = Number(err?.response?.status || 0);
@@ -282,15 +362,15 @@ async function describeForLTX({
           console.warn(
             `[LTXVision] request keyIndex=${keyIndex + 1}/${keys.length} ` +
             `repairAttempt=${repairAttempt}/${MAX_TARGETED_REPAIRS_PER_KEY} failed ` +
-            `status=${status || 'n/a'} detail=${err?.response?.data?.message || err.message}`
+            `status=${status || 'n/a'} ` +
+            `code=${err.code || 'n/a'} ` +
+            `detail=${err?.response?.data?.message || err.message}`
           );
 
-          // Provider/auth errors belong to the key-rotation layer. Semantic
-          // validation errors are handled below without rotating keys.
-          if ([400, 401, 403].includes(status)) throw err;
           throw err;
         }
 
+        const description = vision.description;
         const integrity = _dialogueIntegrity(sourceLines, description);
 
         if (integrity.valid) {
@@ -301,10 +381,12 @@ async function describeForLTX({
             `conversation=${Boolean(intent.dialogue || intent.conversation_reason)} ` +
             `preserved=${sourceLines.length}/${sourceLines.length}`
           );
+
           return description;
         }
 
         previousDescription = description;
+
         const missingText = integrity.missingLines.length
           ? integrity.missingLines.map(line => `"${line}"`).join('; ')
           : 'none';
@@ -319,6 +401,7 @@ async function describeForLTX({
         semanticError.code = 'LTX_AUTHORED_DIALOGUE_INTEGRITY';
         semanticError.missingLines = integrity.missingLines;
         semanticError.outOfOrder = integrity.outOfOrder;
+        semanticError.previousDescription = previousDescription;
 
         if (repairAttempt >= MAX_TARGETED_REPAIRS_PER_KEY) {
           lastError = semanticError;
@@ -347,20 +430,28 @@ async function describeForLTX({
       const status = Number(err?.response?.status || 0);
       console.warn(
         `[LTXVision] attempt keyIndex=${keyIndex + 1}/${keys.length} failed ` +
-        `status=${status || 'n/a'} detail=${err?.response?.data?.message || err.message}`
+        `status=${status || 'n/a'} code=${err.code || 'n/a'} ` +
+        `detail=${err?.response?.data?.message || err.message}`
       );
 
-      // Auth/provider failures can justify trying another configured key.
-      // Semantic dialogue failure after targeted repair does not: rotating the
-      // key does not change the model behavior and wastes quota unnecessarily.
+      // A semantic dialogue failure must never rotate keys. All repair attempts
+      // for the current healthy key are exhausted before the error propagates.
       if (err?.code === 'LTX_AUTHORED_DIALOGUE_INTEGRITY') {
         throw err;
       }
 
-      if ([400, 401, 403].includes(status)) throw err;
+      // Malformed/wrong-schema model output is also a model-output failure, not
+      // evidence that the configured key is bad. Propagate it rather than
+      // pretending the next key will fix a deterministic response-contract bug.
+      if (err?.code === 'LTX_VISION_INVALID_STRUCTURED_OUTPUT') {
+        throw err;
+      }
 
-      // Transient/provider failures can advance to another configured key.
-      // Reset semantic repair state so the new key gets a clean initial pass.
+      if ([400, 401, 403].includes(status)) {
+        throw err;
+      }
+
+      // Only genuine transient/provider failures advance to another key.
       currentRepairInstruction = repairInstruction || '';
       previousDescription = '';
     }
