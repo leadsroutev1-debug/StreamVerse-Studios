@@ -10,17 +10,76 @@ function _ffmpegHeaders() {
 }
 
 /**
- * Wake up the Render FFmpeg service (anti-cold-start ping).
+ * Wait until the FFmpeg service is actually reachable and its HTTP server is
+ * responding to /health. This is readiness-based rather than sleep-based:
+ * waking a Replit service can take an unpredictable amount of time, so a
+ * fixed "wake and wait N seconds" is never used as proof of availability.
+ */
+async function waitForFFmpeg({
+  timeoutMs = config.ffmpegReadyTimeoutMs,
+  initialDelayMs = config.ffmpegReadyInitialDelayMs,
+  maxDelayMs = config.ffmpegReadyMaxDelayMs,
+} = {}) {
+  const startedAt = Date.now();
+  let delayMs = Math.max(0, Number(initialDelayMs) || 0);
+  let attempt = 0;
+  let lastError = null;
+
+  while (true) {
+    attempt += 1;
+
+    try {
+      const resp = await axios.get(config.ffmpegServiceUrl + '/health', {
+        headers: _ffmpegHeaders(),
+        timeout: Math.min(10000, Math.max(3000, Number(config.ffmpegHealthRequestTimeoutMs) || 5000)),
+        validateStatus: () => true,
+      });
+
+      if (resp.status >= 200 && resp.status < 300 && resp.data?.ok === true) {
+        const elapsedMs = Date.now() - startedAt;
+        console.log(`[Compiler] FFmpeg ready after ${elapsedMs}ms (health attempt ${attempt}).`);
+        return resp.data;
+      }
+
+      lastError = new Error(`FFmpeg health returned HTTP ${resp.status}`);
+    } catch (err) {
+      lastError = err;
+    }
+
+    const elapsedMs = Date.now() - startedAt;
+    if (timeoutMs > 0 && elapsedMs >= timeoutMs) {
+      throw new Error(
+        `[Compiler] FFmpeg service did not become ready within ${timeoutMs}ms. ` +
+        `Last health error: ${lastError?.message || 'unknown error'}`
+      );
+    }
+
+    console.log(
+      `[Compiler] FFmpeg not ready yet (attempt ${attempt}, elapsed ${elapsedMs}ms). ` +
+      `Retrying health check in ${delayMs}ms...`
+    );
+
+    if (delayMs > 0) await sleep(delayMs);
+    delayMs = Math.min(
+      Math.max(0, Number(maxDelayMs) || 5000),
+      Math.max(250, delayMs > 0 ? delayMs * 1.5 : 250)
+    );
+  }
+}
+
+/**
+ * Compatibility wrapper retained for callers that explicitly wake the service.
+ * It now waits for an actual successful health response instead of treating a
+ * single request or a fixed delay as proof that FFmpeg is ready.
  */
 async function wakeFFmpeg() {
   try {
-    await axios.get(config.ffmpegServiceUrl + '/health', {
-      headers: _ffmpegHeaders(),
-      timeout: 30000,
-    });
-    console.log('[Compiler] FFmpeg service awake.');
+    await waitForFFmpeg();
+    console.log('[Compiler] FFmpeg service is ready.');
+    return true;
   } catch (err) {
-    console.warn('[Compiler] Wake ping failed (service may still be starting):', err.message);
+    console.warn('[Compiler] FFmpeg readiness check failed:', err.message);
+    return false;
   }
 }
 
@@ -48,7 +107,7 @@ function resolveLayout(raw) {
   const mapped = LAYOUT_FALLBACK_MAP[lower];
   if (mapped) {
     console.log(`[Compiler] Layout "${raw}" mapped to "${mapped}" (effects handled by Magic Hour)`);
-    return mapped;
+    return 'cut';
   }
   console.warn(`[Compiler] Unknown layout "${raw}" — defaulting to "cut"`);
   return 'cut';
@@ -85,7 +144,6 @@ function resolveTransition(raw) {
 async function composeScene(clips, composition = 'cut', sceneEffects = {}) {
   const layout = resolveLayout(composition);
 
-  // Build the clip payload — plain URL strings only, no effects
   const clipPayload = (clips || [])
     .map(c => {
       if (typeof c === 'string') return c;
@@ -98,10 +156,12 @@ async function composeScene(clips, composition = 'cut', sceneEffects = {}) {
     throw new Error('[Compiler] composeScene called with no valid clips');
   }
 
+  // Replit may suspend the FFmpeg service between scene jobs. Never submit
+  // until the actual health endpoint proves the service is ready.
+  await waitForFFmpeg();
+
   const body = { clips: clipPayload, layout };
 
-  // Only forward a safe transition if the scene explicitly requests one
-  // and the layout is "cut". No other scene-level effects are forwarded.
   if (layout === 'cut' && sceneEffects.transition) {
     const safeTransition = resolveTransition(sceneEffects.transition);
     if (safeTransition) {
@@ -142,9 +202,12 @@ async function mergeScenes(clips, { introBumperUrl, outroBumperUrl, ...mergeEffe
     ...(outroBumperUrl ? [outroBumperUrl] : []),
   ].filter(Boolean);
 
+  // Same readiness gate for the final master. The Replit service may have
+  // spun down while shot/scene generation was running.
+  await waitForFFmpeg();
+
   const body = { clips: mergeClips };
 
-  // Only forward a safe transition — no final color grades, overlays, or text
   if (mergeEffects.transition) {
     const safeTransition = resolveTransition(mergeEffects.transition);
     if (safeTransition) {
@@ -192,21 +255,13 @@ async function pollFFmpegJob(jobId) {
     }
     console.log(`[Compiler] FFmpeg job ${jobId} status=${job.status} (${attempt}/${maxAttempts})`);
   }
-  throw new Error(`[Compiler] FFmpeg job ${jobId} timed out after ${maxAttempts} attempts`);
+  throw new Error(`[Compiler] FFmpeg job ${jobId} timed out after ${maxAttempts} polling attempts`);
 }
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-/**
- * Compose a scene from its shot clips, skipping the FFmpeg round-trip
- * entirely when there's only one clip — a single-shot scene has nothing to
- * concatenate, and sending a 1-item clip list through the FFmpeg service was
- * an unnecessary trip that could trip up the compile step for no benefit.
- * Returns the final scene video URL directly (no jobId to poll for the
- * single-clip case).
- */
 async function composeSceneSmartAndWait(clips, composition = 'cut', sceneEffects = {}) {
   const plainClips = (clips || [])
     .map(c => (typeof c === 'string' ? c : c?.url))
@@ -221,4 +276,11 @@ async function composeSceneSmartAndWait(clips, composition = 'cut', sceneEffects
   return pollFFmpegJob(jobId);
 }
 
-module.exports = { wakeFFmpeg, composeScene, mergeScenes, pollFFmpegJob, composeSceneSmartAndWait };
+module.exports = {
+  wakeFFmpeg,
+  waitForFFmpeg,
+  composeScene,
+  mergeScenes,
+  pollFFmpegJob,
+  composeSceneSmartAndWait,
+};
