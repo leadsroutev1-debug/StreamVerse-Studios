@@ -5,7 +5,7 @@
   "main": "index.js",
   "scripts": {
     "start": "bash start.sh",
-    "start:node": "node src/ensureLtxPipelineContracts.js && node src/ensureSceneTransitionContract.js && node index.js",
+    "start:node": "node src/ensureLtxPipelineContracts.js && node src/ensureSceneTransitionContract.js && node src/ensureSceneEditContract.js && node index.js",
     "start:video": "bash video_engine/run.sh",
     "dev": "vite",
     "build": "vite build"
@@ -16,6 +16,8 @@
     "express": "^4.22.2",
     "form-data": "^4.0.6",
     "mysql2": "^3.23.3",
+    "node-cron": "^3.0.3",
+    "nodemailer": "^6.10.1",
     "node-cron": "^3.0.3",
     "nodemailer": "^6.10.1",
     "sharp": "^0.35.3",
