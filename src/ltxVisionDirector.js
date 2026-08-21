@@ -4,6 +4,7 @@ const axios = require('axios');
 const config = require('./config');
 
 const DEFAULT_MODEL = process.env.LTX_VISION_MODEL || 'mistral-large-2512';
+const MAX_TARGETED_REPAIRS_PER_KEY = 2;
 
 function _keys() {
   if (Array.isArray(config.mistralKeys) && config.mistralKeys.length) return config.mistralKeys;
@@ -51,30 +52,137 @@ function _normalizeDialogue(text) {
     .trim();
 }
 
-function _buildVisionRepairInstruction({
-  description,
-  intent,
-  sourceLines,
-  repairInstruction,
+function _dialogueIntegrity(sourceLines, description) {
+  const required = sourceLines.map(_normalizeDialogue);
+  const outputLines = _quotedDialogue(description);
+  const output = outputLines.map(_normalizeDialogue);
+  const missingLines = required.filter(line => !output.includes(line));
+
+  // Verify the authored lines occur in their original order. Presence by itself
+  // would permit Mistral to reorder turns, which changes the dramatic event.
+  let cursor = 0;
+  const outOfOrder = [];
+  for (const line of required) {
+    const index = output.indexOf(line, cursor);
+    if (index === -1) continue;
+    if (index !== cursor) outOfOrder.push(line);
+    cursor = index + 1;
+  }
+
+  return {
+    outputLines,
+    missingLines,
+    outOfOrder,
+    valid: missingLines.length === 0 && outOfOrder.length === 0,
+  };
+}
+
+function _repairToken(error) {
+  return {
+    semantic: true,
+    message: error?.message || String(error || ''),
+  };
+}
+
+function _buildTargetedRepairInstruction({
+  previousDescription,
+  missingLines,
+  outOfOrder,
 }) {
-  const authoredDialogue = sourceLines.length
-    ? `Preserve these exact authored lines verbatim and in order: ${sourceLines.map(line => `"${line}"`).join(' ')}`
-    : 'No authored dialogue lines were supplied; do not invent consequential plot facts.';
+  const missing = missingLines.length
+    ? `Restore these exact missing line(s) verbatim: ${missingLines.map(line => `"${line}"`).join(' ')}`
+    : 'No authored line is missing; correct the dialogue order without changing the authored wording.';
+
+  const order = outOfOrder.length
+    ? `These authored lines were detected out of order and must be restored to source order: ${outOfOrder.map(line => `"${line}"`).join(' ')}`
+    : '';
 
   return [
-    'Previous LTX description:',
-    description || '(none)',
-    '',
-    'Correction required:',
-    repairInstruction || 'The previous description did not fully realize the supplied shot intent.',
-    '',
-    'Rewrite the complete description from the image and intent.',
-    authoredDialogue,
-    'Keep the supplied visual identity, staging, action, camera, environment and ending state coherent.',
-    'Return only the finished ltx_shot_description JSON object.',
-    '',
-    `AUTHORITATIVE INTENT: ${JSON.stringify(intent)}`,
-  ].join('\n');
+    'TARGETED DIALOGUE REPAIR ONLY.',
+    'The previous cinematic description is structurally useful and must be preserved wherever possible.',
+    `PREVIOUS DESCRIPTION: ${previousDescription}`,
+    missing,
+    order,
+    'Do not rewrite the shot from scratch unless necessary to make the exact dialogue occur naturally.',
+    'Keep the established opening composition, character identity, staging, physical action, camera movement, environment, lighting progression, emotional beat, and ending state intact.',
+    'Do not alter, paraphrase, translate, shorten, sanitize, reorder, or replace any authored dialogue line.',
+    'Do not invent a new plot event, character, prop, location, wardrobe change, or consequential story fact.',
+    'Return the COMPLETE ltx_shot_description as one coherent chronological cinematic description, not a patch, explanation, diff, or commentary.',
+    'Every required authored line must appear verbatim inside quotation marks in the original source order.',
+  ].filter(Boolean).join(' ');
+}
+
+function _buildInitialUser({ intent, scene, characterHints, repairInstruction, previousDescription, sourceLines }) {
+  const dialogueRequirement = intent.dialogue || intent.conversation_reason
+    ? [
+        'THIS IS A CONVERSATIONAL SHOT.',
+        'Treat authored dialogue as immutable source material, not optional inspiration.',
+        'When exact lines exist, reproduce EVERY exact line verbatim inside quotation marks and in source order.',
+        sourceLines.length
+          ? `REQUIRED LINES: ${sourceLines.map(line => `"${line}"`).join(' ')}`
+          : 'No exact lines were supplied; create only the natural exchange required by the stated conversational beat.',
+        'Identify the speaker, place the speaker physically in the scene, describe delivery, and describe listener reactions around each line in chronological order.',
+        'The description is invalid if any required authored line is missing, altered, or reordered.',
+      ].join(' ')
+    : 'No dialogue intent is supplied. Keep the shot visually expressive and do not invent consequential dialogue.';
+
+  return [
+    'AUTHORITATIVE SHOT INTENT:',
+    JSON.stringify(intent),
+    'SCENE CONTEXT:',
+    JSON.stringify({
+      location: scene.location || '',
+      lighting_design: scene.lighting_design || '',
+      emotional_beat: scene.emotional_beat || '',
+    }),
+    'LOCKED CHARACTER HINTS:',
+    JSON.stringify(characterHints),
+    'DIALOGUE REQUIREMENT:',
+    dialogueRequirement,
+    repairInstruction ? `REPAIR INSTRUCTION: ${repairInstruction}` : '',
+    previousDescription ? `PREVIOUS DESCRIPTION TO PRESERVE: ${previousDescription}` : '',
+    'Inspect the attached final still and write ONE complete natural chronological cinematic LTX description from the established first frame through the terminal state. Favor concrete observable action and real-time progression. Return only the finished ltx_shot_description JSON object.',
+  ].filter(Boolean).join('\n');
+}
+
+async function _requestVision({ key, model, system, userText, imageBuffer, imageMime }) {
+  const response = await axios.post(
+    'https://api.mistral.ai/v1/chat/completions',
+    {
+      model,
+      messages: [
+        { role: 'system', content: system },
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: userText },
+            { type: 'image_url', image_url: _imageDataUrl(imageBuffer, imageMime) },
+          ],
+        },
+      ],
+      temperature: 0.55,
+      response_format: { type: 'json_object' },
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${key}`,
+        'Content-Type': 'application/json',
+      },
+      timeout: 180000,
+    }
+  );
+
+  const raw = response?.data?.choices?.[0]?.message?.content;
+  const parsed = _parseContent(raw);
+  const description = _cleanText(
+    parsed?.ltx_shot_description || parsed?.description || raw
+  );
+
+  if (!description) {
+    throw new Error('[LTXVision] Vision model returned an empty LTX description');
+  }
+
+  return description;
 }
 
 async function describeForLTX({
@@ -99,17 +207,13 @@ async function describeForLTX({
     environment: shot.scene_environment || scene.location || scene.scene_environment || '',
     dialogue: shot.dialogue_or_action || shot.dialogue || shot.conversation || '',
     conversation_reason: shot.conversation_reason || '',
-    characters_in_shot: Array.isArray(shot.characters_in_shot)
-      ? shot.characters_in_shot
-      : [],
+    characters_in_shot: Array.isArray(shot.characters_in_shot) ? shot.characters_in_shot : [],
   };
 
   const characterHints = (characters || [])
-    .filter(c =>
-      intent.characters_in_shot.some(
-        name => String(name).toLowerCase() === String(c.name || '').toLowerCase()
-      )
-    )
+    .filter(c => intent.characters_in_shot.some(
+      name => String(name).toLowerCase() === String(c.name || '').toLowerCase()
+    ))
     .map(c => ({
       name: c.name,
       visual_anchor: c.visual_anchor || c.description || '',
@@ -121,143 +225,144 @@ async function describeForLTX({
     'The authored shot intent is the narrative target: preserve what the shot is supposed to accomplish while respecting what is visibly present in the image.',
     'Write ONE complete, natural, chronological cinematic description of the shot unfolding in real time.',
     'Do not summarize the shot. Stage it as something the viewer experiences from the opening frame through the final state.',
-    'Cover every element that matters to the shot: visible character identity and staging, physical action and reactions, camera movement, environmental change, lighting evolution, ambience or music when supported, dialogue or vocal performance, and the terminal visual state.',
+    'Cover visible character identity and staging, physical action and reactions, camera movement, environmental change, lighting evolution, ambience or music when supported, dialogue or vocal performance, and the terminal visual state.',
     'Use the image to establish the opening composition. Describe motion as changes from that established image rather than pretending the starting frame is unknown.',
     'Dialogue is a first-class dramatic event whenever the authored intent contains dialogue or conversational purpose.',
-    'Whenever dialogue is present, write the literal spoken words in quotation marks, identify the speaker, place the speaker in the physical scene, describe the delivery, and describe the listener response or next conversational beat in chronological order.',
-    'If exact dialogue lines are supplied, preserve them verbatim and in the same order. Do not paraphrase, shorten, translate, sanitize, reorder, or replace them.',
-    'If conversational intent is supplied without exact dialogue, write a natural short exchange that serves only the stated dramatic beat and does not invent new consequential plot facts.',
+    'Whenever dialogue is present, write the literal spoken words in quotation marks, identify the speaker, place the speaker in the physical scene, describe delivery, and describe listener response or the next conversational beat in chronological order.',
+    'Exact authored dialogue is immutable source material. Preserve every exact line verbatim and in the same order. Do not paraphrase, shorten, translate, sanitize, reorder, replace, or omit it.',
     'Use dialogue as visible performance: facial reactions, breathing, gesture, gaze, pauses, interruptions and posture changes should occur around the spoken words in real time.',
     'Do not replace dialogue with abstractions such as "they speak", "she talks", "he responds", "their voices overlap", or "the conversation continues".',
     'Do not invent characters, props, locations, wardrobe changes, or consequential events absent from the supplied image, scene context, or shot intent.',
     'Do not output analysis, labels, shot contracts, spatial maps, metadata, prompt instructions, negative prompts, implementation language, or editing commands.',
     'Return JSON with exactly one field: ltx_shot_description.',
-    'The final value must be the actual finished cinematic description that can be sent directly to LTX.',
+    'The field value must be the actual finished cinematic description that can be sent directly to LTX.',
   ].join(' ');
 
   const sourceLines = _quotedDialogue(intent.dialogue || '');
-  let activeRepairInstruction = repairInstruction || '';
+  let currentRepairInstruction = repairInstruction || '';
   let previousDescription = '';
-
-  const buildUser = (extraRepair = '') => [
-    'AUTHORITATIVE SHOT INTENT:',
-    JSON.stringify(intent),
-    'SCENE CONTEXT:',
-    JSON.stringify({
-      location: scene.location || '',
-      lighting_design: scene.lighting_design || '',
-      emotional_beat: scene.emotional_beat || '',
-    }),
-    'LOCKED CHARACTER HINTS:',
-    JSON.stringify(characterHints),
-    'DIALOGUE REQUIREMENT:',
-    intent.dialogue || intent.conversation_reason
-      ? [
-          'THIS IS A CONVERSATIONAL SHOT. SPOKEN WORDS ARE MANDATORY WHEN AUTHORED DIALOGUE IS PRESENT.',
-          'Treat authored dialogue as immutable source material, not optional inspiration.',
-          'Reproduce every supplied exact dialogue line verbatim inside quotation marks.',
-          'Do not summarize, paraphrase, shorten, replace, sanitize, or omit any supplied line.',
-          sourceLines.length
-            ? `REQUIRED LINES — EACH ONE MUST APPEAR VERBATIM IN THE FINAL OUTPUT: ${sourceLines.map(line => `"${line}"`).join(' ')}`
-            : 'No exact lines were supplied; create only the natural exchange required by the supplied conversational beat.',
-          'Place each spoken line at the moment it is performed, identify the speaker, and describe the listener reaction and next turn around it.',
-          'The final LTX description is incomplete if any required authored line is absent.',
-        ].join(' ')
-      : 'No dialogue intent is supplied. Keep the shot visually expressive and do not invent consequential dialogue.',
-    extraRepair ? `REPAIR INSTRUCTION: ${extraRepair}` : '',
-    previousDescription ? `PREVIOUS ATTEMPT TO PRESERVE: ${previousDescription}` : '',
-    'Now inspect the attached final still and write the complete cinematic LTX image-to-video description. Favor concrete, observable detail and a clear beginning-to-end progression. Do not return a terse label or summary.',
-  ].filter(Boolean).join('\n');
-
-  const buildRepairInstruction = (missingLines) => {
-    if (!missingLines.length) return activeRepairInstruction || '';
-    return [
-      'The previous response omitted authored dialogue that is mandatory for this shot.',
-      `Restore these exact missing line(s) verbatim: ${missingLines.map(line => `"${line}"`).join(' ')}`,
-      'Keep the existing visual action, staging, camera, environment and ending state unless changing them is necessary to naturally place the dialogue.',
-      'Return the COMPLETE rewritten ltx_shot_description, not a patch, summary, explanation, or abbreviated replacement.',
-      'Do not drop any previously supplied dialogue line while fixing the missing ones.',
-    ].join(' ');
-  };
-
-  const makeContent = () => [
-    { type: 'text', text: buildUser(activeRepairInstruction || '') },
-    { type: 'image_url', image_url: _imageDataUrl(imageBuffer, imageMime) },
-  ];
-
   let lastError = null;
 
-  for (let i = 0; i < keys.length; i++) {
-    const key = keys[i];
+  for (let keyIndex = 0; keyIndex < keys.length; keyIndex++) {
+    const key = keys[keyIndex];
 
     try {
       console.log(
-        `[LTXVision] request keyIndex=${i + 1}/${keys.length} model=${model}` +
-        `${repairInstruction ? ' repair=true' : ''}`
+        `[LTXVision] request keyIndex=${keyIndex + 1}/${keys.length} model=${model}` +
+        `${currentRepairInstruction ? ' mode=targeted-repair' : ' mode=initial'}`
       );
 
-      const response = await axios.post(
-        'https://api.mistral.ai/v1/chat/completions',
-        {
-          model,
-          messages: [
-            { role: 'system', content: system },
-            { role: 'user', content: makeContent() },
-          ],
-          temperature: 0.55,
-          response_format: { type: 'json_object' },
-        },
-        {
-          headers: {
-            Authorization: `Bearer ${key}`,
-            'Content-Type': 'application/json',
-          },
-          timeout: 180000,
+      // One provider request can produce the first description followed by a
+      // bounded number of targeted semantic repairs. Semantic mismatch does NOT
+      // advance keyIndex because the key is healthy and the request succeeded.
+      for (let repairAttempt = 0; repairAttempt <= MAX_TARGETED_REPAIRS_PER_KEY; repairAttempt++) {
+        const userText = _buildInitialUser({
+          intent,
+          scene,
+          characterHints,
+          repairInstruction: currentRepairInstruction,
+          previousDescription,
+          sourceLines,
+        });
+
+        let description;
+        try {
+          description = await _requestVision({
+            key,
+            model,
+            system,
+            userText,
+            imageBuffer,
+            imageMime,
+          });
+        } catch (err) {
+          const status = Number(err?.response?.status || 0);
+          lastError = err;
+
+          console.warn(
+            `[LTXVision] request keyIndex=${keyIndex + 1}/${keys.length} ` +
+            `repairAttempt=${repairAttempt}/${MAX_TARGETED_REPAIRS_PER_KEY} failed ` +
+            `status=${status || 'n/a'} detail=${err?.response?.data?.message || err.message}`
+          );
+
+          // Provider/auth errors belong to the key-rotation layer. Semantic
+          // validation errors are handled below without rotating keys.
+          if ([400, 401, 403].includes(status)) throw err;
+          throw err;
         }
-      );
 
-      const raw = response?.data?.choices?.[0]?.message?.content;
-      const parsed = _parseContent(raw);
-      const description = _cleanText(
-        parsed?.ltx_shot_description || parsed?.description || raw
-      );
+        const integrity = _dialogueIntegrity(sourceLines, description);
 
-      if (!description) {
-        throw new Error('[LTXVision] Vision model returned an empty LTX description');
-      }
+        if (integrity.valid) {
+          console.log(
+            `[LTXVision] completed keyIndex=${keyIndex + 1} ` +
+            `repairAttempt=${repairAttempt} ` +
+            `quotedSpeech=${integrity.outputLines.length} ` +
+            `conversation=${Boolean(intent.dialogue || intent.conversation_reason)} ` +
+            `preserved=${sourceLines.length}/${sourceLines.length}`
+          );
+          return description;
+        }
 
-      const outputLines = _quotedDialogue(description);
-      const normalizedOutput = outputLines.map(_normalizeDialogue);
-      const missing = sourceLines
-        .map(_normalizeDialogue)
-        .filter(line => !normalizedOutput.includes(line));
-
-      if (missing.length) {
         previousDescription = description;
-        activeRepairInstruction = buildRepairInstruction(missing);
-        throw new Error(
-          `[LTXVision] Required authored dialogue missing or altered: ` +
-          `${missing.map(line => `"${line}"`).join('; ')}`
+        const missingText = integrity.missingLines.length
+          ? integrity.missingLines.map(line => `"${line}"`).join('; ')
+          : 'none';
+        const orderText = integrity.outOfOrder.length
+          ? integrity.outOfOrder.map(line => `"${line}"`).join('; ')
+          : 'none';
+
+        const semanticError = new Error(
+          `[LTXVision] Required authored dialogue missing or altered: ${missingText}. ` +
+          `outOfOrder=${orderText}`
+        );
+        semanticError.code = 'LTX_AUTHORED_DIALOGUE_INTEGRITY';
+        semanticError.missingLines = integrity.missingLines;
+        semanticError.outOfOrder = integrity.outOfOrder;
+
+        if (repairAttempt >= MAX_TARGETED_REPAIRS_PER_KEY) {
+          lastError = semanticError;
+          console.warn(
+            `[LTXVision] targeted repair exhausted keyIndex=${keyIndex + 1}/${keys.length} ` +
+            `missing=${missingText} outOfOrder=${orderText}`
+          );
+          break;
+        }
+
+        currentRepairInstruction = _buildTargetedRepairInstruction({
+          previousDescription,
+          missingLines: integrity.missingLines,
+          outOfOrder: integrity.outOfOrder,
+        });
+
+        console.warn(
+          `[LTXVision] authored dialogue integrity failed; targeted repair ` +
+          `attempt=${repairAttempt + 1}/${MAX_TARGETED_REPAIRS_PER_KEY} ` +
+          `missing=${missingText} outOfOrder=${orderText}`
         );
       }
-
-      console.log(
-        `[LTXVision] completed quotedSpeech=${outputLines.length} ` +
-        `conversation=${Boolean(intent.dialogue || intent.conversation_reason)} ` +
-        `preserved=${sourceLines.length - missing.length}/${sourceLines.length}`
-      );
-
-      return description;
     } catch (err) {
       lastError = err;
 
       const status = Number(err?.response?.status || 0);
       console.warn(
-        `[LTXVision] attempt ${i + 1}/${keys.length} failed ` +
+        `[LTXVision] attempt keyIndex=${keyIndex + 1}/${keys.length} failed ` +
         `status=${status || 'n/a'} detail=${err?.response?.data?.message || err.message}`
       );
 
+      // Auth/provider failures can justify trying another configured key.
+      // Semantic dialogue failure after targeted repair does not: rotating the
+      // key does not change the model behavior and wastes quota unnecessarily.
+      if (err?.code === 'LTX_AUTHORED_DIALOGUE_INTEGRITY') {
+        throw err;
+      }
+
       if ([400, 401, 403].includes(status)) throw err;
+
+      // Transient/provider failures can advance to another configured key.
+      // Reset semantic repair state so the new key gets a clean initial pass.
+      currentRepairInstruction = repairInstruction || '';
+      previousDescription = '';
     }
   }
 
