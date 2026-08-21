@@ -38,6 +38,7 @@ const DEFAULT_MAX_DURATION = 10;
 const HIGH_RES_WIDTH = 1024;
 const HIGH_RES_HEIGHT = 1536;
 const MAX_SEED = 2 ** 31 - 1;
+const MAX_VISION_REPAIR_ATTEMPTS = 3;
 
 function _getPositiveNumber(value, fallback) { const n = Number(value); return Number.isFinite(n) && n > 0 ? n : fallback; }
 function _resolveResolution(shotMeta = {}) {
@@ -63,7 +64,7 @@ function _quotedDialogue(text) {
     .filter(Boolean);
 }
 function _normalizeDialogue(text) {
-  return String(text || '').replace(/\s+/g, ' ').trim();
+  return String(text || '').replace(/[“”]/g, '"').replace(/\s+/g, ' ').trim();
 }
 
 async function _resolvePrompt(imageBuffer, shotMeta) {
@@ -74,8 +75,6 @@ async function _resolvePrompt(imageBuffer, shotMeta) {
   }
 
   const visionContext = shotMeta.visionContext || {};
-  // Stage 4 output is the authored shot intent. Always hand the COMPLETE authored
-  // prompt to the vision director; never let a stale visionContext.shot field replace it.
   const authoredIntent = typeof shotMeta.videoPrompt === 'string' ? shotMeta.videoPrompt.trim() : '';
   const visionShot = { ...(visionContext.shot || {}) };
   const sourceLines = _quotedDialogue(authoredIntent);
@@ -83,37 +82,59 @@ async function _resolvePrompt(imageBuffer, shotMeta) {
   if (authoredIntent) {
     visionShot.shot_description = authoredIntent;
     visionShot.authored_ltx_intent = authoredIntent;
-
-    // A quoted line in the authored Stage-4 prompt is a hard conversational requirement.
-    // Make that requirement explicit even when an older/stale vision context lacks dialogue fields.
     if (sourceLines.length) {
       visionShot.dialogue = sourceLines.map(line => `"${line}"`).join(' ');
       visionShot.conversation_reason = visionShot.conversation_reason || 'Authored shot contains explicit spoken dialogue; preserve it verbatim.';
     }
   }
 
-  const description = await ltxVisionDirector.describeForLTX({
-    imageBuffer,
-    imageMime: visionContext.imageMime || 'image/png',
-    shot: visionShot,
-    scene: visionContext.scene || {},
-    characters: visionContext.characters || [],
-  });
+  let repairInstruction = '';
+  for (let visionAttempt = 1; visionAttempt <= MAX_VISION_REPAIR_ATTEMPTS; visionAttempt++) {
+    let description;
+    try {
+      description = await ltxVisionDirector.describeForLTX({
+        imageBuffer,
+        imageMime: visionContext.imageMime || 'image/png',
+        shot: visionShot,
+        scene: visionContext.scene || {},
+        characters: visionContext.characters || [],
+        repairInstruction,
+      });
+    } catch (err) {
+      if (visionAttempt >= MAX_VISION_REPAIR_ATTEMPTS) throw err;
+      repairInstruction = `The previous vision attempt failed. Re-inspect the supplied final still and regenerate the complete cinematic LTX description. Preserve all authored dialogue and character staging. Failure: ${err.message}`;
+      console.warn(`[LTXVideoGen] Vision attempt ${visionAttempt}/${MAX_VISION_REPAIR_ATTEMPTS} failed; requesting repair from vision director: ${err.message}`);
+      continue;
+    }
 
-  const finalPrompt = ltxPromptEngine.prepareImageToVideoPrompt(description);
-  const outputLines = _quotedDialogue(finalPrompt);
-  const outputNormalized = outputLines.map(_normalizeDialogue);
-  const missingLines = sourceLines
-    .map(_normalizeDialogue)
-    .filter(line => !outputNormalized.includes(line));
+    const finalPrompt = ltxPromptEngine.prepareImageToVideoPrompt(description);
+    const outputLines = _quotedDialogue(finalPrompt);
+    const outputNormalized = outputLines.map(_normalizeDialogue);
+    const missingLines = sourceLines
+      .map(_normalizeDialogue)
+      .filter(line => !outputNormalized.includes(line));
 
-  console.log(`[LTXVideoGen] Vision-authored LTX prompt generated (${finalPrompt.split(/\s+/).filter(Boolean).length} words, quotedDialogue=${outputLines.length}/${sourceLines.length}, preserved=${sourceLines.length - missingLines.length}/${sourceLines.length}).`);
+    console.log(`[LTXVideoGen] Vision-authored LTX prompt generated (attempt=${visionAttempt} words=${finalPrompt.split(/\s+/).filter(Boolean).length}, quotedDialogue=${outputLines.length}/${sourceLines.length}, preserved=${sourceLines.length - missingLines.length}/${sourceLines.length}).`);
 
-  if (missingLines.length) {
-    throw new LTXGenerationError(`[LTXVideoGen] Vision director dropped authored dialogue: ${missingLines.length}/${sourceLines.length} exact line(s) missing. Refusing to send a silent/altered conversational shot to LTX.`);
+    if (!missingLines.length) return finalPrompt;
+
+    const missingText = missingLines.map(line => `"${line}"`).join('; ');
+    if (visionAttempt >= MAX_VISION_REPAIR_ATTEMPTS) {
+      throw new LTXGenerationError(`[LTXVideoGen] Vision director could not preserve authored dialogue after ${MAX_VISION_REPAIR_ATTEMPTS} attempts. Missing exact line(s): ${missingText}`);
+    }
+
+    repairInstruction = [
+      'CRITICAL REPAIR REQUIRED.',
+      `The authored shot contains exact dialogue that must survive unchanged. The previous vision response omitted or altered these required lines: ${missingText}`,
+      'Regenerate the entire cinematic description from the supplied still.',
+      'Preserve every required line verbatim inside quotation marks.',
+      'Identify the speaker, their screen position, delivery, listener reaction, pause, and next turn in chronological order.',
+      'Do not summarize, paraphrase, shorten, translate, or replace the dialogue with descriptions such as "speaks" or "responds".',
+    ].join(' ');
+    console.warn(`[LTXVideoGen] Vision director dropped authored dialogue; retrying vision attempt ${visionAttempt + 1}/${MAX_VISION_REPAIR_ATTEMPTS}. Missing=${missingText}`);
   }
 
-  return finalPrompt;
+  throw new LTXGenerationError('[LTXVideoGen] Vision prompt resolution exhausted unexpectedly.');
 }
 
 async function submitVideoJob(imageBuffer, shotMeta = {}) {
@@ -121,7 +142,7 @@ async function submitVideoJob(imageBuffer, shotMeta = {}) {
 
   let prompt;
   try { prompt = await _resolvePrompt(imageBuffer, shotMeta); }
-  catch (err) { throw new LTXGenerationError(`[LTXVideoGen] Failed to author LTX image-to-video prompt: ${err.message}`); }
+  catch (err) { throw err instanceof LTXGenerationError ? err : new LTXGenerationError(`[LTXVideoGen] Failed to author LTX image-to-video prompt: ${err.message}`); }
 
   const validation = ltxPromptEngine.validateImageToVideoPrompt(prompt);
   if (!validation.valid) throw new LTXGenerationError(`[LTXVideoGen] LTX prompt contract violation: ${validation.violations.join(', ')}`);
