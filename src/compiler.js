@@ -1,12 +1,87 @@
 'use strict';
 const axios = require('axios');
 const config = require('./config');
+const db = require('./db');
 
 function _ffmpegHeaders() {
   return {
     'x-api-key':    config.ffmpegApiKey,
     'Content-Type': 'application/json',
   };
+}
+
+/**
+ * Final-master source normalization.
+ *
+ * The production pipeline historically passed individual shot URLs into
+ * mergeScenes even after every scene had already been compiled. That defeated
+ * the scene boundary and made the final FFmpeg job fan out over the entire
+ * episode again. When shot URLs are supplied, resolve the authoritative
+ * persisted compiled-scene URLs for that episode and merge those instead.
+ * Already-compiled scene URLs pass through untouched.
+ */
+function _looksLikeShotClip(url) {
+  return /\/shot_\d+(?:[/?#.]|$)/i.test(String(url || ''));
+}
+
+async function _resolveCompiledSceneSources(clips) {
+  const sourceClips = (clips || []).map(c => typeof c === 'string' ? c : c?.url).filter(Boolean);
+  if (!sourceClips.length || !sourceClips.some(_looksLikeShotClip)) return sourceClips;
+
+  const placeholders = sourceClips.map(() => '?').join(', ');
+  const matchedShots = await db.query(
+    `SELECT episode_id, scene_number, clip_url
+       FROM shots
+      WHERE clip_url IN (${placeholders})
+      ORDER BY scene_number ASC, shot_index ASC`,
+    sourceClips
+  );
+
+  const episodeIds = [...new Set(matchedShots.map(row => row.episode_id).filter(Boolean))];
+  if (episodeIds.length !== 1 || matchedShots.length !== sourceClips.length) {
+    throw new Error(
+      `[Compiler] Final master received shot-level sources but could not map the complete set to one persisted episode ` +
+      `(matched=${matchedShots.length}/${sourceClips.length}, episodes=${episodeIds.length})`
+    );
+  }
+
+  const episodeId = episodeIds[0];
+  const sceneNumbers = [...new Set(matchedShots.map(row => Number(row.scene_number)).filter(Number.isFinite))]
+    .sort((a, b) => a - b);
+  if (!sceneNumbers.length) {
+    throw new Error('[Compiler] Shot-level final master sources resolved to no scene numbers');
+  }
+
+  const episode = await db.queryOne(
+    `SELECT scene_state FROM episodes WHERE id = ? LIMIT 1`,
+    [episodeId]
+  );
+  if (!episode) {
+    throw new Error(`[Compiler] Episode ${episodeId} not found while resolving compiled scene sources`);
+  }
+
+  let sceneState = {};
+  try {
+    sceneState = typeof episode.scene_state === 'string'
+      ? JSON.parse(episode.scene_state || '{}')
+      : (episode.scene_state || {});
+  } catch (err) {
+    throw new Error(`[Compiler] Episode ${episodeId} has invalid scene_state JSON: ${err.message}`);
+  }
+
+  const sceneUrls = sceneNumbers.map(sceneNumber => sceneState[String(sceneNumber)] || sceneState[sceneNumber] || null);
+  if (sceneUrls.some(url => !url)) {
+    const missing = sceneNumbers.filter((sceneNumber, index) => !sceneUrls[index]);
+    throw new Error(
+      `[Compiler] Final master cannot fall back to shot-by-shot merge: compiled scene URL(s) missing for scene ${missing.join(', ')}`
+    );
+  }
+
+  console.log(
+    `[Compiler] Resolved final master from ${sourceClips.length} shot clips to ` +
+    `${sceneUrls.length} persisted compiled scenes for episode ${episodeId}.`
+  );
+  return sceneUrls;
 }
 
 /**
@@ -156,8 +231,6 @@ async function composeScene(clips, composition = 'cut', sceneEffects = {}) {
     throw new Error('[Compiler] composeScene called with no valid clips');
   }
 
-  // Replit may suspend the FFmpeg service between scene jobs. Never submit
-  // until the actual health endpoint proves the service is ready.
   await waitForFFmpeg();
 
   const body = { clips: clipPayload, layout };
@@ -185,25 +258,24 @@ async function composeScene(clips, composition = 'cut', sceneEffects = {}) {
 
 /**
  * Submit a final episode/master merge job to the FFmpeg microservice.
- * clips: ordered source video URLs (plain strings).
  *
- * The final master should receive the original shot assets whenever possible,
- * not already-encoded scene outputs. That avoids cascading re-encodes.
- * introBumperUrl / outroBumperUrl: optional StreamVerse Studio bumpers.
- * mergeEffects: optional { transition, transitionDuration }
- *   — only safe transitions (fade/dissolve) are forwarded. No color grades,
- *     overlays, or text overlays are sent to the FFmpeg service.
- * Returns jobId.
+ * The master consumes compiled scene outputs. If a legacy caller still passes
+ * the individual shot URLs, they are resolved through the episode's persisted
+ * scene_state before the /merge job is submitted. This keeps the scene boundary
+ * authoritative without silently falling back to shot-by-shot merging.
  */
 async function mergeScenes(clips, { introBumperUrl, outroBumperUrl, ...mergeEffects } = {}) {
+  const resolvedClips = await _resolveCompiledSceneSources(clips);
   const mergeClips = [
     ...(introBumperUrl ? [introBumperUrl] : []),
-    ...(clips || []),
+    ...(resolvedClips || []),
     ...(outroBumperUrl ? [outroBumperUrl] : []),
   ].filter(Boolean);
 
-  // Same readiness gate for the final master. The Replit service may have
-  // spun down while shot/scene generation was running.
+  if (!mergeClips.length) {
+    throw new Error('[Compiler] mergeScenes called with no valid scene sources');
+  }
+
   await waitForFFmpeg();
 
   const body = { clips: mergeClips };
