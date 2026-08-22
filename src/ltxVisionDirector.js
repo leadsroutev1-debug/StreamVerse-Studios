@@ -391,20 +391,73 @@ function _sanitizeDialogueQuotes(description, requiredSourceLines = []) {
   return _cleanText(working);
 }
 
+function _normalizeDialogueForMatch(text) {
+  return _normalizeDialogue(text)
+    .replace(/[’]/g, "'")
+    .replace(/\s+([,.!?;:])/g, '$1')
+    .replace(/([,.!?;:])\s+/g, '$1 ')
+    .trim();
+}
+
+/**
+ * Authored dialogue may arrive as one quoted source block containing multiple
+ * spoken utterances/sentences. The LTX-facing description is allowed to split
+ * that block into multiple quoted speech segments, provided the segments are
+ * contiguous, exact, and remain in authored order.
+ */
 function _dialogueIntegrity(sourceLines, description) {
-  const required = sourceLines.map(_normalizeDialogue);
+  const required = sourceLines.map(_normalizeDialogueForMatch);
   const outputLines = _quotedDialogue(description);
-  const output = outputLines.map(_normalizeDialogue);
-  const missingLines = required.filter(line => !output.includes(line));
-
-  let cursor = 0;
+  const output = outputLines.map(_normalizeDialogueForMatch);
+  const missingLines = [];
   const outOfOrder = [];
+  let cursor = 0;
 
-  for (const line of required) {
-    const index = output.indexOf(line, cursor);
-    if (index === -1) continue;
-    if (index !== cursor) outOfOrder.push(line);
-    cursor = index + 1;
+  for (const requiredLine of required) {
+    if (!requiredLine) continue;
+
+    // First accept an exact single quoted segment.
+    let index = output.indexOf(requiredLine, cursor);
+    if (index !== -1) {
+      if (index !== cursor) outOfOrder.push(requiredLine);
+      cursor = index + 1;
+      continue;
+    }
+
+    // Then accept a contiguous run of quoted segments whose exact joined text
+    // equals the authored source line. This covers:
+    //   "Elena Vasquez, I presume?" "I'm Silas Crowe..."
+    // when the authored source contained both sentences inside one quoted block.
+    let found = false;
+    let joined = '';
+    for (let end = cursor; end < output.length; end++) {
+      joined = joined ? `${joined} ${output[end]}` : output[end];
+      if (joined === requiredLine) {
+        if (cursor !== end - (end - cursor)) {
+          // Cursor is the first segment of the matched run. A contiguous run
+          // is valid only when it begins exactly at the current dialogue cursor.
+          if (cursor !== cursor) outOfOrder.push(requiredLine);
+        }
+        cursor = end + 1;
+        found = true;
+        break;
+      }
+
+      // Do not consume arbitrary extra dialogue while looking for the match.
+      if (!requiredLine.startsWith(joined + ' ')) break;
+    }
+
+    if (!found) {
+      // Diagnostic: if the authored line's first phrase appears later, report
+      // ordering drift rather than silently accepting a rearrangement.
+      const firstWord = requiredLine.split(/\s+/)[0];
+      const laterIndex = output.findIndex((line, i) => i >= cursor && line.includes(firstWord));
+      if (laterIndex !== -1 && laterIndex !== cursor) {
+        outOfOrder.push(requiredLine);
+      } else {
+        missingLines.push(requiredLine);
+      }
+    }
   }
 
   return {
