@@ -2610,27 +2610,36 @@ async function _runPipeline() {
     episodeScript.scene_simulation = episodeSimulation;
   }
 
-  // The checkpoint stage is authoritative. Do not advance a scene_shot_writing
-  // checkpoint to script_ready_for_processing unless the writer actually returned
-  // a complete script checkpoint. This prevents a one-scene partial script from
-  // becoming the apparent production universe after a restart.
+  // The checkpoint stage is authoritative, but a checkpoint is a RESUME CURSOR,
+  // not a stop signal. Once the process reaches media_generation_ready (or any
+  // later production stage), resume must fall through into the existing media
+  // generation loop and continue from persisted shot rows/jobs.
   let effectiveCheckpointStage = episodeScript?.checkpoint_state?.stage || loadedCheckpointStage || null;
-  if (!isResuming || ['script_complete', 'script_ready_for_processing'].includes(String(effectiveCheckpointStage || '').toLowerCase())) {
+  const normalizedCheckpointStage = String(effectiveCheckpointStage || '').toLowerCase();
+  const mediaResumeStage = _pipelineCheckpointRank(normalizedCheckpointStage) >= PIPELINE_CHECKPOINT_STAGE_ORDER.media_generation_ready;
+  const processingReadyStage = ['script_complete', 'script_ready_for_processing'].includes(normalizedCheckpointStage);
+
+  if (!isResuming || processingReadyStage) {
     await persistScriptCheckpoint({
       stage: 'script_ready_for_processing',
       script: episodeScript,
     });
     effectiveCheckpointStage = episodeScript?.checkpoint_state?.stage || 'script_ready_for_processing';
+    console.log(
+      `[Pipeline] ↻ Checkpoint advanced into processing: stage=${effectiveCheckpointStage}`
+    );
+  } else if (mediaResumeStage) {
+    console.log(
+      `[Pipeline] ↺ Checkpoint resumes directly into media generation: stage=${effectiveCheckpointStage} ` +
+      `scene=${episodeScript?.checkpoint_state?.last_scene_number ?? 'n/a'} ` +
+      `shot=${episodeScript?.checkpoint_state?.last_shot_index ?? 'n/a'}`
+    );
   } else {
     console.log(
       `[Pipeline] ↺ Checkpoint remains authoritative: stage=${effectiveCheckpointStage || 'unknown'} ` +
-      `scene=${episodeScript?.checkpoint_state?.last_scene_number ?? 'n/a'} — downstream media processing not started`
+      `scene=${episodeScript?.checkpoint_state?.last_scene_number ?? 'n/a'} ` +
+      `— continuing stage-specific resume work`
     );
-    state.setStatus(
-      state.STATES.GENERATING,
-      `Checkpoint ${effectiveCheckpointStage || 'unknown'} requires continuation before media generation.`
-    );
-    return;
   }
 
   // ── Enforce scene speech coverage before any downstream rendering layers ──
