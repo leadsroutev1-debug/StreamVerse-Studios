@@ -338,63 +338,56 @@ function _quoteNormalize(value) {
  * in quotes only when the surrounding sentence clearly marks it as spoken.
  */
 function _sanitizeDialogueQuotes(description, requiredSourceLines = []) {
-  const input = String(description || '');
-  if (!input) return input;
+  let working = String(description || '');
+  if (!working) return working;
 
-  const protectedLines = new Map();
-  for (const line of requiredSourceLines) {
-    const normalized = _quoteNormalize(line);
-    if (normalized) protectedLines.set(normalized, line.trim());
-  }
+  const protectedTokens = [];
+  let tokenIndex = 0;
 
-  const speechCue = /\b(?:says?|said|saying|speaks?|spoke|speaking|whisper(?:s|ed|ing)?|murmur(?:s|ed|ing)?|mutters?|utters?|answers?|answered|answers|replies?|replied|responds?|responded|asks?|asked|shouts?|shouted|yells?|yelled|calls?|called|exclaims?|exclaimed|cries?|cried|declares?|declared|warns?|warned|orders?|ordered|tells?|told|voice|voices|caller|caller's|over the line|through the microphone|into the microphone|on the phone|over the radio|over the headset)\b/i;
-
+  const normalizeLine = value => _quoteNormalize(value);
+  const speechCue = /\b(?:says?|said|saying|speaks?|spoke|speaking|whisper(?:s|ed|ing)?|murmur(?:s|ed|ing)?|mutters?|utters?|answers?|answered|replies?|replied|responds?|responded|asks?|asked|shouts?|shouted|yells?|yelled|calls?|called|exclaims?|exclaimed|cries?|cried|declares?|declared|warns?|warned|orders?|ordered|tells?|told|voice|voices|caller|caller's|over the line|through the microphone|into the microphone|on the phone|over the radio|over the headset)\b/i;
   const nonSpeechCue = /\b(?:internal voice|inner voice|thought|thinks?|thoughts?|written|text|label|sign|display|screen|monitor|caption|title|nameplate|badge|logo|watermark|on air|line \d+|radio text|console text|printed|reads? the words?|visible words?|the word|the words|the letters|sound effect|sfx|onomatopoeia|stage direction)\b/i;
 
-  let quoteIndex = 0;
-  const placeholders = new Map();
+  const protect = value => {
+    const token = `@@SV_SPOKEN_${tokenIndex++}@@`;
+    protectedTokens.push([token, value]);
+    return token;
+  };
 
-  // First protect required authored dialogue exactly, regardless of model typography.
-  let working = input;
-  for (const [normalized, authored] of protectedLines.entries()) {
-    const escaped = normalized.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const curlyEscaped = escaped.replace(/"/g, '[\"“”]');
-    const re = new RegExp(`[\"“”]${curlyEscaped}[\"“”]`, 'g');
-    working = working.replace(re, () => {
-      const token = `@@SV_SPOKEN_${quoteIndex++}@@`;
-      placeholders.set(token, `"${authored}"`);
-      return token;
+  // Authored dialogue is authoritative. Whether Mistral returned it quoted or
+  // unquoted, normalize it into the explicit spoken channel before validation.
+  for (const sourceLine of requiredSourceLines) {
+    const normalized = normalizeLine(sourceLine);
+    if (!normalized) continue;
+    const escaped = normalized.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&');
+    const quotedRe = new RegExp(`["“”]${escaped}["“”]`, 'g');
+    if (quotedRe.test(working)) {
+      working = working.replace(quotedRe, () => protect(`"${sourceLine.trim()}"`));
+      continue;
+    }
+
+    const unquotedRe = new RegExp(escaped, 'g');
+    working = working.replace(unquotedRe, (match, offset, whole) => {
+      const before = whole.slice(Math.max(0, Number(offset) - 220), Number(offset));
+      const after = whole.slice(Number(offset) + match.length, Math.min(whole.length, Number(offset) + match.length + 100));
+      const explicitlyWritten = nonSpeechCue.test(before) || nonSpeechCue.test(after);
+      const speechContext = speechCue.test(before) || /\b(?:voice|tone|delivery)\b/i.test(before);
+      if (!explicitlyWritten || speechContext) return protect(`"${sourceLine.trim()}"`);
+      return match;
     });
   }
 
-  // Process all remaining quoted spans.
+  // Normalize remaining quote spans. Only clearly spoken material may retain quotes.
   working = working.replace(/"([^"]+)"|“([^”]+)”/g, (full, straight, curly, offset, whole) => {
     const inner = _quoteNormalize(straight || curly || '');
     if (!inner) return '';
-
-    const alreadyProtected = placeholders.get(full);
-    if (alreadyProtected) return full;
-
-    const before = whole.slice(Math.max(0, Number(offset) - 180), Number(offset));
+    const before = whole.slice(Math.max(0, Number(offset) - 220), Number(offset));
     const speech = speechCue.test(before) && !nonSpeechCue.test(before);
-
-    if (speech) {
-      const token = `@@SV_SPOKEN_${quoteIndex++}@@`;
-      placeholders.set(token, `"${inner}"`);
-      return token;
-    }
-
-    // Not spoken aloud: remove quotation marks entirely.
-    return inner;
+    return speech ? protect(`"${inner}"`) : inner;
   });
 
-  // Also remove markdown emphasis that can surround spoken dialogue in model output.
-  working = working.replace(/\\\*([^*]+)\\\*/g, '$1');
-
-  for (const [token, quoted] of placeholders.entries()) {
-    working = working.split(token).join(quoted);
-  }
-
+  working = working.replace(/\*([^*]+)\*/g, '$1');
+  for (const [token, quoted] of protectedTokens) working = working.split(token).join(quoted);
   return _cleanText(working);
 }
 
@@ -693,6 +686,12 @@ async function describeForLTX({
         }
 
         const description = vision.description;
+        if (sourceLines.length) {
+          console.log(
+            `[LTXVision] Authored dialogue normalization required=${sourceLines.length} ` +
+            `normalizedOutputQuotes=${_quotedDialogue(description).length}`
+          );
+        }
         const integrity = _dialogueIntegrity(sourceLines, description);
 
         if (integrity.valid) {
