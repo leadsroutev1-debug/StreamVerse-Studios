@@ -29,11 +29,6 @@ function _resolveDuration(shotMeta = {}) {
   return Math.min(DEFAULT_MAX_DURATION, Math.max(DEFAULT_MIN_DURATION, duration));
 }
 
-function _extractSourceDialogue(shotMeta = {}) {
-  const text = String(shotMeta.dialogue_or_action || shotMeta.videoPrompt || '').trim();
-  return text;
-}
-
 async function _buildFinalAgnesPrompt(imageBuffer, shotMeta = {}) {
   const authoredIntent = String(
     shotMeta._agnesPromptOverride ||
@@ -42,8 +37,9 @@ async function _buildFinalAgnesPrompt(imageBuffer, shotMeta = {}) {
     ''
   ).trim();
 
+  const visionContext = shotMeta.visionContext || {};
   const shot = {
-    ...(shotMeta.visionContext?.shot || {}),
+    ...(visionContext.shot || {}),
     ...shotMeta,
   };
 
@@ -55,10 +51,10 @@ async function _buildFinalAgnesPrompt(imageBuffer, shotMeta = {}) {
 
   const result = await ltxVisionDirector.describeForLTX({
     imageBuffer,
-    imageMime: shotMeta.visionContext?.imageMime || 'image/png',
+    imageMime: visionContext.imageMime || 'image/png',
     shot,
-    scene: shotMeta.visionContext?.scene || {},
-    characters: shotMeta.visionContext?.characters || [],
+    scene: visionContext.scene || {},
+    characters: visionContext.characters || [],
     repairInstruction: '',
   });
 
