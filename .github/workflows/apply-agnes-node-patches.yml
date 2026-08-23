@@ -1,0 +1,142 @@
+name: Apply Agnes Node patches
+
+on:
+  push:
+    branches:
+      - feature/agnes-video-provider
+
+jobs:
+  patch-node:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Patch provider routing and Agnes pacing
+        env:
+          TARGET_BRANCH: feature/agnes-video-provider
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          pipeline = Path('src/pipeline.js')
+          text = pipeline.read_text()
+
+          old = """const videoGen        = config.videoProvider === 'magichour'\n  ? require('./videoGen')\n  : require('./ltxVideoGen');"""
+          new = """const videoGen        = config.videoProvider === 'magichour'\n  ? require('./videoGen')\n  : config.videoProvider === 'agnes'\n    ? require('./agnesVideoGen')\n    : require('./ltxVideoGen');"""
+          assert old in text, 'pipeline provider selector not found'
+          text = text.replace(old, new, 1)
+
+          old = """const _SEMANTIC_MIN_DURATION = 8.0;\nconst _SEMANTIC_TARGET_DURATION = 9.25;\nconst _SEMANTIC_MAX_DURATION = 10.0;"""
+          new = """const _IS_AGNES_VIDEO = config.videoProvider === 'agnes';\nconst _SEMANTIC_MIN_DURATION = 8.0;\nconst _SEMANTIC_TARGET_DURATION = _IS_AGNES_VIDEO ? 15.5 : 9.25;\nconst _SEMANTIC_MAX_DURATION = _IS_AGNES_VIDEO ? 18.0 : 10.0;"""
+          assert old in text, 'pipeline pacing constants not found'
+          text = text.replace(old, new, 1)
+
+          old = "const MAX_SHOT_DURATION = 10.0;"
+          new = "const MAX_SHOT_DURATION = _SEMANTIC_MAX_DURATION;"
+          assert old in text, 'pipeline max duration constant not found'
+          text = text.replace(old, new, 1)
+
+          marker = "function _wordCount(text) {"
+          assert marker in text, 'pipeline duration helper marker not found'
+          helper = r'''function _buildAgnesVideoPrompt(shot, storyline, orderedChars = [], characterPositions = [], motionParams = null) {
+  const quote = String(shot?.dialogue_or_action || '').trim();
+  const opening = String(shot?.start_frame_state || shot?.shot_description || shot?.image_prompt || '').trim();
+  const action = [
+    shot?.subject_motion,
+    shot?.ambient_motion,
+    shot?.temporal_arc,
+    shot?.environmental_story_beat,
+  ].filter(Boolean).join(' ');
+  const camera = [shot?.camera_type, shot?.framing, shot?.camera_movement].filter(Boolean).join(', ');
+  const ending = String(shot?.end_frame_state || shot?.end_frame_transition || shot?.next_shot_continuity || '').trim();
+  const cast = (Array.isArray(orderedChars) ? orderedChars : []).map(c => {
+    const name = c?.name || c;
+    const anchor = c?.visual_anchor || '';
+    return anchor ? `${name}: ${anchor}` : String(name || '');
+  }).filter(Boolean).join(' | ');
+  const positions = (Array.isArray(characterPositions) ? characterPositions : [])
+    .map(p => typeof p === 'string' ? p : JSON.stringify(p))
+    .filter(Boolean).join('; ');
+
+  return [
+    `A cinematic ${storyline?.genre || 'drama'} shot beginning from the supplied image exactly as shown.`,
+    opening ? `Opening state: ${opening}.` : '',
+    cast ? `Character identity and appearance remain consistent with these established characters: ${cast}.` : '',
+    positions ? `Opening screen geography: ${positions}.` : '',
+    action ? `During the shot: ${action}.` : '',
+    camera ? `Camera and framing: ${camera}.` : '',
+    quote ? `Spoken dialogue: ${quote}. Render only the quoted words as audible speech, keep each named speaker in chronological order, and synchronize the speaking character's mouth and facial performance.` : '',
+    `Use natural cinematic sound and environmental ambience appropriate to the scene; do not invent extra dialogue, narration, subtitles, captions, logos, or prominent new written text.`,
+    ending ? `End state: ${ending}.` : '',
+    motionParams?.agnesMotionHint ? `Motion character: ${motionParams.agnesMotionHint}.` : '',
+    `Preserve the supplied image's wardrobe, set, lighting, character identity, and spatial relationships while allowing the described movement and camera progression to unfold naturally.`
+  ].filter(Boolean).join(' ');
+}
+
+'''
+          text = text.replace(marker, helper + marker, 1)
+
+          old = """      if (config.videoProvider === 'magichour') {\n        submitMeta = {\n          motionLevel:    motionParams?.mhMotionLevel || currentShot.motion_level    || 'medium',\n          duration:       currentShot.duration        || 5,\n          talkingPhoto,   // null → image-to-video+audio; set → ai-talking-photo\n          imagePrompt:    motionParams?.videoPrompt || mhImagePrompt || currentShot.image_prompt || '',\n          shotPacingType: currentShot.shot_pacing_type || '',\n          motionParams,   // structured motion control from the Motion System Upgrade\n        };\n      } else {"""
+          new = """      if (config.videoProvider === 'magichour') {\n        submitMeta = {\n          motionLevel:    motionParams?.mhMotionLevel || currentShot.motion_level    || 'medium',\n          duration:       currentShot.duration        || 5,\n          talkingPhoto,   // null → image-to-video+audio; set → ai-talking-photo\n          imagePrompt:    motionParams?.videoPrompt || mhImagePrompt || currentShot.image_prompt || '',\n          shotPacingType: currentShot.shot_pacing_type || '',\n          motionParams,   // structured motion control from the Motion System Upgrade\n        };\n      } else if (config.videoProvider === 'agnes') {\n        // Agnes Video V2.0 — native audiovisual image-to-video. Do not invoke\n        // Deepgram/TTS; dialogue/audio is generated by Agnes from this prompt.\n        submitMeta = {\n          duration: currentShot.duration || _SEMANTIC_MAX_DURATION,\n          agnesPrompt: currentShot._agnesPromptOverride || _buildAgnesVideoPrompt(\n            currentShot, storyline, orderedChars, characterPositions, motionParams\n          ),\n          width: Number(process.env.AGNES_WIDTH || 720),\n          height: Number(process.env.AGNES_HEIGHT || 1280),\n          seed: shotSeed,\n        };\n      } else {"""
+          assert old in text, 'pipeline video submission branch not found'
+          text = text.replace(old, new, 1)
+
+          old = """      // 1b. Deepgram TTS + Magic Hour's ai-talking-photo path (audio synthesised\n      //     separately, lip-synced onto a single-face crop). LTX-2.3 generates\n      //     synchronized audio (including multi-character dialogue/lip-sync)\n      //     natively from the video prompt, so this step is Magic-Hour-only —\n      //     skipped entirely on the LTX path (no Deepgram dependency, no\n      //     external TTS call)."""
+          new = """      // 1b. Deepgram TTS is only for the Magic Hour talking-photo path.\n      //     LTX-2.3 and Agnes Video V2.0 are native audiovisual generators, so\n      //     both receive dialogue in the video prompt and generate synchronized\n      //     speech/audio without a second external TTS track."""
+          assert old in text, 'pipeline audio comment not found'
+          text = text.replace(old, new, 1)
+
+          pipeline.write_text(text)
+
+          writer = Path('src/scriptWriter.js')
+          text = writer.read_text()
+
+          old = """const _VIDEO_BACKEND_NAME =\n  config.videoProvider === 'magichour' ? 'Magic Hour' : 'LTX';"""
+          new = """const _VIDEO_BACKEND_NAME =\n  config.videoProvider === 'agnes' ? 'Agnes Video V2.0' :\n  config.videoProvider === 'magichour' ? 'Magic Hour' : 'LTX';\n\nconst _VIDEO_MAX_DURATION = config.videoProvider === 'agnes' ? 18 : 10;"""
+          assert old in text, 'scriptWriter backend name block not found'
+          text = text.replace(old, new, 1)
+
+          replacements = {
+            'SEMANTIC 10-SECOND CINEMATIC SHOT RULES': 'SEMANTIC ${_VIDEO_MAX_DURATION}-SECOND CINEMATIC SHOT RULES',
+            'HARD MAXIMUM OF 10 SECONDS PER SHOT': 'HARD MAXIMUM OF ${_VIDEO_MAX_DURATION} SECONDS PER SHOT',
+            '8–10 seconds': '8–${_VIDEO_MAX_DURATION} seconds',
+            '8-10 second shots': '8–${_VIDEO_MAX_DURATION} second shots',
+            '8–10 second visual event': '8–${_VIDEO_MAX_DURATION} second visual event',
+            'The resulting LTX duration will normally be 8.0–10.0 seconds': 'The resulting ${_VIDEO_BACKEND_NAME} duration will normally occupy the available 8.0–${_VIDEO_MAX_DURATION}.0 second temporal canvas',
+            'Use 10 as the raw intended duration': 'Use ${_VIDEO_MAX_DURATION} as the raw intended duration',
+            'backend is LTX-first': 'backend is provider-first',
+          }
+          for old, new in replacements.items():
+            if old in text:
+              text = text.replace(old, new)
+
+          # Agnes benefits from a longer, dialogue-forward prompt budget. Keep\n          # the existing directorial schema intact, but add explicit guidance\n          # so the model designs complete 18-second micro-scenes instead of\n          # compressing dialogue into the former LTX 10-second canvas.
+          anchor = "const DIRECTOR_PERSONA = `You are the lead director and showrunner for StreamVerse Studios."
+          assert anchor in text, 'scriptWriter director persona marker not found'
+          injected = """const PROVIDER_SPECIFIC_DIRECTING_RULES = config.videoProvider === 'agnes'\n  ? `\\n═══ AGNES VIDEO V2.0 DIRECTING RULES ═══\\n\\nAgnes Video V2.0 is the active audiovisual video backend. Design shots for a maximum temporal canvas of 18 seconds. Dialogue can occupy a meaningful portion of the shot, but every spoken exchange must remain visually grounded in continuous action, environment, performance, and camera movement. When dialogue is present, write the exact words the character should say; do not add filler speech. Multi-character dialogue is allowed when the characters remain visibly staged and the lines are chronological. Do not rely on external TTS, subtitles, narration, captions, or editor instructions.\\n\\nThe supplied still is the authoritative opening image. Preserve character identity, wardrobe, set geography, lighting, and established props while animating only the described progression. Do not invent prominent written signage or new text. End every shot on a deliberate visual state that can hand off into the next shot.\n`\n  : '';\n\n"""
+          text = text.replace(anchor, injected + anchor, 1)
+
+          # Inject provider guidance wherever the main director persona is used.
+          text = text.replace('${DIRECTOR_PERSONA}', '${DIRECTOR_PERSONA}\\n${PROVIDER_SPECIFIC_DIRECTING_RULES}', 1)
+
+          writer.write_text(text)
+          print('Patched pipeline.js and scriptWriter.js for Agnes.')
+          PY
+
+      - name: Commit patches
+        run: |
+          git config user.name "streamverse-agnes-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add src/pipeline.js src/scriptWriter.js
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git commit -m "Integrate Agnes provider into pipeline pacing and prompts"
+          git push origin "$TARGET_BRANCH"
