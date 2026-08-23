@@ -22,7 +22,7 @@ function patchContent(content) {
     return content;
   }
 
-  const pacingSensitive = /SEMANTIC 10-SECOND CINEMATIC SHOT RULES|HARD MAXIMUM OF 10 SECONDS PER SHOT|8[–-]10 seconds|8[–-]10 second shots|8[–-]10 second visual event|duration must be an integer from 8 to 10|Use 10 as the raw intended duration|backend is LTX-first|LTX duration will normally be 8\.0[–-]10\.0/i.test(content);
+  const pacingSensitive = /SEMANTIC 10-SECOND CINEMATIC SHOT RULES|HARD MAXIMUM OF 10 SECONDS PER SHOT|8[–-]10 seconds|8[–-]10 second shots|8[–-]10 second visual event|duration must be an integer from 8 to 10|Use 10 as the raw intended duration|backend is LTX-first|The resulting LTX duration will normally be 8\.0[–-]10\.0/i.test(content);
   const repairSensitive = /duration must be an integer from 8 to 10 for LTX-first production/i.test(content);
   const ltxShotSensitive = /LTX SHOT DESCRIPTION|LTX image-to-video model|LTX-ready semantics/i.test(content);
 
@@ -39,8 +39,8 @@ function patchContent(content) {
     .replace(/8-10 second visual event/g, '8-18 second visual event')
     .replace(/duration must be an integer from 8 to 10 for LTX-first production/g, 'duration should be planned within an 8–18 second cinematic canvas for Agnes production')
     .replace(/Use 10 as the raw intended duration because the backend is LTX-first and the pipeline will clamp safely\./g, 'Use 18 as the maximum raw intended duration for Agnes; shorter durations remain valid when the shot is semantically complete.')
-    .replace(/The resulting LTX duration will normally be 8\.0–10\.0 seconds/g, 'The resulting Agnes duration should normally occupy 8.0–18.0 seconds')
-    .replace(/The resulting LTX duration will normally be 8\.0-10\.0 seconds/g, 'The resulting Agnes duration should normally occupy 8.0-18.0 seconds')
+    .replace(/The resulting LTX duration will normally be 8\.0–10\.0 seconds and can reach the full 10\.0 seconds for rich narrative beats\./g, 'The resulting Agnes duration should normally occupy the available 8.0–18.0 second canvas, reaching 18.0 seconds when the narrative beat benefits from the additional temporal room.')
+    .replace(/The resulting LTX duration will normally be 8\.0-10\.0 seconds and can reach the full 10\.0 seconds for rich narrative beats\./g, 'The resulting Agnes duration should normally occupy the available 8.0-18.0 second canvas, reaching 18.0 seconds when the narrative beat benefits from the additional temporal room.')
     .replace(/LTX can receive the complete composition plus multiple speaker lines in chronological order\./g, 'Agnes can receive the complete composition plus multiple speaker lines in chronological order and generate audiovisual performance natively.')
     .replace(/MULTI-SPEAKER LTX DIALOGUE/g, 'MULTI-SPEAKER AUDIOVISUAL DIALOGUE')
     .replace(/LTX SHOT DESCRIPTION — REQUIRED OUTPUT STYLE/g, 'AUDIOVISUAL SHOT DESCRIPTION — REQUIRED OUTPUT STYLE')
