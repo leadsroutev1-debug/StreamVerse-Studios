@@ -3,22 +3,20 @@
 /**
  * StreamVerse Studio — Agnes Video V2.0 image-to-video integration.
  *
- * Agnes is deliberately kept behind the same submit/poll contract as LTX.
- * The Python video engine owns the provider HTTP API, key rotation, retries,
- * frame-constraint handling, and Cloudinary upload. Node only supplies the
- * authoritative still plus a cinematic prompt and requested duration.
+ * Agnes uses the SAME authoritative final still and the SAME Vision Director
+ * used by the LTX path. The Vision Director inspects the actual first-frame
+ * pixels and returns the final chronological cinematic prompt; that exact
+ * returned description is then submitted to Agnes.
  *
- * Agnes natively produces audiovisual clips, including generated speech/audio,
- * so this adapter never invokes the external Deepgram/TTS path.
+ * Agnes is native audiovisual generation, so no external TTS track is created.
  */
 
 const config = require('./config');
 const videoEngineClient = require('../services/videoEngineClient');
+const ltxVisionDirector = require('./ltxVisionDirector');
 
 const DEFAULT_MIN_DURATION = 1;
 const DEFAULT_MAX_DURATION = 18;
-const DEFAULT_CANVAS_DURATION = 18;
-const LEGACY_LTX_MAX_DURATION = 10;
 
 function _positive(value, fallback) {
   const n = Number(value);
@@ -27,31 +25,51 @@ function _positive(value, fallback) {
 
 function _resolveDuration(shotMeta = {}) {
   const requested = Number(shotMeta.duration);
-  const preserveExplicit = String(process.env.AGNES_DURATION_POLICY || 'full_canvas').toLowerCase() === 'preserve';
-
-  // The legacy Node pipeline can still hand the provider an LTX-era 8–10s
-  // semantic duration. Agnes has an 18s temporal canvas, so by default we
-  // expand that legacy cap to the full Agnes canvas. Set
-  // AGNES_DURATION_POLICY=preserve to retain the exact requested duration.
-  if (!preserveExplicit && (!Number.isFinite(requested) || requested <= LEGACY_LTX_MAX_DURATION)) {
-    return _positive(process.env.AGNES_DEFAULT_DURATION, DEFAULT_CANVAS_DURATION);
-  }
-
   const duration = Number.isFinite(requested) ? requested : DEFAULT_MIN_DURATION;
   return Math.min(DEFAULT_MAX_DURATION, Math.max(DEFAULT_MIN_DURATION, duration));
 }
 
-function _buildPrompt(shotMeta = {}) {
-  const explicit = String(shotMeta._agnesPromptOverride || shotMeta.agnesPrompt || '').trim();
-  if (explicit) return explicit;
+function _extractSourceDialogue(shotMeta = {}) {
+  const text = String(shotMeta.dialogue_or_action || shotMeta.videoPrompt || '').trim();
+  return text;
+}
 
-  const fallback = String(
-    shotMeta.videoPrompt || shotMeta.prompt || shotMeta.image_prompt || ''
+async function _buildFinalAgnesPrompt(imageBuffer, shotMeta = {}) {
+  const authoredIntent = String(
+    shotMeta._agnesPromptOverride ||
+    shotMeta.agnesPrompt ||
+    shotMeta.videoPrompt ||
+    ''
   ).trim();
-  if (!fallback) {
-    throw new Error('[AgnesVideoGen] No Agnes cinematic prompt supplied for shot');
+
+  const shot = {
+    ...(shotMeta.visionContext?.shot || {}),
+    ...shotMeta,
+  };
+
+  if (authoredIntent) {
+    shot.ltx_shot_description = authoredIntent;
+    shot.shot_description = shot.shot_description || authoredIntent;
+    shot.authored_ltx_intent = authoredIntent;
   }
-  return fallback;
+
+  const result = await ltxVisionDirector.describeForLTX({
+    imageBuffer,
+    imageMime: shotMeta.visionContext?.imageMime || 'image/png',
+    shot,
+    scene: shotMeta.visionContext?.scene || {},
+    characters: shotMeta.visionContext?.characters || [],
+    repairInstruction: '',
+  });
+
+  const finalPrompt = String(result || '').trim();
+  if (!finalPrompt) {
+    throw new Error('[AgnesVideoGen] Vision Director returned an empty final Agnes prompt');
+  }
+
+  console.log('[AgnesVideoGen] FINAL VISION-DIRECTOR PROMPT:');
+  console.log(finalPrompt);
+  return finalPrompt;
 }
 
 class AgnesGenerationError extends Error {
@@ -67,7 +85,7 @@ async function submitVideoJob(imageBuffer, shotMeta = {}) {
     throw new AgnesGenerationError('[AgnesVideoGen] submitVideoJob received an empty image buffer.');
   }
 
-  const prompt = _buildPrompt(shotMeta);
+  const prompt = await _buildFinalAgnesPrompt(imageBuffer, shotMeta);
   const duration = _resolveDuration(shotMeta);
   const width = Math.floor(_positive(shotMeta.width, 720));
   const height = Math.floor(_positive(shotMeta.height, 1280));
@@ -82,11 +100,10 @@ async function submitVideoJob(imageBuffer, shotMeta = {}) {
       width,
       height,
       seed,
-      randomizeSeed: Boolean(config.ltxRandomizeSeed),
+      randomizeSeed: false,
       enhancePrompt: false,
     });
 
-    console.log(`[AgnesVideoGen] Submitted audiovisual shot | duration=${duration}s width=${width} height=${height}`);
     return { jobId, apiKey: 'video-engine-managed' };
   } catch (err) {
     const status = err.response?.status;
