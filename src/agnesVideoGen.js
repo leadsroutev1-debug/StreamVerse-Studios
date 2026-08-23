@@ -17,6 +17,8 @@ const videoEngineClient = require('../services/videoEngineClient');
 
 const DEFAULT_MIN_DURATION = 1;
 const DEFAULT_MAX_DURATION = 18;
+const DEFAULT_CANVAS_DURATION = 18;
+const LEGACY_LTX_MAX_DURATION = 10;
 
 function _positive(value, fallback) {
   const n = Number(value);
@@ -25,6 +27,16 @@ function _positive(value, fallback) {
 
 function _resolveDuration(shotMeta = {}) {
   const requested = Number(shotMeta.duration);
+  const preserveExplicit = String(process.env.AGNES_DURATION_POLICY || 'full_canvas').toLowerCase() === 'preserve';
+
+  // The legacy Node pipeline can still hand the provider an LTX-era 8–10s
+  // semantic duration. Agnes has an 18s temporal canvas, so by default we
+  // expand that legacy cap to the full Agnes canvas. Set
+  // AGNES_DURATION_POLICY=preserve to retain the exact requested duration.
+  if (!preserveExplicit && (!Number.isFinite(requested) || requested <= LEGACY_LTX_MAX_DURATION)) {
+    return _positive(process.env.AGNES_DEFAULT_DURATION, DEFAULT_CANVAS_DURATION);
+  }
+
   const duration = Number.isFinite(requested) ? requested : DEFAULT_MIN_DURATION;
   return Math.min(DEFAULT_MAX_DURATION, Math.max(DEFAULT_MIN_DURATION, duration));
 }
@@ -74,6 +86,7 @@ async function submitVideoJob(imageBuffer, shotMeta = {}) {
       enhancePrompt: false,
     });
 
+    console.log(`[AgnesVideoGen] Submitted audiovisual shot | duration=${duration}s width=${width} height=${height}`);
     return { jobId, apiKey: 'video-engine-managed' };
   } catch (err) {
     const status = err.response?.status;
