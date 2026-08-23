@@ -11,16 +11,18 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field, asdict
-from typing import Any, Optional
+from dataclasses import dataclass, field
+from typing import Optional
 
 from .providers.base import ProviderError
+from .providers.agnes import AgnesProvider
 from .providers.ltx import LTXProvider
 
 logger = logging.getLogger("video_engine.jobs")
 
 _PROVIDERS = {
     "ltx": LTXProvider(),
+    "agnes": AgnesProvider(),
 }
 
 _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="video-job")
@@ -100,7 +102,7 @@ class JobStore:
         provider_name = params.get("provider", "ltx")
         provider = _PROVIDERS.get(provider_name)
         if provider is None:
-            self._update(job_id, status="failed", error={"message": f"Unknown provider '{provider_name}'"})
+            self._update(job_id, status="failed", error={"message": f"Unknown provider '{provider_name}'", "category": "validation"})
             return
 
         self._update(job_id, status="submitting")
@@ -129,7 +131,7 @@ class JobStore:
                 seed=result.seed,
             )
         except ProviderError as exc:
-            logger.error("[Jobs] job=%s failed category=%s error=%s", job_id, exc.category, str(exc))
+            logger.error("[Jobs] job=%s provider=%s failed category=%s error=%s", job_id, provider_name, exc.category, str(exc))
             self._update(
                 job_id,
                 status="failed",
