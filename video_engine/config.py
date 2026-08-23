@@ -57,6 +57,26 @@ LTX_DURATION_MAX = _float("LTX_DURATION_MAX", "10")
 LTX_ENHANCE_PROMPT = _bool("LTX_ENHANCE_PROMPT", "false")
 LTX_RANDOMIZE_SEED = _bool("LTX_RANDOMIZE_SEED", "false")
 
+# ── Agnes Video V2.0 ─────────────────────────────────────────────────────
+# Agnes supports text-to-video and image-to-video through an async API. Keep
+# this fully environment-driven so production secrets never enter source.
+AGNES_API_KEYS = _token_pool("AGNES_API_KEYS")
+AGNES_BASE_URL = os.environ.get("AGNES_BASE_URL", "https://apihub.agnes-ai.com").rstrip("/")
+AGNES_MODEL = os.environ.get("AGNES_MODEL", "agnes-video-v2.0")
+AGNES_WIDTH = _int("AGNES_WIDTH", "720")
+AGNES_HEIGHT = _int("AGNES_HEIGHT", "1280")
+AGNES_FRAME_RATE = _int("AGNES_FRAME_RATE", "24")
+AGNES_DURATION_MIN = _float("AGNES_DURATION_MIN", "1")
+AGNES_DURATION_MAX = _float("AGNES_DURATION_MAX", "18")
+AGNES_MAX_FRAMES = _int("AGNES_MAX_FRAMES", "441")
+AGNES_KEY_COOLDOWN_SECONDS = _float("AGNES_KEY_COOLDOWN_SECONDS", "120")
+AGNES_HTTP_TIMEOUT_SECONDS = _float("AGNES_HTTP_TIMEOUT_SECONDS", "60")
+AGNES_SUBMIT_RETRIES = _int("AGNES_SUBMIT_RETRIES", "3")
+AGNES_MAX_POLL_ATTEMPTS = _int("AGNES_MAX_POLL_ATTEMPTS", "120")
+AGNES_POLL_INTERVAL_SECONDS = _float("AGNES_POLL_INTERVAL_SECONDS", "5")
+AGNES_RETRY_BASE_SECONDS = _float("AGNES_RETRY_BASE_SECONDS", "2")
+AGNES_RETRY_MAX_SECONDS = _float("AGNES_RETRY_MAX_SECONDS", "30")
+
 # ── Shared filesystem ────────────────────────────────────────────────────
 # NOTE: intentionally not used for image/video hand-off anymore — Replit
 # Autoscale can run multiple instances, and even within one instance the
