@@ -310,7 +310,7 @@ function createDirectorState({ episode = {}, scene = {}, shot = {}, previousStat
        */
       visual_handoff: {
         mode: previous?.terminal
-          ? 'previous_end_frame_to_current_still'
+          ? 'semantic_previous_end_frame_to_fresh_current_still'
           : 'current_still_only',
         previous_end_frame_required: Boolean(previous?.terminal),
         current_still_required: true,
@@ -345,10 +345,12 @@ function createDirectorState({ episode = {}, scene = {}, shot = {}, previousStat
     },
     invariants: [
       'no-teleportation',
-      'previous-terminal-state-becomes-next-opening-state',
+      'previous-terminal-state-drives-next-opening-state',
+      'fresh-still-is-constructed-from-the-target-opening-state',
       'preserve-screen-geography',
       'preserve-wardrobe-and-props-unless-explicitly-changed',
       'still-image-is-opening-frame-only',
+      'agnes-sequential-shots-use-previous-end-frame-and-fresh-current-still-as-ordered-keyframes',
       'vision-director-compares-previous-end-frame-to-current-still',
     ],
   };

@@ -12,12 +12,12 @@ const config     = require('./config');
 const cfImageGen = require('./cfImageGen');
 const { CFSafetyRefusalError } = cfImageGen;
 
-async function generateImage(prompt, referenceImageUrls = [], seed = null, negativePrompt = null, characterMap = []) {
+async function generateImage(prompt, referenceImageUrls = [], seed = null, negativePrompt = null, characterMap = [], generationOptions = {}) {
   if (config.cfWorkerUrls.length === 0 || config.cfWorkerKeys.length === 0) {
     throw new Error('[ImageGen] No image generation backend configured (CF_WORKER_URL + CF_WORKER_KEYS required)');
   }
 
-  return cfImageGen.generateImage(prompt, referenceImageUrls, seed, negativePrompt, characterMap);
+  return cfImageGen.generateImage(prompt, referenceImageUrls, seed, negativePrompt, characterMap, generationOptions);
 }
 
 module.exports = { generateImage, CFSafetyRefusalError };

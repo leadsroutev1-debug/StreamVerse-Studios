@@ -30,6 +30,7 @@ const cameraSim          = require('./cameraSim');
 const motionSystem       = require('./motionSystem');
 const shotStaging         = require('./shotStaging');
 const { selectReferenceAngles } = require('./characterReferenceSelector');
+const semanticTransitionDirector = require('./semanticTransitionDirector');
 const constraintEnforcer = require('./constraintEnforcer');
 const directorialOrchestrator = require('./directorialOrchestrator');
 const hardControl       = require('./hardControlLayers');
@@ -1555,14 +1556,37 @@ function _makeShotImagePersistenceCallback({ episodeId, shot, storyline, globalE
 }
 
 function _buildSceneBackgroundPrompt(scene, storyline) {
-  return `Establish the reusable empty-set master background for this ${storyline.genre || 'cinematic'} scene. Location: ${scene.location || 'unspecified'}. ${scene.scene_description || ''} Lighting: ${scene.lighting_design || 'natural cinematic lighting'}. Build the exact architecture, furniture, doors, windows, props, surfaces, spatial depth, practical lights and time-of-day evidence required for later character placement. No people, no characters, no silhouettes, no human figures. Photorealistic cinematic 9:16 vertical environment plate, stable geography, no text, logo or watermark.`;
+  const location = String(scene.location || 'unspecified location').trim();
+  const description = String(
+    scene.scene_environment ||
+    scene.environmental_story_beat ||
+    scene.environment_description ||
+    ''
+  ).trim();
+  const lighting = String(scene.lighting_design || 'natural cinematic lighting').trim();
+  return [
+    `ENVIRONMENT REFERENCE — EMPTY SET ONLY. ${storyline.genre || 'cinematic'} production.`,
+    `LOCATION: ${location}.`,
+    description ? `PHYSICAL ENVIRONMENT DESCRIPTION: ${description}.` : '',
+    `LIGHTING AND TIME-OF-DAY: ${lighting}.`,
+    'Construct only the reusable physical environment: architecture, room geometry, doors, windows, furniture, fixed props, surfaces, materials, practical lights, spatial depth, perspective, weather evidence and time-of-day evidence.',
+    'This is a character-free master environment plate. Do not depict or imply people, characters, human figures, silhouettes, crowds, faces, bodies, mannequins, portraits or human-like subjects.',
+    'Do not create any character reference image. Do not use any character reference image. Generate one photorealistic 9:16 vertical environment plate with stable geography and no text, logos or watermarks.'
+  ].filter(Boolean).join(' ');
 }
 
 async function _ensureSceneBackground({ episodeId, storyline, globalEpisodeNumber, scene, savedState }) {
   const key = String(scene.scene_number);
   if (savedState[key]) return savedState[key];
   const prompt = _buildSceneBackgroundPrompt(scene, storyline);
-  const generated = await imageGen.generateImage(prompt, [], Math.abs(`${storyline.id}:${globalEpisodeNumber}:${key}`.split('').reduce((h,c)=>((h<<5)-h+c.charCodeAt(0))|0,0)) % 2147483647, 'people, character, human, face, body, silhouette, crowd, text, logo, watermark', []);
+  const generated = await imageGen.generateImage(
+    prompt,
+    [],
+    Math.abs(`${storyline.id}:${globalEpisodeNumber}:${key}`.split('').reduce((h,c)=>((h<<5)-h+c.charCodeAt(0))|0,0)) % 2147483647,
+    'people, character, human, face, body, silhouette, crowd, mannequin, portrait, human-like subject, text, logo, watermark',
+    [],
+    { generationMode: 'environment', referenceRoles: [] }
+  );
   const pubId = cloudinary.sceneBgPublicId(storyline.id, globalEpisodeNumber, scene.scene_number);
   let url = null;
   if (Buffer.isBuffer(generated) || generated instanceof Uint8Array) {
@@ -1601,11 +1625,10 @@ async function generateShot(shot, storyline, characterList, globalEpisodeNumber,
   const maxRetries  = config.shotMaxRetries;  // per-attempt retries inside generateShot
   let   lastError;
   let   currentShot = shot; // may be replaced by a sanitised copy on safety refusal
-  // A persisted image from the pre-continuity pipeline must never bypass the
-  // new predecessor-frame architecture. For every shot with a predecessor,
-  // build the current opening still from that exact terminal frame again.
-  // During retries of the same invocation imageReuseUrl may be populated by
-  // onImageGenerated(), which is safe because that image was just re-anchored.
+  // A persisted image must never bypass continuity construction. For Agnes
+  // sequential shots, the current still is always freshly authored from the target
+  // semantic state. For retries, imageReuseUrl is safe only when it came from the
+  // current invocation's image-generation callback.
   let   imageReuseUrl = prevShot ? null : reuseImageUrl;
   // Carries the constraint-corrected prompt across retry attempts. Without this,
   // each attempt rebuilt imagePrompt from scratch from currentShot.image_prompt,
@@ -1662,6 +1685,53 @@ async function generateShot(shot, storyline, characterList, globalEpisodeNumber,
       `previous=S${prevShot.scene_number}/idx${prevShot.shot_index} ` +
       `previousEndFrame=${previousEndFrameUrl ? 'resolved' : 'not-resolved'}`
     );
+  }
+
+  // Agnes has a distinct semantic construction pass. The predecessor end frame
+  // is evidence for the director and the FIRST Agnes keyframe, never the canvas
+  // for the newly authored current-shot still. Fail closed when continuity pixels
+  // are unavailable: generating a fresh still without knowing the predecessor
+  // state would reintroduce the exact teleportation defect this path prevents.
+  const useSemanticAgnesStill = Boolean(
+    config.videoProvider === 'agnes' && prevShot
+  );
+  let semanticTransitionPlan = null;
+  if (useSemanticAgnesStill) {
+    if (!previousEndFrameUrl) {
+      const continuityErr = new Error(
+        `[Pipeline] Agnes semantic transition requires the exact previous terminal frame for ` +
+        `S${shot.scene_number}/idx${shot.shot_index}`
+      );
+      continuityErr.code = 'AGNES_CONTINUITY_FRAME_REQUIRED';
+      throw continuityErr;
+    }
+    semanticTransitionPlan = await semanticTransitionDirector.planSemanticTransition({
+      previousEndFrameUrl,
+      previousShot: prevShot,
+      currentShot,
+      scene: {
+        scene_number: currentShot.scene_number,
+        location: currentShot._scene_location || currentShot.location || '',
+        scene_description: currentShot._scene_description || '',
+        emotional_beat: currentShot._scene_emotion || '',
+        lighting_design: currentShot._lighting_design || '',
+      },
+      episode: {
+        episode_title: storyline?.episode_title || storyline?.title || '',
+        logline: storyline?.logline || '',
+      },
+      characters: characterList,
+      continuityHistory: Array.isArray(currentShot._continuity_history)
+        ? currentShot._continuity_history
+        : [],
+    });
+    currentShot._semantic_transition_plan = semanticTransitionPlan;
+    if (semanticTransitionPlan.teleport_risk >= 0.65) {
+      console.warn(
+        `[Pipeline] High semantic teleport risk on S${shot.scene_number}/idx${shot.shot_index}: ` +
+        `${semanticTransitionPlan.teleport_risk.toFixed(2)} — target staging will be rendered only after explicit bridge planning`
+      );
+    }
   }
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -1721,12 +1791,12 @@ async function generateShot(shot, storyline, characterList, globalEpisodeNumber,
         ? [focusChar].filter(Boolean)
         : [focusChar, ...otherChars].filter(Boolean);
 
-      // For every shot after the first, the previous terminal frame becomes the
-      // source canvas. Only the canonical character references actually needed for
-      // the current shot are added as identity anchors. Scene background references
-      // are intentionally dropped because the predecessor frame already contains
-      // the authoritative environment and composition.
-      const continuityReanchorMode = Boolean(previousEndFrameUrl && prevShot);
+      // Image-construction strategy:
+      //   Agnes sequential shots: fresh current-shot still from scene + canonical
+      //   character references; the predecessor frame is NOT an image-gen canvas.
+      //   Legacy providers: retain the existing predecessor re-anchor behavior.
+      const semanticAgnesMode = Boolean(useSemanticAgnesStill && semanticTransitionPlan);
+      const continuityReanchorMode = Boolean(previousEndFrameUrl && prevShot && !semanticAgnesMode);
       const selectedContinuityRefs = continuityReanchorMode
         ? _selectContinuityCharacterReferences(charsInShot, currentShot, speakerNameForRef, 3)
         : [];
@@ -1753,6 +1823,16 @@ async function generateShot(shot, storyline, characterList, globalEpisodeNumber,
             ? [sceneBgImageUrl, ...charRefs].slice(0, 4)
             : charRefs.slice(0, 4));
 
+      const referenceRoles = continuityReanchorMode
+        ? ['previous_end_frame', ...charRefs.map(() => 'character')].slice(0, 4)
+        : (sceneBgImageUrl
+            ? ['environment', ...charRefs.map(() => 'character')].slice(0, 4)
+            : charRefs.map(() => 'character').slice(0, 4));
+
+      if (!continuityReanchorMode && useSemanticAgnesStill && !sceneBgImageUrl) {
+        throw new Error(`[Pipeline] Agnes semantic shot S${shot.scene_number}/idx${shot.shot_index} requires a locked scene environment reference before character composition.`);
+      }
+
       const refSlotStart = continuityReanchorMode ? 1 : (sceneBgImageUrl ? 1 : 0);
       const charRefSlots = orderedCharsForRender
         .slice(0, 4 - refSlotStart)
@@ -1763,8 +1843,13 @@ async function generateShot(shot, storyline, characterList, globalEpisodeNumber,
           .map(x => `${x.character.name}:${x.angle}`)
           .join(', ');
         console.log(
-          `[Pipeline] Continuity re-anchor refs | S${shot.scene_number}/idx${shot.shot_index} ` +
+          `[Pipeline] Legacy continuity re-anchor refs | S${shot.scene_number}/idx${shot.shot_index} ` +
           `base=previous_end_frame refs=${selectedDescription || 'none'}`
+        );
+      } else if (semanticAgnesMode) {
+        console.log(
+          `[Pipeline] Agnes semantic still construction | S${shot.scene_number}/idx${shot.shot_index} ` +
+          `canvas=FRESH target still; previous_end_frame=director+keyframe-only`
         );
       }
 
@@ -1783,7 +1868,7 @@ async function generateShot(shot, storyline, characterList, globalEpisodeNumber,
       // a fresh, uncorrected prompt every retry.
       const promptSource = pendingCorrectedPrompt || null;
       let imagePrompt = promptSource
-        || _buildShotImagePrompt(currentShot, storyline, charsInShot, prevShot, continuityReanchorMode ? null : sceneBgImageUrl, focusChar, charRefSlots, _speakerOnlyMode, previousEndFrameUrl);
+        || _buildShotImagePrompt(currentShot, storyline, charsInShot, prevShot, continuityReanchorMode ? null : sceneBgImageUrl, focusChar, charRefSlots, _speakerOnlyMode, continuityReanchorMode ? previousEndFrameUrl : null, semanticTransitionPlan);
       lastAttemptImagePrompt = imagePrompt;
       pendingCorrectedPrompt = null;
       if (promptSource) {
@@ -1838,10 +1923,16 @@ async function generateShot(shot, storyline, characterList, globalEpisodeNumber,
           // Fall back to one fresh image rather than retrying the dead URL forever.
           console.warn(`[Pipeline] Saved image for S${shot.scene_number}/idx${shot.shot_index} is unavailable (${reuseErr.message}) — regenerating once`);
           imageReuseUrl = null;
-          imageBuffer = await imageGen.generateImage(imagePrompt, referenceUrls, shotSeed, negativePrompt, characterRefMap);
+          imageBuffer = await imageGen.generateImage(imagePrompt, referenceUrls, shotSeed, negativePrompt, characterRefMap, {
+            generationMode: semanticAgnesMode || !continuityReanchorMode ? 'shot-composite' : 'shot-reanchor',
+            referenceRoles,
+          });
         }
       } else {
-        imageBuffer = await imageGen.generateImage(imagePrompt, referenceUrls, shotSeed, negativePrompt, characterRefMap);
+        imageBuffer = await imageGen.generateImage(imagePrompt, referenceUrls, shotSeed, negativePrompt, characterRefMap, {
+            generationMode: semanticAgnesMode || !continuityReanchorMode ? 'shot-composite' : 'shot-reanchor',
+            referenceRoles,
+          });
       }
 
       // ── Constraint Enforcement + Hard Control Layers: multi-pass validation ──
@@ -1954,7 +2045,10 @@ async function generateShot(shot, storyline, characterList, globalEpisodeNumber,
           console.log(
             `[Pipeline] S${shot.scene_number}/idx${shot.shot_index}: DRAFT pass passed → upgrading to REFINE pass (full quality)`
           );
-          imageBuffer = await imageGen.generateImage(imagePrompt, referenceUrls, shotSeed, negativePrompt, characterRefMap);
+          imageBuffer = await imageGen.generateImage(imagePrompt, referenceUrls, shotSeed, negativePrompt, characterRefMap, {
+            generationMode: semanticAgnesMode || !continuityReanchorMode ? 'shot-composite' : 'shot-reanchor',
+            referenceRoles,
+          });
 
           // Re-validate structure on the refined image
           const refineStructResult = await constraintEnforcer.validateImage(
@@ -2079,8 +2173,10 @@ async function generateShot(shot, storyline, characterList, globalEpisodeNumber,
            * as its ordered first keyframe; the Vision Director consumes
            * visionPreviousEndFrameUrl as its visual continuity reference.
            */
-          continuityLastFrameUrl: null,
+          continuityLastFrameUrl: previousEndFrameUrl || null,
           visionPreviousEndFrameUrl: previousEndFrameUrl || null,
+          semanticTransitionPlan: semanticTransitionPlan || null,
+          agnesTransitionDirective: semanticTransitionPlan?.agnes_transition_directive || null,
           visionPreviousShot: prevShot
             ? {
                 scene_number: Number(prevShot.scene_number),
@@ -2096,9 +2192,9 @@ async function generateShot(shot, storyline, characterList, globalEpisodeNumber,
             shot: {
               ...currentShot,
               _imageGenerationSource: 'actual_current_shot_still',
-              _visualContinuityMode: previousEndFrameUrl
-                ? 'previous_end_frame_to_current_still'
-                : 'current_still_only',
+              _visualContinuityMode: semanticTransitionPlan
+                ? 'semantic_previous_end_frame_to_fresh_current_still'
+                : (previousEndFrameUrl ? 'previous_end_frame_to_current_still' : 'current_still_only'),
               _visualContinuityPreviousEndFrameUrl: previousEndFrameUrl || null,
               _temporalCanvasSeconds: _videoTemporalContract().maxSeconds,
             },
@@ -3402,6 +3498,9 @@ async function _runPipeline() {
 
     const shot     = allShots[i];
     const prevShot = i > 0 ? allShots[i - 1] : null;
+    // Give the semantic continuity director access to the full ordered shot
+    // history without persisting that runtime-only graph into the episode JSON.
+    shot._continuity_history = allShots.slice(0, i);
     const stateKey = `${shot.scene_number}_${shot.shot_index}`;
     const shotRow  = shotRowMap.get(stateKey);
 
@@ -4576,8 +4675,12 @@ function _staticCharacterState(row, fallbackPose = '') {
   return staticParts.join('; ') || 'frozen natural pose, stable posture, no transitional action';
 }
 
-function _buildShotImagePrompt(shot, storyline, charsInShot, prevShot = null, sceneBgImageUrl = null, focusChar = null, charRefSlots = [], speakerOnlyMode = false, previousEndFrameUrl = null) {
+function _buildShotImagePrompt(shot, storyline, charsInShot, prevShot = null, sceneBgImageUrl = null, focusChar = null, charRefSlots = [], speakerOnlyMode = false, previousEndFrameUrl = null, semanticTransitionPlan = null) {
   const staging = shotStaging.getShotCharacterStaging(shot, charsInShot);
+  const semanticStillDirective = semanticTransitionPlan
+    ? semanticTransitionDirector.buildStillTargetDirective(semanticTransitionPlan)
+    : '';
+  const semanticAgnesMode = Boolean(semanticTransitionPlan);
   const refs = charRefSlots.map(x => `input_image_${x.slotIndex} = ${x.char.name} character reference`).join('; ');
   const continuityBase = previousEndFrameUrl
     ? 'input_image_0 is the EXACT terminal frame of the immediately preceding completed shot and is the authoritative visual canvas for the current opening frame. Preserve its environment, composition, lighting, wardrobe, props, character identity, screen geography, body positions, gaze and hand/prop contact unless the current frozen opening state explicitly changes them.'
@@ -4585,7 +4688,7 @@ function _buildShotImagePrompt(shot, storyline, charsInShot, prevShot = null, sc
   const bg = continuityBase
     ? continuityBase
     : sceneBgImageUrl
-      ? 'input_image_0 is the character-free master background for this scene. Preserve its architecture, spatial geometry, props, lighting and camera geography exactly.'
+      ? 'INPUT IMAGE 0 = ENVIRONMENT MASTER. It is the immutable character-free environment plate for this scene. Treat it as the number-one compositional base layer: preserve its architecture, spatial geometry, fixed props, surfaces, perspective, lighting and camera geography exactly. Character references are secondary identity/staging inputs layered onto this environment; they must never replace, redesign or dominate the environment.'
       : 'No scene background reference was available; preserve the written scene geography exactly.';
 
   const previousEnd = prevShot
@@ -4605,9 +4708,11 @@ function _buildShotImagePrompt(shot, storyline, charsInShot, prevShot = null, sc
     return `CHARACTER ${row.name}: ${row.screen_position}, ${row.depth}; ${staticState}.${identity}`;
   }).join('\n');
 
-  const staticContinuity = sameScene && startState
-    ? `Frozen opening state inherited from the previous shot: ${_staticizeImagePromptText(startState)}. Reproduce this state as a single settled frame; do not depict a transition or in-between motion state.`
-    : 'Establish the declared opening visual state as one settled, frozen instant; no transitional pose.';
+  const staticContinuity = semanticAgnesMode
+    ? (semanticStillDirective || 'Establish the declared current-shot opening visual state as one settled, frozen instant; no transitional pose.')
+    : (sameScene && startState
+      ? `Frozen opening state inherited from the previous shot: ${_staticizeImagePromptText(startState)}. Reproduce this state as a single settled frame; do not depict a transition or in-between motion state.`
+      : 'Establish the declared opening visual state as one settled, frozen instant; no transitional pose.');
 
   const focus = shot._multi_speaker
     ? 'Keep every visible character separately readable and spatially distinct. Use closed or naturally resting mouths unless the frozen reference state clearly shows otherwise.'
@@ -4623,6 +4728,9 @@ function _buildShotImagePrompt(shot, storyline, charsInShot, prevShot = null, sc
     `Lighting: ${_staticizeImagePromptText(shot._lighting_design || 'consistent with the established scene lighting')}.`,
     `LOCKED CHARACTER STAGING — authoritative frozen spatial map:\n${stagingLines}`,
     bg,
+    sceneBgImageUrl && !continuityBase
+      ? 'ENVIRONMENT-FIRST COMPOSITING CONTRACT: input_image_0 is the scene environment. Build the shot on that image first. Only after the environment geometry is established may character references be layered into their authoritative positions, depths, poses and roles. Never allow a character reference to become the environment, and never synthesize a new background from a character portrait.'
+      : '',
     refs ? `REFERENCE MAP: ${refs}. Each reference supplies identity only for the matching character; preserve the same identity, screen position and depth.` : '',
     `COMPOSITION SUMMARY: ${staging.map(row => `${row.name} at ${row.screen_position}, ${row.depth}`).join('; ')}.`,
     `VISIBLE OPENING STATE: ${_staticCharacterState(staging[0], shot.pose_state)}.`,
@@ -5581,6 +5689,7 @@ async function regenerateEpisodeVideos(episodeId) {
     for (let i = 0; i < allShots.length; i++) {
       const shot = allShots[i];
       const prevShot = i > 0 ? allShots[i - 1] : null;
+      shot._continuity_history = allShots.slice(0, i);
       const row = shotRowMap.get(`${shot.scene_number}_${shot.shot_index}`);
       const storedImageUrl = _storedShotImageUrl(row?.image_url);
 

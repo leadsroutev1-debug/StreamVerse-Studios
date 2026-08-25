@@ -110,8 +110,19 @@ async function _prepareReferenceImage(buffer, index) {
  * a materially different, safer prompt before retrying rather than replaying
  * the same request.
  */
-function _build3030RecoveryPrompt(originalPrompt, attempt) {
+function _build3030RecoveryPrompt(originalPrompt, attempt, generationMode = 'shot') {
   let prompt = String(originalPrompt || '').trim();
+
+  if (generationMode === 'environment') {
+    const recoveryGuidance = [
+      'Describe only the physical environment as an empty-set location plate.',
+      'Do not add, imply, or depict people, characters, human figures, silhouettes, crowds, mannequins, portraits, faces, bodies, hands, or human-like subjects.',
+      'Preserve architecture, spatial geometry, furniture, fixed props, practical lights, surfaces, depth, weather and time-of-day evidence only.',
+      'The result must be a character-free reusable environment reference for later compositing.'
+    ][Math.min(Math.max(attempt - 1, 0), 3)];
+    return `A professional fictional film environment plate for an original narrative project. ${prompt} Empty set only. No people, no characters, no human figures, no silhouettes, no crowds, no faces, no bodies, no mannequins, no portraits, no human-like subjects. ${recoveryGuidance} No text, logos or watermarks.`
+      .replace(/\s{2,}/g, ' ').trim();
+  }
 
   // Avoid isolated words/fragments by adding complete scene framing first.
   const framing =
@@ -201,7 +212,19 @@ const FLUX_STILL_NEGATIVE_CONSTRAINTS = [
   'no split panels', 'no collage', 'no text', 'no subtitles', 'no logos', 'no watermark',
 ].join(', ');
 
-async function generateImage(prompt, referenceImageUrls = [], seed = null, negativePrompt = null, characterMap = []) {
+async function generateImage(prompt, referenceImageUrls = [], seed = null, negativePrompt = null, characterMap = [], generationOptions = {}) {
+  const generationMode = String(generationOptions?.generationMode || 'shot').trim().toLowerCase();
+  const referenceRoles = Array.isArray(generationOptions?.referenceRoles) ? generationOptions.referenceRoles.map(x => String(x || '').trim().toLowerCase()) : [];
+  if (generationMode === 'environment' && referenceImageUrls.length) {
+    throw new Error('[CFImageGen] Environment generation must never receive reference images.');
+  }
+  if (referenceRoles.length && referenceRoles.length !== Math.min((referenceImageUrls || []).length, 4)) {
+    throw new Error(`[CFImageGen] Reference role count ${referenceRoles.length} does not match supplied reference count ${Math.min((referenceImageUrls || []).length, 4)}.`);
+  }
+  if (referenceRoles.length && referenceRoles[0] !== 'environment' && referenceRoles.includes('environment')) {
+    throw new Error('[CFImageGen] Environment reference must be reference slot 0.');
+  }
+
   const urlCount = config.cfWorkerUrls.length;
   const keyCount = config.cfWorkerKeys.length;
 
@@ -212,12 +235,19 @@ async function generateImage(prompt, referenceImageUrls = [], seed = null, negat
   // non-fatal so another available reference can still be used.
   const refBuffers = [];
   for (const [index, url] of (referenceImageUrls || []).slice(0, 4).entries()) {
+    const role = referenceRoles[index] || 'reference';
     try {
       const r = await axios.get(url, { responseType: 'arraybuffer', timeout: 20000 });
       refBuffers.push(await _prepareReferenceImage(Buffer.from(r.data), index));
     } catch (e) {
-      console.warn(`[CFImageGen] Skipping reference image ${index + 1}: ${e.message}`);
+      if (role === 'environment') {
+        throw new Error(`[CFImageGen] Required environment reference failed to download; refusing to promote a character reference into slot 0: ${e.message}`);
+      }
+      console.warn(`[CFImageGen] Skipping ${role} reference image ${index + 1}: ${e.message}`);
     }
+  }
+  if (generationMode !== 'environment' && referenceRoles.length && referenceRoles[0] === 'environment' && refBuffers.length === 0) {
+    throw new Error('[CFImageGen] Shot generation expected an environment image in slot 0 but no reference image was available.');
   }
 
   let lastError;
@@ -287,7 +317,7 @@ async function generateImage(prompt, referenceImageUrls = [], seed = null, negat
           if (errText.includes('3030')) {
             if (safetyRetries < CF_3030_MAX_RETRIES) {
               safetyRetries += 1;
-              currentPrompt = _build3030RecoveryPrompt(currentPrompt, safetyRetries);
+              currentPrompt = _build3030RecoveryPrompt(currentPrompt, safetyRetries, generationMode);
               console.warn(
                 `[CFImageGen] 3030 content flag on ${workerUrl} — ` +
                 `rewriting prompt and retrying ${safetyRetries}/${CF_3030_MAX_RETRIES}`
@@ -314,7 +344,7 @@ async function generateImage(prompt, referenceImageUrls = [], seed = null, negat
           if (errText.includes('3030')) {
             if (safetyRetries < CF_3030_MAX_RETRIES) {
               safetyRetries += 1;
-              currentPrompt = _build3030RecoveryPrompt(currentPrompt, safetyRetries);
+              currentPrompt = _build3030RecoveryPrompt(currentPrompt, safetyRetries, generationMode);
               console.warn(
                 `[CFImageGen] 3030 content flag on ${workerUrl} HTTP ${status} — ` +
                 `rewriting prompt and retrying ${safetyRetries}/${CF_3030_MAX_RETRIES}`

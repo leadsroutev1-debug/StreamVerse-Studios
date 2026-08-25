@@ -3,11 +3,13 @@
 /**
  * StreamVerse Studio — Agnes Video V2.0 image-to-video integration.
  *
- * Agnes uses the re-anchored current-shot still as its single authoritative
- * I2V opening image. For continuity, the current-shot still has already been
- * generated from the exact previous-shot terminal frame plus the canonical
- * character references needed by the shot. The predecessor frame is never sent
- * as a competing Agnes keyframe.
+ * Agnes sequential shots use two ordered visual keyframes:
+ *   1) the exact terminal frame of the previous shot;
+ *   2) a freshly constructed current-shot still produced from the authored target
+ *      state plus canonical scene/character references.
+ * The predecessor frame is continuity evidence and keyframe A, never the canvas
+ * used to construct keyframe B. Agnes V2 keyframe mode then creates the physical
+ * A -> B bridge while the Vision Director reads the same pair for motion direction.
  */
 
 const config = require('./config');
@@ -212,20 +214,53 @@ async function _persistContinuityFrames(videoUrl, continuity, jobId = null) {
   return continuity;
 }
 
+async function _downloadReferenceBuffer(url, label = 'reference frame') {
+  const target = String(url || '').trim();
+  if (!/^https?:\/\//i.test(target)) {
+    throw new Error(`[AgnesVideoGen] Invalid ${label} URL`);
+  }
+  const response = await fetch(target);
+  if (!response.ok) {
+    throw new Error(`[AgnesVideoGen] Failed to download ${label}: HTTP ${response.status}`);
+  }
+  const arrayBuffer = await response.arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
+  if (!buffer.length) throw new Error(`[AgnesVideoGen] ${label} is empty`);
+  return buffer;
+}
+
 async function _resolveAgnesStartingImage(imageBuffer, shotMeta = {}) {
   if (!Buffer.isBuffer(imageBuffer) || imageBuffer.length === 0) {
     throw new Error('[AgnesVideoGen] Current shot image is empty.');
   }
 
-  // Continuity has already been resolved in the still-generation stage. Agnes
-  // must receive exactly one opening image so the provider cannot reinterpret
-  // the predecessor frame as a second competing composition.
+  const previousEndFrameUrl = String(
+    shotMeta.continuityLastFrameUrl || shotMeta.visionPreviousEndFrameUrl || ''
+  ).trim();
+
+  if (!previousEndFrameUrl) {
+    return {
+      imageBuffer,
+      referenceImageBuffers: [imageBuffer],
+      usedContinuityFrame: false,
+      continuityLastFrameUrl: null,
+      predecessor: null,
+    };
+  }
+
+  const predecessorBuffer = await _downloadReferenceBuffer(
+    previousEndFrameUrl,
+    'previous-shot terminal frame'
+  );
+
   return {
     imageBuffer,
-    referenceImageBuffers: [imageBuffer],
-    usedContinuityFrame: false,
-    continuityLastFrameUrl: null,
-    predecessor: null,
+    // Agnes keyframe order is semantically meaningful: A = predecessor, B =
+    // freshly rendered current opening still. Never reverse this list.
+    referenceImageBuffers: [predecessorBuffer, imageBuffer],
+    usedContinuityFrame: true,
+    continuityLastFrameUrl: previousEndFrameUrl,
+    predecessor: { url: previousEndFrameUrl, buffer: predecessorBuffer },
   };
 }
 
@@ -240,7 +275,7 @@ async function _buildFinalAgnesPrompt(imageBuffer, shotMeta = {}, continuity = {
   }
 
   const continuityInstruction = continuity.usedContinuityFrame
-    ? 'The previous-shot terminal frame is available only as continuity context. The supplied current-shot image is the authoritative opening frame. Preserve the inherited identity, wardrobe, props, lighting, geography, eyelines, hand/prop contact and emotional state that were re-anchored into this image. Do not reset, teleport, mirror, swap, replace, clone, age, or morph any character.'
+    ? 'KEYFRAME CONTINUITY CONTRACT: keyframe A is the exact previous-shot terminal frame; keyframe B is the freshly constructed current-shot still. The pair defines a physical A-to-B transition. Use the director-specified bridge to connect the states; never teleport, reset, mirror, swap, replace, clone, age, or morph characters. Keyframe B is a settled target state, not an in-between frame.'
     : 'The supplied image is the authoritative authored opening still for this shot. Begin from that exact visual state. Do not redesign the composition, replace characters, or invent new identities.';
 
   const behaviorGuardrail = [
@@ -250,7 +285,9 @@ async function _buildFinalAgnesPrompt(imageBuffer, shotMeta = {}, continuity = {
     'Preserve stable facial identity, hair, wardrobe, body proportions, age, skin/features, and spatial identity throughout the shot.',
     'Do not introduce spontaneous smiles, blinks, head turns, hand gestures, eye darts, mouth movements, prop interactions, or background activity merely to make the frame feel alive.',
     'Maintain grounded weight, foot contact and believable body mechanics. No sliding feet, rubber limbs, puppet-like movement, mannequin motion, or sudden pose snaps.',
-    'The current still is settled and authoritative. Do not create an artificial transition from an invented pose; start exactly from the supplied pixels and evolve only the authored action.',
+    continuity.usedContinuityFrame
+      ? 'The two ordered keyframes are the continuity anchors. The transition must be physically plausible and causally connect their geometry; never invent a third arbitrary starting composition.'
+      : 'The current still is settled and authoritative. Do not create an artificial transition from an invented pose; start exactly from the supplied pixels and evolve only the authored action.',
   ].join(' ');
 
   const dialogueInstruction = /(?:dialogue|speaker|speaking|"|“|”|tts_mode)/i.test(String(shot.dialogue_or_action || shot.videoPrompt || shot.agnesPrompt || ''))
@@ -314,7 +351,7 @@ async function submitVideoJob(imageBuffer, shotMeta = {}) {
     const { jobId } = await videoEngineClient.submitJob({
       provider: 'agnes',
       imageBuffer: startingImage.imageBuffer,
-      referenceImageBuffers: [startingImage.imageBuffer],
+      referenceImageBuffers: startingImage.referenceImageBuffers,
       prompt,
       duration,
       width,
@@ -324,7 +361,11 @@ async function submitVideoJob(imageBuffer, shotMeta = {}) {
       randomizeSeed: false,
       enhancePrompt: false,
     });
-    console.log('[AgnesVideoGen] Agnes I2V starting from the continuity-re-anchored current-shot still (single keyframe).');
+    console.log(
+      startingImage.usedContinuityFrame
+        ? '[AgnesVideoGen] Agnes keyframes submitted in order: [previous_end_frame, fresh_current_shot_still].'
+        : '[AgnesVideoGen] Agnes I2V starting from the fresh current-shot still (single keyframe).'
+    );
     return { jobId, apiKey: '... (redacted)' };
   } catch (err) {
     throw err instanceof AgnesGenerationError ? err : new AgnesGenerationError(`[AgnesVideoGen] Submission failed: ${err.message}`);
