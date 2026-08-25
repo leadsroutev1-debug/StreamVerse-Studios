@@ -30,11 +30,32 @@ VALIDATION_STATUS = frozenset({400})
 QUOTA_STATUS = frozenset({402})
 
 DEFAULT_NEGATIVE_PROMPT = (
+    # Text / overlay suppression
     "garbled text, gibberish, misspelled words, distorted lettering, unreadable text, "
     "random symbols, fake subtitles, subtitles, captions, closed captions, dialogue captions, "
     "text overlays, UI overlays, title cards, watermarks, logos, extra typography, floating text, "
     "duplicated text, malformed signs, malformed labels, screen text, extra written words, "
-    "on-screen graphics, words appearing from nowhere"
+    "on-screen graphics, words appearing from nowhere, "
+    # Character identity / morphology suppression
+    "character morphing, face morphing, identity drift, identity swapping, face swapping, "
+    "hybrid faces, merged faces, duplicated faces, age drift, age changing, body-shape drift, "
+    "hairstyle changes, hair color changes, skin-tone drift, wardrobe changes, costume changes, "
+    "extra people, duplicate people, vanishing characters, character cloning, character replacement, "
+    # Anatomy / temporal artifacts
+    "extra arms, extra legs, extra hands, extra fingers, missing fingers, fused fingers, "
+    "fused hands, malformed hands, rubbery limbs, stretched limbs, warped anatomy, "
+    "deformed face, melted facial features, distorted teeth, crossed eyes, eye drift, "
+    "wandering eyes, unnatural blinking, random mouth movement, mouth deformation, teeth popping, "
+    "lip-sync drift, wrong-character lip-sync, ghosting, temporal smear, double exposure, "
+    "frame flicker, texture swimming, background warping, geometry drift, object duplication, "
+    "prop morphing, floating props, disappearing props, phantom objects, "
+    # Artificial performance suppression
+    "robotic movement, mechanical movement, puppet-like motion, mannequin movement, "
+    "rubber-like motion, sliding feet, foot skating, weightless motion, teleporting, "
+    "instant pose changes, unmotivated gestures, synchronized character motion, "
+    "identical reactions, random secondary-character motion, random background activity, "
+    "camera jitter, unmotivated camera shake, excessive zoom, excessive camera movement, "
+    "motion blur, smearing, low-detail faces"
 )
 
 _QUOTA_PATTERNS = (
