@@ -1,0 +1,1883 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<meta name="10d1f5ff375d28f097527e2b75c0d6fba62c09cc" content="10d1f5ff375d28f097527e2b75c0d6fba62c09cc" />
+<title>StreamVerse Studios — Control Room</title>
+<style>
+  :root {
+    --bg:      #0a0c10;
+    --surface: #12161e;
+    --border:  #1e2433;
+    --accent:  #7c3aed;
+    --accent2: #06b6d4;
+    --success: #22c55e;
+    --warning: #f59e0b;
+    --danger:  #ef4444;
+    --text:    #e2e8f0;
+    --muted:   #64748b;
+    --r:       10px;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,sans-serif;font-size:14px;line-height:1.5}
+  header{background:var(--surface);border-bottom:1px solid var(--border);padding:14px 24px;display:flex;align-items:center;gap:12px;position:sticky;top:0;z-index:100}
+  .logo{font-size:18px;font-weight:700;color:var(--accent);letter-spacing:.5px}
+  .sub{color:var(--muted);font-size:12px}
+  .conn-dot{width:8px;height:8px;border-radius:50%;background:var(--danger);transition:background .3s;margin-left:auto}
+  .conn-dot.live{background:var(--success)}
+  .conn-label{font-size:11px;color:var(--muted)}
+  main{padding:20px 24px;max-width:1280px;margin:0 auto}
+  .grid{display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));margin-bottom:16px}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:18px;position:relative;overflow:hidden}
+  .card h3{font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);margin-bottom:12px}
+  .card.accent-top::before{content:'';position:absolute;top:0;left:0;right:0;height:3px;background:linear-gradient(90deg,var(--accent),var(--accent2))}
+  /* Status */
+  .pill{display:inline-block;padding:4px 12px;border-radius:999px;font-size:13px;font-weight:600;background:rgba(124,58,237,.15);color:var(--accent);border:1px solid rgba(124,58,237,.3)}
+  .pill.idle{background:rgba(100,116,139,.12);color:var(--muted);border-color:var(--border)}
+  .pill.error{background:rgba(239,68,68,.15);color:var(--danger);border-color:rgba(239,68,68,.3)}
+  .pill.paused{background:rgba(245,158,11,.15);color:var(--warning);border-color:rgba(245,158,11,.3)}
+  .ep-info{margin-top:10px;font-size:13px;color:var(--muted)}
+  .ep-info strong{color:var(--text)}
+  .error-box{background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.25);border-radius:6px;padding:10px 14px;font-size:12px;color:var(--danger);display:none;margin-top:10px;word-break:break-word}
+  .paused-box{background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.25);border-radius:6px;padding:10px 14px;font-size:12px;color:var(--warning);display:none;margin-top:10px;word-break:break-word}
+  /* Progress */
+  .bar-wrap{background:rgba(255,255,255,.06);border-radius:999px;height:8px;overflow:hidden;margin:8px 0 4px}
+  .bar-fill{height:100%;background:linear-gradient(90deg,var(--accent),var(--accent2));border-radius:999px;transition:width .4s}
+  .prog-label{font-size:12px;color:var(--muted);display:flex;justify-content:space-between}
+  /* Key pills */
+  .key-grid{display:flex;flex-wrap:wrap;gap:6px}
+  .kp{font-size:11px;padding:3px 8px;border-radius:5px;font-family:monospace;background:rgba(34,197,94,.12);color:var(--success);border:1px solid rgba(34,197,94,.25)}
+  .kp.rate-limited{background:rgba(245,158,11,.12);color:var(--warning);border-color:rgba(245,158,11,.25)}
+  .kp.exhausted,.kp.missing{background:rgba(239,68,68,.12);color:var(--danger);border-color:rgba(239,68,68,.25)}
+  /* Disk */
+  .big-val{font-size:28px;font-weight:700;color:var(--text)}
+  .big-val span{font-size:14px;color:var(--muted);font-weight:400}
+  /* Active shows */
+  .show-row{display:flex;align-items:center;justify-content:space-between;padding:6px 0;border-bottom:1px solid rgba(255,255,255,.04);font-size:13px}
+  .show-row:last-child{border-bottom:none}
+  .show-badge{font-size:10px;padding:2px 7px;border-radius:4px;background:rgba(124,58,237,.18);color:var(--accent);border:1px solid rgba(124,58,237,.3)}
+  .show-badge.completed{background:rgba(100,116,139,.12);color:var(--muted);border-color:var(--border)}
+  /* Table */
+  .table-wrap{overflow-x:auto}
+  table{width:100%;border-collapse:collapse}
+  th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.8px;color:var(--muted);padding:6px 10px;border-bottom:1px solid var(--border)}
+  td{padding:8px 10px;border-bottom:1px solid rgba(255,255,255,.04);font-size:13px;vertical-align:middle}
+  tr:hover td{background:rgba(255,255,255,.02)}
+  .lnk{color:var(--accent2);text-decoration:none;font-size:12px}
+  .lnk:hover{text-decoration:underline}
+  /* Buttons */
+  .run-btn{background:linear-gradient(135deg,var(--accent),#5b21b6);color:#fff;border:none;padding:9px 20px;border-radius:7px;font-size:13px;font-weight:600;cursor:pointer;transition:opacity .2s}
+  .run-btn:hover{opacity:.85}
+  .run-btn:disabled{opacity:.4;cursor:not-allowed}
+  .resume-btn{background:linear-gradient(135deg,#b45309,#d97706);color:#fff;border:none;padding:9px 20px;border-radius:7px;font-size:13px;font-weight:600;cursor:pointer;transition:opacity .2s;display:none;margin-left:8px}
+  .resume-btn:hover{opacity:.85}
+  .resume-btn:disabled{opacity:.4;cursor:not-allowed}
+  .pause-btn{background:linear-gradient(135deg,#334155,#475569);color:#fff;border:none;padding:9px 20px;border-radius:7px;font-size:13px;font-weight:600;cursor:pointer;transition:opacity .2s;display:inline-block;margin-left:8px}
+  .pause-btn:hover{opacity:.85}
+  .pause-btn:disabled{opacity:.4;cursor:not-allowed}
+  .refresh-btn{background:transparent;color:var(--muted);border:1px solid var(--border);padding:5px 12px;border-radius:6px;font-size:12px;cursor:pointer;margin-left:8px;transition:color .2s,border-color .2s}
+  .refresh-btn:hover{color:var(--text);border-color:var(--muted)}
+  .analytics-pagination{display:flex;align-items:center;justify-content:center;gap:5px;flex-wrap:wrap;padding-top:12px}
+  .analytics-page-btn{background:transparent;color:var(--muted);border:1px solid var(--border);border-radius:5px;min-width:30px;height:28px;padding:0 8px;font-size:11px;cursor:pointer}
+  .analytics-page-btn:hover{color:var(--text);border-color:var(--muted)}
+  .analytics-page-btn.active{background:rgba(124,58,237,.2);border-color:var(--accent);color:var(--text);font-weight:700}
+  .analytics-page-btn:disabled{opacity:.4;cursor:not-allowed}
+  .test-btn{background:rgba(6,182,212,.12);color:var(--accent2);border:1px solid rgba(6,182,212,.3);padding:7px 16px;border-radius:7px;font-size:12px;font-weight:600;cursor:pointer;transition:opacity .2s}
+  .test-btn:hover{opacity:.85}
+  .test-btn:disabled{opacity:.4;cursor:not-allowed}
+  /* Test API results */
+  .test-results{margin-top:12px}
+  .test-row{display:flex;align-items:center;justify-content:space-between;padding:5px 0;border-bottom:1px solid rgba(255,255,255,.04);font-size:12px}
+  .test-row:last-child{border-bottom:none}
+  .test-name{color:var(--text);font-weight:500;min-width:140px}
+  .test-status{font-size:11px;padding:2px 8px;border-radius:4px;font-weight:600}
+  .test-status.ok{background:rgba(34,197,94,.12);color:var(--success);border:1px solid rgba(34,197,94,.25)}
+  .test-status.fail{background:rgba(239,68,68,.12);color:var(--danger);border:1px solid rgba(239,68,68,.25)}
+  .test-status.running{background:rgba(245,158,11,.12);color:var(--warning);border:1px solid rgba(245,158,11,.25)}
+  .test-detail{color:var(--muted);font-size:11px;flex:1;text-align:right;margin-left:8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:200px}
+  .test-latency{color:var(--muted);font-size:11px;min-width:50px;text-align:right}
+  /* Draft episode cards */
+  .draft-card{background:rgba(245,158,11,.04);border:1px solid rgba(245,158,11,.2);border-radius:8px;padding:14px;margin-bottom:10px}
+  .draft-card:last-child{margin-bottom:0}
+  .draft-title{font-weight:600;font-size:13px;color:var(--text)}
+  .draft-meta{font-size:12px;color:var(--muted);margin-top:3px}
+  .draft-progress{margin-top:10px}
+  .draft-reason{font-size:11px;color:var(--warning);margin-top:6px;padding:4px 8px;background:rgba(245,158,11,.08);border-radius:4px}
+  /* Rendered scenes panel */
+  .scene-block{margin-bottom:16px;padding-bottom:16px;border-bottom:1px solid var(--border)}
+  .scene-block:last-child{margin-bottom:0;padding-bottom:0;border-bottom:none}
+  .scene-header{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+  .scene-label{font-size:11px;text-transform:uppercase;letter-spacing:.8px;color:var(--muted);font-weight:600}
+  .scene-shot-count{font-size:11px;color:var(--muted)}
+  .scene-compiled-link{font-size:11px;color:var(--accent2);text-decoration:none;margin-left:auto}
+  .scene-compiled-link:hover{text-decoration:underline}
+  .shots-row{display:flex;gap:8px;overflow-x:auto;padding-bottom:6px;scrollbar-width:thin;scrollbar-color:var(--border) transparent}
+  .shots-row::-webkit-scrollbar{height:4px}.shots-row::-webkit-scrollbar-track{background:transparent}.shots-row::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
+  .shot-thumb{flex-shrink:0;cursor:pointer;position:relative}
+  .shot-thumb video{width:60px;height:107px;object-fit:cover;border-radius:7px;border:1px solid var(--border);display:block;transition:border-color .2s,transform .2s}
+  .shot-thumb:hover video{border-color:var(--accent);transform:scale(1.04)}
+  .shot-label{font-size:10px;color:var(--muted);text-align:center;margin-top:3px}
+  .recompile-btn{background:rgba(6,182,212,.12);color:var(--accent2);border:1px solid rgba(6,182,212,.3);padding:3px 10px;border-radius:5px;font-size:11px;cursor:pointer;transition:opacity .2s}
+  .recompile-btn:hover{opacity:.8}
+  .recompile-btn:disabled{opacity:.4;cursor:not-allowed}
+  .regen-btn{position:absolute;top:2px;right:2px;background:rgba(245,158,11,.85);color:#fff;border:none;width:18px;height:18px;border-radius:50%;font-size:10px;cursor:pointer;display:none;align-items:center;justify-content:center;line-height:1;padding:0}
+  .shot-thumb:hover .regen-btn{display:flex}
+  .regen-btn:hover{background:rgba(217,119,6,.95)}
+  /* Failed / in-progress shot tiles */
+  .shot-thumb-failed{flex-shrink:0;width:60px;display:flex;flex-direction:column;align-items:center}
+  .shot-failed-box{width:60px;height:107px;border-radius:7px;border:1.5px solid #ef4444;background:rgba(239,68,68,.1);display:flex;align-items:center;justify-content:center;color:#f87171;font-size:18px;cursor:pointer}
+  .shot-failed-box:hover{background:rgba(239,68,68,.18)}
+  .shot-thumb-pending{flex-shrink:0;width:60px;display:flex;flex-direction:column;align-items:center}
+  .shot-pending-box{width:60px;height:107px;border-radius:7px;border:1px dashed var(--border);background:rgba(255,255,255,.03);display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:10px;text-align:center;animation:pulse-pending 1.6s ease-in-out infinite}
+  @keyframes pulse-pending{0%,100%{opacity:.55}50%{opacity:1}}
+  .shot-fail-panel{width:100%;background:rgba(239,68,68,.06);border:1px solid rgba(239,68,68,.25);border-radius:8px;padding:10px 12px;margin-top:6px}
+  .shot-fail-panel-head{display:flex;align-items:center;gap:8px;font-size:11px;color:#f87171;font-weight:600;margin-bottom:4px}
+  .shot-fail-reason-badge{font-size:10px;padding:1px 6px;border-radius:4px;background:rgba(239,68,68,.18);color:#f87171;text-transform:uppercase;letter-spacing:.4px}
+  .shot-fail-msg{font-size:11px;color:var(--muted);margin-bottom:6px;word-break:break-word}
+  .shot-fail-prompt{width:100%;box-sizing:border-box;background:rgba(0,0,0,.25);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:11px;font-family:inherit;padding:6px 8px;resize:vertical;min-height:54px;margin-bottom:6px}
+  .shot-fail-actions{display:flex;gap:6px}
+  .shot-fail-btn{background:rgba(239,68,68,.15);color:#f87171;border:1px solid rgba(239,68,68,.35);padding:3px 10px;border-radius:5px;font-size:11px;cursor:pointer}
+  .shot-fail-btn:hover{opacity:.8}
+  .shot-fail-btn:disabled{opacity:.4;cursor:not-allowed}
+  .shot-fail-btn.primary{background:rgba(245,158,11,.15);color:var(--warning);border-color:rgba(245,158,11,.35)}
+  /* HF token pool panel */
+  .hf-token-row{display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--border);font-size:12px}
+  .hf-token-row:last-child{border-bottom:none}
+  .hf-token-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+  .hf-token-dot.active{background:#4ade80}
+  .hf-token-dot.exhausted,.hf-token-dot.invalid,.hf-token-dot.rate-limited{background:#ef4444}
+  .hf-token-id{font-family:monospace;color:var(--text)}
+  .hf-token-current{font-size:10px;color:var(--accent2);border:1px solid rgba(6,182,212,.3);padding:0 5px;border-radius:4px}
+  .hf-token-status{margin-left:auto;font-size:11px;text-transform:capitalize}
+  .hf-token-status.active{color:#4ade80}
+  .hf-token-status.exhausted,.hf-token-status.invalid,.hf-token-status.rate-limited{color:#f87171;font-weight:600}
+  .hf-token-cooldown{font-size:10px;color:var(--muted)}
+  .purge-btn{background:rgba(239,68,68,.1);color:#f87171;border:1px solid rgba(239,68,68,.3);padding:5px 12px;border-radius:6px;font-size:12px;cursor:pointer;transition:opacity .2s}
+  .purge-btn:hover{opacity:.8}
+  .purge-btn:disabled{opacity:.4;cursor:not-allowed}
+  .recompile-all-btn{background:linear-gradient(135deg,#0891b2,#0e7490);color:#fff;border:none;padding:5px 12px;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;transition:opacity .2s}
+  .recompile-all-btn:hover{opacity:.85}
+  .recompile-all-btn:disabled{opacity:.4;cursor:not-allowed}
+  /* Clip modal */
+  #clipModal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.88);z-index:200;align-items:center;justify-content:center;backdrop-filter:blur(4px)}
+  #clipModal.open{display:flex}
+  #clipModalVideo{max-height:82vh;max-width:92vw;border-radius:12px;border:1px solid var(--border);box-shadow:0 0 60px rgba(0,0,0,.6)}
+  .modal-close{position:absolute;top:18px;right:22px;background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.15);color:var(--text);font-size:18px;width:34px;height:34px;border-radius:50%;cursor:pointer;display:flex;align-items:center;justify-content:center;line-height:1}
+  .modal-close:hover{background:rgba(255,255,255,.2)}
+  /* Shot editor modal (HIL) */
+  #shotEditModal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.88);z-index:210;align-items:center;justify-content:center;backdrop-filter:blur(4px);padding:20px}
+  #shotEditModal.open{display:flex}
+  .shot-edit-panel{background:var(--surface);border:1px solid var(--border);border-radius:14px;max-width:640px;width:100%;max-height:88vh;overflow-y:auto;padding:20px;position:relative}
+  .shot-edit-title{font-size:14px;font-weight:700;margin-bottom:14px;color:var(--text)}
+  .shot-edit-img-wrap{width:100%;border-radius:10px;overflow:hidden;background:#111;margin-bottom:14px;display:flex;align-items:center;justify-content:center;min-height:120px}
+  .shot-edit-img-wrap img{width:100%;display:block}
+  .shot-edit-label{font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.03em;margin:14px 0 6px}
+  .shot-edit-textarea{width:100%;min-height:90px;background:#0c0f14;border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:12.5px;font-family:inherit;padding:10px;resize:vertical;line-height:1.5}
+  .shot-edit-duration{width:100px;background:#0c0f14;border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;padding:8px 10px}
+  .shot-edit-video-wrap{width:100%;border-radius:10px;overflow:hidden;background:#000;margin-bottom:14px}.shot-edit-video-wrap video{width:100%;display:block;max-height:320px}
+  .shot-edit-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:18px}
+  .shot-edit-btn{border:none;border-radius:8px;padding:9px 14px;font-size:12.5px;font-weight:600;cursor:pointer;transition:opacity .2s}
+  .shot-edit-btn:disabled{opacity:.4;cursor:not-allowed}
+  .shot-edit-btn.primary{background:linear-gradient(135deg,#0891b2,#0e7490);color:#fff}
+  .shot-edit-btn.secondary{background:rgba(255,255,255,.08);color:var(--text);border:1px solid var(--border)}
+  .shot-edit-btn:hover:not(:disabled){opacity:.85}
+  #episodeEditModal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.78);z-index:1200;align-items:center;justify-content:center;padding:18px;backdrop-filter:blur(5px)}
+  #episodeEditModal.open{display:flex}
+  .episode-edit-panel{background:var(--surface);border:1px solid var(--border);border-radius:14px;width:min(1100px,96vw);max-height:92vh;overflow:auto;padding:20px;position:relative}
+  .episode-edit-head{display:flex;align-items:center;justify-content:space-between;gap:14px;position:sticky;top:0;background:var(--surface);z-index:2;padding-bottom:12px;border-bottom:1px solid var(--border)}
+  .episode-scene{margin-top:16px;border:1px solid var(--border);border-radius:12px;padding:12px;background:rgba(255,255,255,.02)}
+  .episode-scene-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}
+  .episode-shot-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px}
+  .episode-shot-card{border:1px solid var(--border);border-radius:9px;background:#0b0e13;overflow:hidden;cursor:pointer;text-align:left;color:var(--text)}
+  .episode-shot-card:hover{border-color:#2dd4bf;transform:translateY(-1px)}
+  .episode-shot-thumb{aspect-ratio:16/9;background:#111;display:flex;align-items:center;justify-content:center;overflow:hidden}
+  .episode-shot-thumb img,.episode-shot-thumb video{width:100%;height:100%;object-fit:cover}
+  .episode-shot-meta{padding:8px;font-size:11px}.episode-shot-meta strong{font-size:12px}
+  .shot-edit-hint{font-size:11px;color:var(--muted);margin-top:4px}
+  @media(max-width:600px){main{padding:12px}.grid{grid-template-columns:1fr}header{padding:12px 16px}}
+
+  /* Analytics / admin surfaces */
+  .sheet-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:16px;margin-bottom:14px}
+  .sheet-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
+  .sheet-stat{background:rgba(255,255,255,.025);border:1px solid var(--border);border-radius:10px;padding:13px}
+  .sheet-stat .label{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}.sheet-stat .value{font-size:22px;font-weight:800;margin-top:5px}
+  .sheet-toolbar{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:12px}
+  .sheet-select,.sheet-input,.sheet-textarea{background:#0b0e13;border:1px solid var(--border);color:var(--text);border-radius:8px;padding:8px 10px;font-size:12px;outline:none}.sheet-select:focus,.sheet-input:focus,.sheet-textarea:focus{border-color:#0891b2}.sheet-textarea{min-height:120px;width:100%;resize:vertical;line-height:1.5}
+  .sheet-table-wrap{overflow:auto;border:1px solid var(--border);border-radius:10px}.sheet-table{width:100%;border-collapse:collapse;min-width:760px}.sheet-table th{position:sticky;top:0;background:#0d1118;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.05em;text-align:left;padding:9px;border-bottom:1px solid var(--border);white-space:nowrap}.sheet-table td{padding:9px;border-bottom:1px solid rgba(255,255,255,.05);font-size:11px;vertical-align:top}.sheet-table tr:hover td{background:rgba(255,255,255,.02)}
+  .flag{font-size:19px;vertical-align:middle;margin-right:6px}.muted-mini{color:var(--muted);font-size:10px}.pill-mini{display:inline-flex;align-items:center;padding:2px 6px;border-radius:999px;border:1px solid rgba(255,255,255,.12);font-size:10px}.pill-green{color:#86efac;border-color:rgba(34,197,94,.25);background:rgba(34,197,94,.08)}.pill-red{color:#fca5a5;border-color:rgba(239,68,68,.25);background:rgba(239,68,68,.08)}
+  #adminLoginModal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.82);z-index:3000;align-items:center;justify-content:center;padding:18px;backdrop-filter:blur(8px)}#adminLoginModal.open{display:flex}.admin-login-panel{width:min(420px,94vw);background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:22px;box-shadow:0 25px 80px rgba(0,0,0,.55)}
+  @media(max-width:900px){.sheet-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:600px){.sheet-grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <div class="logo">▶ StreamVerse Studios</div>
+    <div class="sub">Autonomous Content Engine — Control Room</div>
+  </div>
+  <div class="conn-dot" id="connDot"></div>
+  <div class="conn-label" id="connLabel">Connecting…</div>
+</header>
+
+<nav style="display:flex;gap:4px;padding:10px 24px 0;max-width:1280px;margin:0 auto">
+  <button class="tab-btn active" id="tabBtnControl" onclick="switchTab('control')"
+    style="background:var(--surface);border:1px solid var(--border);border-bottom:none;color:var(--text);padding:9px 18px;border-radius:8px 8px 0 0;font-size:13px;font-weight:600;cursor:pointer">
+    🎛 Control Room
+  </button>
+  <button class="tab-btn" id="tabBtnEpisodes" onclick="switchTab('episodes')"
+    style="background:transparent;border:1px solid transparent;color:var(--muted);padding:9px 18px;border-radius:8px 8px 0 0;font-size:13px;font-weight:600;cursor:pointer">
+    🎬 Episodes
+  </button>
+  <button class="tab-btn" id="tabBtnAnalytics" onclick="switchTab('analytics')"
+    style="background:transparent;border:1px solid transparent;color:var(--muted);padding:9px 18px;border-radius:8px 8px 0 0;font-size:13px;font-weight:600;cursor:pointer">📊 Analytics</button>
+  <button class="tab-btn" id="tabBtnUsers" onclick="switchTab('users')"
+    style="background:transparent;border:1px solid transparent;color:var(--muted);padding:9px 18px;border-radius:8px 8px 0 0;font-size:13px;font-weight:600;cursor:pointer">👥 Users</button>
+  <button class="tab-btn" id="tabBtnAnnouncements" onclick="switchTab('announcements')"
+    style="background:transparent;border:1px solid transparent;color:var(--muted);padding:9px 18px;border-radius:8px 8px 0 0;font-size:13px;font-weight:600;cursor:pointer">📣 Announcements</button>
+  <button class="tab-btn" id="tabBtnCheckpoints" onclick="switchTab('checkpoints')" style="background:transparent;border:1px solid transparent;color:var(--muted);padding:9px 18px;border-radius:8px 8px 0 0;font-size:13px;font-weight:600;cursor:pointer">🧭 Checkpoints</button>
+</nav>
+
+<main>
+  <div id="tabPanelControl">
+  <div class="grid">
+
+    <!-- System State -->
+    <div class="card accent-top">
+      <h3>System State</h3>
+      <div class="pill idle" id="statusPill">Idle</div>
+      <div class="ep-info" id="epInfo" style="display:none">
+        <strong id="epTitle"></strong><br/><span id="epSub"></span>
+      </div>
+      <div class="error-box" id="errorBox"></div>
+      <div class="paused-box" id="pausedBox"></div>
+      <div style="margin-top:14px">
+        <button class="run-btn" id="runBtn" onclick="triggerPipeline()">▶ Run Pipeline Now</button>
+        <button class="resume-btn" id="resumeBtn" onclick="resumePipeline()">⏵ Resume Episode</button>
+        <button class="pause-btn" id="pauseBtn" onclick="pausePipeline()">⏸ Pause</button>
+      </div>
+      <div style="margin-top:10px;border-top:1px solid rgba(255,255,255,.07);padding-top:10px">
+        <button onclick="openPruneModal()" style="background:rgba(239,68,68,.08);color:#f87171;border:1px solid rgba(239,68,68,.25);padding:5px 12px;border-radius:6px;font-size:12px;cursor:pointer;transition:opacity .2s" onmouseover="this.style.opacity='.75'" onmouseout="this.style.opacity='1'" title="Wipe all storylines, episodes, characters and shots from the database">🗑 Prune Database</button>
+      </div>
+    </div>
+
+    <!-- Task Progress -->
+    <div class="card accent-top">
+      <h3>Task Progress</h3>
+      <div id="progressLabel" style="font-size:13px;color:var(--muted);margin-bottom:6px">No active task</div>
+      <div class="bar-wrap"><div class="bar-fill" id="progressFill" style="width:0%"></div></div>
+      <div class="prog-label">
+        <span id="progressCurrent">0</span>
+        <span id="progressTotal">—</span>
+      </div>
+    </div>
+
+    <!-- Storage Guard -->
+    <div class="card">
+      <h3>Storage Guard</h3>
+      <div class="big-val"><span id="diskMB">—</span> <span>MB used</span></div>
+      <div style="color:var(--muted);font-size:12px;margin-top:6px">Container disk consumption</div>
+    </div>
+
+  </div>
+
+  <div class="grid">
+
+    <!-- Google Keys -->
+    <div class="card">
+      <h3>Google Keys</h3>
+      <div class="key-grid" id="googleKeys"><span style="color:var(--muted)">—</span></div>
+    </div>
+
+    <!-- Mistral Keys -->
+    <div class="card">
+      <h3>Mistral Keys</h3>
+      <div class="key-grid" id="mistralKeys"><span style="color:var(--muted)">—</span></div>
+    </div>
+
+    <!-- Groq Keys -->
+    <div class="card">
+      <h3>Groq Keys</h3>
+      <div class="key-grid" id="groqKeys"><span style="color:var(--muted)">—</span></div>
+    </div>
+
+    <!-- Deepgram Keys -->
+    <div class="card">
+      <h3>Deepgram Keys</h3>
+      <div class="key-grid" id="deepgramKeys"><span style="color:var(--muted)">—</span></div>
+      <div style="color:var(--muted);font-size:11px;margin-top:8px">TTS for dialogue shots · rotates on quota exhaustion</div>
+    </div>
+
+    <!-- Hugging Face Tokens (LTX-2.3 video backend) -->
+    <div class="card">
+      <h3>Hugging Face Tokens</h3>
+      <div class="key-grid" id="hfTokens"><span style="color:var(--muted)">—</span></div>
+      <div style="color:var(--muted);font-size:11px;margin-top:8px">Powers LTX-2.3 video generation · rotates on ZeroGPU quota exhaustion (24h cooldown)</div>
+    </div>
+
+    <!-- CF Worker URLs -->
+    <div class="card">
+      <h3>CF Worker URLs</h3>
+      <div class="key-grid" id="cfWorkerUrls"><span style="color:var(--muted)">—</span></div>
+      <div style="color:var(--muted);font-size:11px;margin-top:8px">Resets daily at midnight UTC · exhausted = 4006 quota hit</div>
+    </div>
+
+    <!-- Discord Webhook -->
+    <div class="card">
+      <h3>Discord Webhook</h3>
+      <div class="key-grid" id="discordKeys"><span style="color:var(--muted)">—</span></div>
+      <div style="color:var(--muted);font-size:11px;margin-top:8px">Set WEBHOOK_URL in environment · episodes post here automatically</div>
+    </div>
+
+  </div>
+
+  <!-- Test APIs -->
+  <div class="card" style="margin-bottom:16px">
+    <h3 style="display:inline-block">API Health Check</h3>
+    <button class="test-btn" id="testBtn" onclick="runApiTests()" style="margin-left:12px">🔬 Test All APIs</button>
+    <span id="testStatus" style="font-size:11px;color:var(--muted);margin-left:10px"></span>
+    <div class="test-results" id="testResults" style="display:none"></div>
+    <!-- Test media: source image + generated video -->
+    <div id="testMedia" style="display:none;margin-top:16px;border-top:1px solid var(--border);padding-top:14px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+        <span style="font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--muted)">Test Media Output</span>
+        <button onclick="clearTestMedia()" style="background:rgba(239,68,68,.1);color:var(--danger);border:1px solid rgba(239,68,68,.25);padding:3px 10px;border-radius:5px;font-size:11px;cursor:pointer;transition:opacity .2s" onmouseover="this.style.opacity='.75'" onmouseout="this.style.opacity='1'">🗑 Delete</button>
+      </div>
+      <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:flex-start">
+        <div id="testImageBox" style="display:none">
+          <div style="font-size:11px;color:var(--muted);margin-bottom:5px">Source Image</div>
+          <a id="testImageLink" href="#" target="_blank">
+            <img id="testImageEl" src="" alt="Test source image" style="width:90px;height:160px;object-fit:cover;border-radius:7px;border:1px solid var(--border);display:block"/>
+          </a>
+        </div>
+        <div id="testVideoBox" style="display:none;flex:1;min-width:180px;max-width:380px">
+          <div style="font-size:11px;color:var(--muted);margin-bottom:5px">Generated Video <span id="testVideoJobId" style="opacity:.55"></span></div>
+          <video id="testVideoEl" controls muted playsinline style="width:100%;border-radius:7px;border:1px solid var(--border);background:#000;display:block;max-height:320px"></video>
+          <a id="testVideoLink" href="#" target="_blank" style="font-size:11px;color:var(--accent2);text-decoration:none;margin-top:5px;display:inline-block">Open full ↗</a>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Hugging Face token pool (LTX only) -->
+  <div class="card" style="margin-bottom:16px" id="hfTokensCard">
+    <h3 style="display:inline-block">Hugging Face Token Pool</h3>
+    <button class="refresh-btn" onclick="loadHfTokens()">↻ Refresh</button>
+    <div id="hfTokensBody" style="margin-top:10px">
+      <div style="color:var(--muted);font-size:12px">Loading…</div>
+    </div>
+  </div>
+
+  <!-- Paused / Draft Episodes -->
+  <div class="card" style="margin-bottom:16px" id="draftsCard" style="display:none">
+    <h3 style="display:inline-block">Paused Episodes</h3>
+    <button class="refresh-btn" onclick="loadDrafts()">↻ Refresh</button>
+    <div id="draftsBody" style="margin-top:12px">
+      <div style="color:var(--muted);font-size:13px">Loading…</div>
+    </div>
+  </div>
+
+  <!-- Rendered Scenes -->
+  <div class="card" id="renderedShotsCard" style="margin-bottom:16px;display:none">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
+      <div>
+        <h3 style="display:inline-block">Rendered Scenes</h3>
+        <span id="renderedShotsEpLabel" style="font-size:12px;color:var(--muted);margin-left:10px"></span>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px">
+        <button class="refresh-btn" onclick="loadRenderedShots()">↻ Refresh</button>
+        <button class="recompile-all-btn" id="recompileAllBtn" onclick="recompileAllScenes()">🔄 Purge & Recompile All</button>
+        <button onclick="clearRenderedShots()" style="background:rgba(239,68,68,.1);color:var(--danger);border:1px solid rgba(239,68,68,.25);padding:5px 12px;border-radius:6px;font-size:12px;cursor:pointer;transition:opacity .2s" onmouseover="this.style.opacity='.75'" onmouseout="this.style.opacity='1'">✕ Clear</button>
+      </div>
+    </div>
+    <div id="renderedShotsBody"></div>
+  </div>
+
+  <!-- Active Shows -->
+  <div class="card" style="margin-bottom:16px">
+    <h3 style="display:inline-block">Active Shows</h3>
+    <button class="refresh-btn" onclick="loadHistory()">↻ Refresh</button>
+    <div id="showsBody" style="margin-top:12px">
+      <div style="color:var(--muted);font-size:13px">Loading…</div>
+    </div>
+  </div>
+
+  <!-- Episode History -->
+  <div class="card" style="margin-bottom:0">
+    <h3 style="display:inline-block">Episode History (last 10)</h3>
+    <button class="refresh-btn" onclick="loadHistory()">↻ Refresh</button>
+    <div class="table-wrap" style="margin-top:12px">
+      <table>
+        <thead>
+          <tr>
+            <th>#</th><th>Show / Episode</th><th>Posted At</th><th>Cloudinary</th><th>Discord / Video</th>
+          </tr>
+        </thead>
+        <tbody id="historyBody">
+          <tr><td colspan="5" style="color:var(--muted);text-align:center;padding:20px">Loading from database…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+  </div>
+
+  <div id="tabPanelEpisodes" style="display:none">
+    <div class="card" style="margin-bottom:0">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
+        <h3 style="display:inline-block">All Episodes</h3>
+        <button class="refresh-btn" onclick="loadEpisodesTab()">↻ Refresh</button>
+      </div>
+      <div style="color:var(--muted);font-size:12px;margin-bottom:12px">
+        Purge &amp; Regenerate Videos resets every shot's compiled clip and re-renders video from the
+        <strong style="color:var(--text)">already-generated still images</strong> — shots keep their images and are
+        never sent back through the CF Worker. Only shots missing a saved still are skipped (regenerate those
+        individually from the shot regen tool instead).
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>#</th><th>Episode</th><th>Status</th><th>Shots (video / image)</th><th>Video</th><th>Action</th>
+            </tr>
+          </thead>
+          <tbody id="episodesBody">
+            <tr><td colspan="6" style="color:var(--muted);text-align:center;padding:20px">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+
+  <div id="tabPanelAnalytics" style="display:none">
+    <div class="sheet-card">
+      <div class="sheet-toolbar">
+        <div><h3>Visitor Analytics</h3><div class="muted-mini">Consent-based visitor, session, page-request and video telemetry.</div></div>
+        <div style="display:flex;gap:8px;align-items:center"><select id="analyticsDays" class="sheet-select" onchange="loadAnalytics(true)"><option value="7">Last 7 days</option><option value="30" selected>Last 30 days</option><option value="90">Last 90 days</option><option value="365">Last 365 days</option></select><button class="refresh-btn" onclick="loadAnalytics()">↻ Refresh</button></div>
+      </div>
+      <div class="sheet-grid" id="analyticsStats"></div>
+    </div>
+    <div class="sheet-card"><div class="sheet-toolbar"><h3>Geography / Visit Frequency</h3><span class="muted-mini">Country code is populated from trusted request/CDN geo headers when available.</span></div><div class="sheet-table-wrap"><table class="sheet-table"><thead><tr><th>Country</th><th>Visitors</th><th>Sessions</th><th>Requests</th><th>Watch Time</th><th>Repeat Visitors</th><th>Last Seen</th></tr></thead><tbody id="analyticsCountriesBody"><tr><td colspan="7" class="muted-mini" style="text-align:center">Sign in as admin to load analytics.</td></tr></tbody></table></div></div>
+    <div class="sheet-card"><div class="sheet-toolbar"><h3>Show Performance</h3><span class="muted-mini">Episodes watched and audience aggregated by the actual storyline/show record.</span></div><div class="sheet-table-wrap"><table class="sheet-table"><thead><tr><th>Show</th><th>Episodes</th><th>Viewers</th><th>Starts</th><th>Completions</th><th>Watch Time</th><th>Completion %</th><th>Last Watched</th></tr></thead><tbody id="analyticsShowsBody"><tr><td colspan="8" class="muted-mini" style="text-align:center">No analytics yet.</td></tr></tbody></table></div></div>
+
+    <div class="sheet-card"><div class="sheet-toolbar"><h3>Video Performance</h3><span class="muted-mini">Exact episode starts, unique viewers, completions and watch time.</span></div><div class="sheet-table-wrap"><table class="sheet-table"><thead><tr><th>Video</th><th>Viewers</th><th>Starts</th><th>Completions</th><th>Watch Time</th><th>Completion %</th><th>Last Watched</th></tr></thead><tbody id="analyticsVideosBody"></tbody></table></div></div>
+    <div class="sheet-card"><div class="sheet-toolbar"><h3>Frontend Request Log</h3><span class="muted-mini">Showing 20 entries per page so the dashboard stays responsive.</span></div><div class="sheet-table-wrap"><table class="sheet-table"><thead><tr><th>Time</th><th>Event</th><th>Path</th><th>Episode</th><th>Geo</th><th>Device</th><th>Visitor</th><th>Details</th></tr></thead><tbody id="analyticsRequestsBody"></tbody></table></div><div id="analyticsRequestsPagination" class="analytics-pagination"></div></div>
+  </div>
+
+  <div id="tabPanelUsers" style="display:none">
+    <div class="sheet-card">
+      <div class="sheet-toolbar"><div><h3>Registered Users</h3><div class="muted-mini">View and modify member accounts. Passwords are never displayed.</div></div><div style="display:flex;gap:8px"><button class="refresh-btn" onclick="openCreateUser()">＋ Create User</button><button class="refresh-btn" onclick="loadUsers()">↻ Refresh</button></div></div>
+      <div class="sheet-table-wrap"><table class="sheet-table"><thead><tr><th>Email</th><th>Display Name</th><th>Verified</th><th>Active</th><th>Created</th><th>Last Login</th><th>Favorites</th><th>Video Starts</th><th>Actions</th></tr></thead><tbody id="usersBody"></tbody></table></div>
+    </div>
+  </div>
+
+
+  <div id="tabPanelCheckpoints" style="display:none">
+    <div class="card">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
+        <h3 style="display:inline-block">Production Checkpoints</h3>
+        <button class="refresh-btn" onclick="loadCheckpointEpisodes()">↻ Refresh</button>
+      </div>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:12px">Select a persisted checkpoint. Rollback removes downstream progress and resumes from the selected stage.</div>
+      <select id="checkpointEpisodeSelect" onchange="loadEpisodeCheckpoints(this.value)" style="width:100%;background:var(--surface);color:var(--text);border:1px solid var(--border);padding:8px;border-radius:6px;margin-bottom:12px"><option value="">Select an episode…</option></select>
+      <div id="checkpointStatus" style="font-size:12px;color:var(--muted);margin-bottom:10px"></div>
+      <div class="table-wrap"><table><thead><tr><th>Stage</th><th>Scene</th><th>Shot</th><th>Status</th><th>Created</th><th></th></tr></thead><tbody id="checkpointBody"><tr><td colspan="6" style="padding:20px;text-align:center;color:var(--muted)">Select an episode.</td></tr></tbody></table></div>
+    </div>
+  </div>
+  <div id="tabPanelAnnouncements" style="display:none">
+    <div class="sheet-card">
+      <div class="sheet-toolbar"><div><h3>Send Announcement</h3><div class="muted-mini">Published messages appear in registered users' account pages.</div></div></div>
+      <div style="display:grid;gap:10px;max-width:850px"><input id="announcementTitle" class="sheet-input" placeholder="Announcement title"><textarea id="announcementBody" class="sheet-textarea" placeholder="Write the announcement..."></textarea><div><button class="run-btn" onclick="sendAnnouncement()">📣 Publish Announcement</button></div></div>
+    </div>
+    <div class="sheet-card"><div class="sheet-toolbar"><h3>Announcement History</h3><button class="refresh-btn" onclick="loadAnnouncements()">↻ Refresh</button></div><div class="sheet-table-wrap"><table class="sheet-table"><thead><tr><th>Published</th><th>Title</th><th>Message</th><th>Status</th><th>Actions</th></tr></thead><tbody id="announcementsBody"></tbody></table></div></div>
+  </div>
+</main>
+
+
+<div id="adminLoginModal" onclick="if(event.target===this)closeAdminLogin()">
+  <div class="admin-login-panel">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:12px"><div><h3>Admin Access</h3><div class="muted-mini">Analytics, users and announcements are protected.</div></div><button class="modal-close" style="position:static" onclick="closeAdminLogin()">✕</button></div>
+    <input id="adminPassword" type="password" class="sheet-input" placeholder="Dashboard admin password" style="width:100%;margin-top:18px" onkeydown="if(event.key==='Enter')adminLogin()">
+    <div id="adminLoginError" style="display:none;color:#fca5a5;font-size:11px;margin-top:8px"></div>
+    <button class="run-btn" style="margin-top:14px;width:100%" onclick="adminLogin()">Unlock Admin Features</button>
+  </div>
+</div>
+<div id="userModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.82);z-index:2990;align-items:center;justify-content:center;padding:18px">
+  <div class="admin-login-panel"><div style="display:flex;align-items:center;justify-content:space-between"><h3 id="userModalTitle">Create User</h3><button class="modal-close" style="position:static" onclick="closeUserModal()">✕</button></div>
+    <input id="userModalEmail" class="sheet-input" placeholder="Email" style="width:100%;margin-top:15px">
+    <input id="userModalName" class="sheet-input" placeholder="Display name" style="width:100%;margin-top:8px">
+    <input id="userModalPassword" type="password" class="sheet-input" placeholder="Password (8+ chars for new/reset)" style="width:100%;margin-top:8px">
+    <label style="display:flex;align-items:center;gap:8px;margin-top:10px;font-size:11px;color:var(--muted)"><input id="userModalVerified" type="checkbox" checked> Email verified</label>
+    <label id="userModalActiveWrap" style="display:none;align-items:center;gap:8px;margin-top:8px;font-size:11px;color:var(--muted)"><input id="userModalActive" type="checkbox" checked> Account active</label>
+    <div id="userModalError" style="display:none;color:#fca5a5;font-size:11px;margin-top:8px"></div>
+    <button class="run-btn" style="margin-top:14px;width:100%" onclick="saveUserModal()">Save User</button>
+  </div>
+</div>
+
+<!-- Clip modal — click a shot thumbnail to watch fullscreen -->
+<div id="clipModal" onclick="closeClipModal()">
+  <button class="modal-close" onclick="closeClipModal()" title="Close">✕</button>
+  <video id="clipModalVideo" controls autoplay playsinline onclick="event.stopPropagation()"></video>
+</div>
+
+<!-- Shot editor modal (Human-In-the-Loop): view input image, edit prompt(s)
+     and duration, then regenerate — either a full redo or video-only
+     (keeping the current image). -->
+<div id="shotEditModal" onclick="closeShotEditModal(event)">
+  <div class="shot-edit-panel" onclick="event.stopPropagation()">
+    <button class="modal-close" style="position:absolute;top:14px;right:14px" onclick="closeShotEditModal()" title="Close">✕</button>
+    <div class="shot-edit-title" id="shotEditTitle">Edit Shot</div>
+    <div id="shotEditFailure" style="display:none;margin:0 0 12px;padding:10px 12px;border:1px solid rgba(248,113,113,.35);background:rgba(248,113,113,.08);border-radius:8px;font-size:12px;line-height:1.5;color:#fca5a5"></div>
+
+    <div class="shot-edit-img-wrap" id="shotEditImgWrap">
+      <span style="color:var(--muted);font-size:12px;padding:30px">Loading…</span>
+    </div>
+    <div class="shot-edit-video-wrap" id="shotEditVideoWrap" style="display:none">
+      <video id="shotEditVideo" controls playsinline preload="metadata"></video>
+    </div>
+
+    <div class="shot-edit-label">Editorial trim</div>
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <label style="font-size:12px;color:var(--muted)">Start
+        <input class="shot-edit-duration" id="shotEditTrimStart" type="number" min="0" step="0.1" placeholder="0">
+      </label>
+      <label style="font-size:12px;color:var(--muted)">End
+        <input class="shot-edit-duration" id="shotEditTrimEnd" type="number" min="0" step="0.1" placeholder="full">
+      </label>
+      <button class="shot-edit-btn secondary" id="shotEditApplyTrimBtn" onclick="applyShotEditorial()">✂ Apply Trim</button>
+      <button class="shot-edit-btn secondary" id="shotEditRemoveBtn" onclick="removeShotEditorial()">🗑 Remove From Episode</button>
+    </div>
+    <div class="shot-edit-hint">Trimming creates a non-destructive Cloudinary delivery transformation. Removing a shot hides it from the episode timeline without deleting the original asset.</div>
+
+    <div class="shot-edit-label">Image prompt <span style="font-weight:400;text-transform:none">(what the starting frame looks like)</span></div>
+    <textarea class="shot-edit-textarea" id="shotEditImagePrompt" spellcheck="false"></textarea>
+
+    <div class="shot-edit-label">Video prompt <span style="font-weight:400;text-transform:none" id="shotEditVideoPromptNote">(sent to LTX to animate the frame)</span></div>
+    <textarea class="shot-edit-textarea" id="shotEditVideoPrompt" spellcheck="false" style="min-height:140px"></textarea>
+    <div class="shot-edit-hint">Editing this box sends your exact text to the video model instead of the auto-built prompt.</div>
+
+    <div class="shot-edit-label">Duration (seconds)</div>
+    <input class="shot-edit-duration" id="shotEditDuration" type="number" min="1" max="10" step="0.5">
+
+    <div class="shot-edit-actions">
+      <button class="shot-edit-btn primary" id="shotEditRegenBothBtn" onclick="submitShotEdit(false)">🎬 Regenerate Image + Video</button>
+      <button class="shot-edit-btn secondary" id="shotEditRegenVideoBtn" onclick="submitShotEdit(true)">▶ Regenerate Video Only (keep image)</button>
+    </div>
+  </div>
+</div>
+
+<!-- Full Episode HIL editor -->
+<div id="episodeEditModal" onclick="closeEpisodeEditModal(event)">
+  <div class="episode-edit-panel" onclick="event.stopPropagation()">
+    <button class="modal-close" style="position:absolute;top:12px;right:12px" onclick="closeEpisodeEditModal()" title="Close">✕</button>
+    <div class="episode-edit-head">
+      <div>
+        <div id="episodeEditTitle" style="font-size:17px;font-weight:700">Edit Episode</div>
+        <div id="episodeEditSubtitle" style="font-size:12px;color:var(--muted);margin-top:3px"></div>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <button class="shot-edit-btn secondary" onclick="reloadEpisodeEditor()">↻ Refresh</button>
+        <button class="shot-edit-btn primary" id="episodeRecompileBtn" onclick="recompileEditedEpisode()">🎬 Recompile Episode</button>
+         <button class="shot-edit-btn secondary" id="episodePublishBtn" onclick="publishEditedEpisode()" style="display:none;border-color:rgba(34,197,94,.4);color:#86efac">🚀 Publish Episode</button>
+      </div>
+    </div>
+    <div id="episodeEditBody" style="padding-top:4px">Loading…</div>
+    <div style="font-size:11px;color:var(--muted);margin-top:14px">Click any shot to open the existing HIL editor. Edits are non-destructive; recompile rebuilds the episode from the current shot states.</div>
+  </div>
+</div>
+
+<!-- Prune DB confirmation modal -->
+<div id="pruneModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;align-items:center;justify-content:center;backdrop-filter:blur(4px)" onclick="closePruneModal(event)">
+  <div onclick="event.stopPropagation()" style="background:#1a1a2e;border:1px solid rgba(239,68,68,.4);border-radius:12px;padding:28px 32px;max-width:400px;width:90%;box-shadow:0 20px 60px rgba(0,0,0,.6)">
+    <div style="font-size:28px;margin-bottom:10px">⚠️</div>
+    <h3 style="margin:0 0 10px;color:#f87171;font-size:18px">Wipe Entire Database?</h3>
+    <p style="color:#a0aec0;font-size:13px;margin:0 0 16px;line-height:1.6">
+      This will permanently delete <strong style="color:#fff">all storylines, episodes, characters, and shots</strong> from the database.
+      This cannot be undone. Cloudinary media is <em>not</em> deleted.
+    </p>
+    <div style="margin-bottom:16px">
+      <label style="display:block;font-size:12px;color:#a0aec0;margin-bottom:6px">Enter your admin password or session secret to confirm:</label>
+      <input id="pruneSecretInput" type="password" placeholder="Password or session secret" autocomplete="off"
+        style="width:100%;box-sizing:border-box;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.2);color:#fff;padding:8px 10px;border-radius:6px;font-size:13px;outline:none"
+        onkeydown="if(event.key==='Enter')confirmPrune()"/>
+    </div>
+    <div style="display:flex;gap:10px;justify-content:flex-end">
+      <button onclick="closePruneModal()" style="background:rgba(255,255,255,.07);color:#e2e8f0;border:1px solid rgba(255,255,255,.15);padding:8px 18px;border-radius:7px;font-size:13px;cursor:pointer">Cancel</button>
+      <button id="pruneConfirmBtn" onclick="confirmPrune()" style="background:#dc2626;color:#fff;border:none;padding:8px 18px;border-radius:7px;font-size:13px;cursor:pointer;font-weight:600">Wipe Everything</button>
+    </div>
+    <div id="pruneResult" style="margin-top:14px;font-size:12px;display:none"></div>
+  </div>
+</div>
+
+<script>
+  // ── SSE ────────────────────────────────────────────────────────────────────
+  let evtSource = null;
+  let retryDelay = 2000;
+
+  function connect() {
+    evtSource = new EventSource('/api/sse');
+    evtSource.onopen = () => {
+      document.getElementById('connDot').classList.add('live');
+      document.getElementById('connLabel').textContent = 'Live';
+      retryDelay = 2000;
+    };
+    evtSource.addEventListener('state', e => renderState(JSON.parse(e.data)));
+    evtSource.onerror = () => {
+      document.getElementById('connDot').classList.remove('live');
+      document.getElementById('connLabel').textContent = 'Reconnecting…';
+      evtSource.close();
+      setTimeout(connect, retryDelay);
+      retryDelay = Math.min(retryDelay * 2, 30000);
+    };
+  }
+
+  // ── State render (from SSE) ─────────────────────────────────────────────────
+  let _lastStatus = null;
+  let _draftsRefreshTimer = null;
+  // Tracks the last live shot progress from SSE so loadDrafts() can re-apply
+  // the live counter after it re-renders cards from the DB (which only has
+  // committed 'done' shots, lagging behind what the pipeline has in memory).
+  let _liveShots = { done: 0, total: 0, episodeId: null };
+
+  function renderState(s) {
+    const pill = document.getElementById('statusPill');
+    pill.textContent = s.status;
+    pill.className = 'pill'
+      + (s.status === 'Idle'   ? ' idle'   : '')
+      + (s.status === 'Error'  ? ' error'  : '')
+      + (s.status === 'Paused' ? ' paused' : '');
+
+    const epInfo = document.getElementById('epInfo');
+    if (s.currentEpisode) {
+      epInfo.style.display = 'block';
+      document.getElementById('epTitle').textContent = s.currentEpisode.title || '';
+      document.getElementById('epSub').textContent =
+        `Season ${s.currentEpisode.seasonNumber}, Episode ${s.currentEpisode.episodeNumber}`;
+    } else {
+      epInfo.style.display = 'none';
+    }
+
+    const errBox    = document.getElementById('errorBox');
+    const pausedBox = document.getElementById('pausedBox');
+    if (s.status === 'Paused') {
+      pausedBox.style.display = 'block';
+      pausedBox.textContent   = '⏸ ' + (s.progress?.label || 'Episode paused — check API keys/tokens then click Resume');
+      errBox.style.display    = 'none';
+    } else if (s.lastError) {
+      errBox.style.display    = 'block';
+      errBox.textContent      = '⚠ ' + s.lastError.message;
+      pausedBox.style.display = 'none';
+    } else {
+      errBox.style.display    = 'none';
+      pausedBox.style.display = 'none';
+    }
+
+    const { current, total, label } = s.progress;
+    const pct = total > 0 ? Math.round(current / total * 100) : 0;
+    document.getElementById('progressFill').style.width = pct + '%';
+    document.getElementById('progressLabel').textContent = label || (s.status === 'Idle' ? 'No active task' : s.status);
+    document.getElementById('progressCurrent').textContent = current;
+    document.getElementById('progressTotal').textContent = total > 0 ? `/ ${total}` : '—';
+    document.getElementById('diskMB').textContent = s.diskUsageMB || '—';
+
+    renderKeys('googleKeys',    s.keyHealth?.google    || []);
+    renderKeys('mistralKeys',   s.keyHealth?.mistral   || []);
+    renderKeys('groqKeys',      s.keyHealth?.groq      || []);
+    renderKeys('deepgramKeys',  s.keyHealth?.deepgram  || []);
+    renderKeys('hfTokens',      s.keyHealth?.hf         || []);
+    renderKeys('cfWorkerUrls',  s.keyHealth?.cfurl     || []);
+    renderKeys('discordKeys',   s.keyHealth?.discord   || []);
+
+    // Run / Resume / Pause buttons
+    const runBtn    = document.getElementById('runBtn');
+    const resumeBtn = document.getElementById('resumeBtn');
+    const pauseBtn  = document.getElementById('pauseBtn');
+    const busy      = s.status !== 'Idle' && s.status !== 'Error' && s.status !== 'Paused';
+    runBtn.disabled = busy || s.status === 'Paused';
+    if (s.status === 'Paused') {
+      resumeBtn.style.display = 'inline-block';
+      resumeBtn.disabled      = false;
+    } else {
+      resumeBtn.style.display = 'none';
+    }
+    if (busy) {
+      pauseBtn.style.display = 'inline-block';
+      pauseBtn.disabled = !!pauseBtn.dataset.pauseRequested;
+    } else {
+      // Keep Pause visible on the dashboard so the control never appears to be
+      // missing after a refresh; it is simply disabled when nothing is running.
+      pauseBtn.style.display = 'inline-block';
+      pauseBtn.disabled = true;
+      pauseBtn.textContent = '⏸ Pause';
+      delete pauseBtn.dataset.pauseRequested;
+    }
+
+    // ── Live shot counter: update draft card directly from SSE state ──────────
+    // This means the paused/draft card tracks shots in real-time without waiting
+    // for the 60s DB poll. shotsDone/shotsTotal are emitted after every saved shot.
+    // Pass draftEpisodeId so only the card for the active episode is updated
+    // (important when multiple episodes are paused at the same time).
+    if (s.shotsTotal > 0) {
+      _liveShots = { done: s.shotsDone, total: s.shotsTotal, episodeId: s.currentEpisode?.draftEpisodeId || null };
+      updateDraftShotCountLive(s.shotsDone, s.shotsTotal, s.currentEpisode?.draftEpisodeId || null);
+    }
+
+    // ── Refresh drafts + rendered shots on any status transition ────────────
+    const statusChanged = s.status !== _lastStatus;
+    _lastStatus = s.status;
+    if (statusChanged) {
+      loadDrafts();
+      loadRenderedShots();
+      // Keep refreshing whenever the pipeline is actively doing work so the
+      // Paused Episodes card tracks progress in real-time (Writing Script,
+      // Generating Shots, Compiling Video, Posting to Discord, Paused).
+      clearInterval(_draftsRefreshTimer);
+      clearInterval(_shotsRefreshTimer);
+      const activePipelineStatuses = new Set([
+        'Writing Script', 'Generating Shots', 'Compiling Video',
+        'Posting to Discord', 'Paused',
+      ]);
+      if (activePipelineStatuses.has(s.status)) {
+        _draftsRefreshTimer = setInterval(loadDrafts, 8000);
+        if (!_shotsClearedThisSession) {
+          _shotsRefreshTimer = setInterval(loadRenderedShots, 10000);
+        }
+      }
+    }
+
+    // Also refresh shots on every shot-counter tick so new clips appear promptly
+    if (s.shotsTotal > 0 && !_shotsClearedThisSession) {
+      // Debounce: only poll if the count actually changed
+      const shotKey = `${s.shotsDone}/${s.shotsTotal}`;
+      if (shotKey !== renderState._lastShotKey) {
+        renderState._lastShotKey = shotKey;
+        loadRenderedShots();
+      }
+    }
+
+    // Render API test results if present
+    if (s.apiTest) renderApiTest(s.apiTest);
+  }
+
+  // Update the shots counter inside the specific draft card that is currently
+  // being processed. Uses draftEpisodeId from SSE state to find the right row
+  // when multiple episodes are paused at the same time.
+  function updateDraftShotCountLive(done, total, episodeId) {
+    const outer = document.getElementById('draftsCard');
+    if (!outer || outer.style.display === 'none') return;
+    // Target the specific card by episode ID; fall back to first card if no ID yet.
+    const card = episodeId
+      ? outer.querySelector(`.draft-card[data-episode-id="${episodeId}"]`)
+      : outer.querySelector('.draft-card');
+    if (!card) return;
+    const shotEl = card.querySelector('.live-shot-count');
+    const barEl  = card.querySelector('.live-shot-bar');
+    if (shotEl) shotEl.textContent = `${done}/${total}`;
+    if (barEl)  barEl.style.width  = (total > 0 ? Math.round(done / total * 100) : 0) + '%';
+  }
+
+  function renderKeys(id, keys) {
+    const el = document.getElementById(id);
+    if (!keys.length) { el.innerHTML = '<span style="color:var(--muted)">—</span>'; return; }
+    el.innerHTML = keys.map(k => {
+      const cls   = k.status === 'active' ? '' : ` ${k.status}`;
+      // Show credits + email if known (populated by Test APIs)
+      let extra = '';
+      if (k.credits !== undefined) extra += ` · ${k.credits} cr`;
+      if (k.email   && k.email !== '—') extra += ` (${k.email})`;
+      return `<span class="kp${cls}" title="${k.status}${extra}">${esc(k.label)}${extra ? `<span style="opacity:.65;font-size:10px"> ${extra.trim()}</span>` : ''}</span>`;
+    }).join('');
+  }
+
+  // ── API test results ────────────────────────────────────────────────────────
+  function renderApiTest(data) {
+    const el     = document.getElementById('testResults');
+    const status = document.getElementById('testStatus');
+    const btn    = document.getElementById('testBtn');
+
+    if (!data) { el.style.display = 'none'; return; }
+
+    el.style.display = 'block';
+    btn.disabled     = !!data.running;
+
+    if (data.running) {
+      status.textContent = '⟳ Running tests…';
+    } else if (data.finishedAt) {
+      const ok   = (data.results || []).filter(r => r.status === 'ok').length;
+      const fail = (data.results || []).filter(r => r.status === 'fail').length;
+      status.textContent = `✓ Done — ${ok} passed, ${fail} failed`;
+    }
+
+    el.innerHTML = (data.results || []).map(r => `
+      <div class="test-row">
+        <span class="test-name">${esc(r.name)}</span>
+        <span class="test-status ${r.status}">${r.status === 'ok' ? '✓ OK' : r.status === 'fail' ? '✗ Fail' : '…'}</span>
+        <span class="test-detail" title="${esc(r.message)}">${esc(r.detail || r.message || '')}</span>
+        <span class="test-latency">${r.latencyMs != null ? r.latencyMs + 'ms' : ''}</span>
+      </div>`).join('');
+
+    // Show pending tests as "running" rows
+    const testNames = ['Google Image Gen','CF Worker','Cloudinary','Mistral','Groq','FFmpeg Service','Telegram','Discord Webhook','Hugging Face Tokens','LTX Video'];
+    const done = new Set((data.results || []).map(r => r.name));
+    if (data.running) {
+      for (const n of testNames) {
+        if (!done.has(n)) {
+          el.innerHTML += `
+            <div class="test-row">
+              <span class="test-name">${esc(n)}</span>
+              <span class="test-status running">…</span>
+              <span class="test-detail">Waiting…</span>
+              <span class="test-latency"></span>
+            </div>`;
+        }
+      }
+    }
+
+    // ── Test media: source image + generated video ──────────────────────────
+    const mediaSection = document.getElementById('testMedia');
+    const imgBox       = document.getElementById('testImageBox');
+    const vidBox       = document.getElementById('testVideoBox');
+    if (data.testVideoUrl || data.testImageUrl) {
+      mediaSection.style.display = 'block';
+      if (data.testImageUrl) {
+        imgBox.style.display = 'block';
+        const imgEl = document.getElementById('testImageEl');
+        if (imgEl.src !== data.testImageUrl) imgEl.src = data.testImageUrl;
+        document.getElementById('testImageLink').href = data.testImageUrl;
+      } else {
+        imgBox.style.display = 'none';
+      }
+      if (data.testVideoUrl) {
+        vidBox.style.display = 'block';
+        const vid = document.getElementById('testVideoEl');
+        if (vid.src !== data.testVideoUrl) { vid.src = data.testVideoUrl; }
+        document.getElementById('testVideoLink').href = data.testVideoUrl;
+        // Extract job ID from detail string if available
+        const ltxRow = (data.results || []).find(r => r.name === 'LTX Video');
+        const jobMatch = (ltxRow?.detail || '').match(/Job (\S+) complete/);
+        document.getElementById('testVideoJobId').textContent = jobMatch ? `· ${jobMatch[1]}` : '';
+      } else {
+        vidBox.style.display = 'none';
+      }
+    } else {
+      mediaSection.style.display = 'none';
+    }
+  }
+
+  async function runApiTests() {
+    const btn = document.getElementById('testBtn');
+    btn.disabled = true;
+    document.getElementById('testStatus').textContent = '⟳ Starting…';
+    document.getElementById('testResults').style.display = 'block';
+    document.getElementById('testResults').innerHTML = '<div style="color:var(--muted);font-size:12px;padding:8px 0">Starting API tests…</div>';
+    try {
+      const r = await fetch('/api/test-apis', { method: 'POST' });
+      const d = await r.json();
+      if (!d.ok) { alert('Test start failed: ' + (d.error || 'unknown')); btn.disabled = false; }
+    } catch (e) {
+      alert('Test error: ' + e.message);
+      btn.disabled = false;
+    }
+  }
+
+  // ── Draft episodes ─────────────────────────────────────────────────────────
+  async function loadDrafts() {
+    try {
+      const r = await fetch('/api/drafts');
+      const d = await r.json();
+      renderDrafts(d.drafts || []);
+      // Re-apply live counter after DB refresh — DB only has committed 'done' shots;
+      // the active pipeline may have more in-memory progress not yet in DB.
+      if (_liveShots.total > 0) {
+        updateDraftShotCountLive(_liveShots.done, _liveShots.total, _liveShots.episodeId);
+      }
+    } catch (e) {
+      document.getElementById('draftsBody').innerHTML =
+        `<div style="color:var(--danger);font-size:12px">Error: ${esc(e.message)}</div>`;
+    }
+  }
+
+  function renderDrafts(drafts) {
+    const card = document.getElementById('draftsCard');
+    const body = document.getElementById('draftsBody');
+    card.style.display = drafts.length ? 'block' : 'none';
+    if (!drafts.length) return;
+    body.innerHTML = drafts.map(d => {
+      const shotPct  = d.shotsTotal  > 0 ? Math.round(d.shotsGenerated  / d.shotsTotal  * 100) : 0;
+      return `
+        <div class="draft-card" data-episode-id="${esc(d.id)}">
+          <div style="display:flex;justify-content:space-between;align-items:flex-start">
+            <div>
+              <div class="draft-title">${esc(d.title)}</div>
+              <div class="draft-meta">${esc(d.genre)} · Paused ${fmtDate(d.createdAt)}</div>
+            </div>
+            <button class="resume-btn" style="display:inline-block;margin-left:0" onclick="resumePipeline()">⏵ Resume</button>
+          </div>
+          <div class="draft-progress">
+            <div style="font-size:11px;color:var(--muted);margin-bottom:4px">
+              Shots: <strong style="color:var(--text)" class="live-shot-count">${d.shotsGenerated}/${d.shotsTotal}</strong>
+              ${d.scenesTotal > 0 ? `&nbsp;·&nbsp;Scenes: <strong style="color:var(--text)">${d.scenesCompiled}/${d.scenesTotal}</strong>` : ''}
+            </div>
+            <div class="bar-wrap"><div class="bar-fill live-shot-bar" style="width:${shotPct}%;background:linear-gradient(90deg,#b45309,#d97706)"></div></div>
+          </div>
+          ${d.pausedReason ? `<div class="draft-reason">⚠ ${esc(d.pausedReason)}</div>` : ''}
+        </div>`;
+    }).join('');
+  }
+
+  // ── DB history (separate fetch, persists across server restarts) ───────────
+  async function loadHistory() {
+    try {
+      const r = await fetch('/api/history');
+      const d = await r.json();
+      if (!d.ok) throw new Error(d.error);
+      renderHistory(d.history || []);
+      renderShows(d.activeShows || []);
+    } catch (e) {
+      document.getElementById('historyBody').innerHTML =
+        `<tr><td colspan="5" style="color:var(--danger);text-align:center;padding:20px">DB unavailable: ${esc(e.message)}</td></tr>`;
+    }
+  }
+
+  function renderHistory(history) {
+    const tbody = document.getElementById('historyBody');
+    if (!history.length) {
+      tbody.innerHTML = '<tr><td colspan="5" style="color:var(--muted);text-align:center;padding:20px">No episodes yet</td></tr>';
+      return;
+    }
+    tbody.innerHTML = history.map((h, i) => `
+      <tr>
+        <td style="color:var(--muted)">${i + 1}</td>
+        <td>
+          <div style="font-weight:600">${esc(h.title || '')}</div>
+          <div style="font-size:12px;color:var(--muted)">${esc(h.episodeTitle || '')}</div>
+        </td>
+        <td style="color:var(--muted);white-space:nowrap">${fmtDate(h.postedAt)}</td>
+        <td>${h.cloudinaryUrl ? `<a href="${esc(h.cloudinaryUrl)}" target="_blank" class="lnk">View ↗</a>` : '<span style="color:var(--muted)">—</span>'}</td>
+        <td>${h.videoLink  ? `<a href="${esc(h.videoLink)}"  target="_blank" class="lnk">Watch ↗</a>` : '<span style="color:var(--muted)">—</span>'}</td>
+      </tr>`).join('');
+  }
+
+  function renderShows(shows) {
+    const el = document.getElementById('showsBody');
+    if (!shows.length) { el.innerHTML = '<div style="color:var(--muted);font-size:13px">No shows yet</div>'; return; }
+    el.innerHTML = shows.map(s => `
+      <div class="show-row">
+        <div>
+          <span style="font-weight:600">${esc(s.title)}</span>
+          <span style="color:var(--muted);font-size:12px;margin-left:8px">${esc(s.genre)}</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px">
+          <span style="color:var(--muted);font-size:12px">S${s.current_season} · Ep ${s.episode_count}</span>
+          <span class="show-badge ${s.status === 'completed' ? 'completed' : ''}">${s.status}</span>
+        </div>
+      </div>`).join('');
+  }
+
+  // ── Pipeline trigger ───────────────────────────────────────────────────────
+  async function triggerPipeline() {
+    document.getElementById('runBtn').disabled = true;
+    try {
+      const r = await fetch('/api/trigger', { method: 'POST' });
+      const d = await r.json();
+      if (!d.ok) { alert('Trigger failed: ' + (d.error || 'unknown')); document.getElementById('runBtn').disabled = false; }
+    } catch (e) {
+      alert('Trigger error: ' + e.message);
+      document.getElementById('runBtn').disabled = false;
+    }
+  }
+
+  async function clearTestMedia() {
+    try {
+      await fetch('/api/test-video', { method: 'DELETE' });
+      document.getElementById('testMedia').style.display = 'none';
+    } catch (e) { console.warn('clearTestMedia error:', e.message); }
+  }
+
+  async function resumePipeline() {
+    document.getElementById('resumeBtn').disabled = true;
+    try {
+      const r = await fetch('/api/resume', { method: 'POST' });
+      const d = await r.json();
+      if (!d.ok) { alert('Resume failed: ' + (d.error || 'unknown')); document.getElementById('resumeBtn').disabled = false; }
+      else { loadDrafts(); }
+    } catch (e) {
+      alert('Resume error: ' + e.message);
+      document.getElementById('resumeBtn').disabled = false;
+    }
+  }
+
+  async function pausePipeline() {
+    const pauseBtn = document.getElementById('pauseBtn');
+    pauseBtn.disabled = true;
+    pauseBtn.dataset.pauseRequested = '1';
+    pauseBtn.textContent = '⏸ Pausing…';
+    try {
+      const r = await fetch('/api/pause', { method: 'POST' });
+      const d = await r.json();
+      if (!d.ok) {
+        alert('Pause failed: ' + (d.error || 'unknown'));
+        pauseBtn.disabled = false;
+        pauseBtn.textContent = '⏸ Pause';
+        delete pauseBtn.dataset.pauseRequested;
+      }
+      // On success we leave the button disabled with "Pausing…" — it stays
+      // that way until the current shot finishes and SSE state flips to
+      // Paused, at which point renderState() hides it and resets the label.
+    } catch (e) {
+      alert('Pause error: ' + e.message);
+      pauseBtn.disabled = false;
+      pauseBtn.textContent = '⏸ Pause';
+      delete pauseBtn.dataset.pauseRequested;
+    }
+  }
+
+  // ── Rendered Scenes ────────────────────────────────────────────────────────
+  let _shotsClearedThisSession = false;
+  let _shotsRefreshTimer = null;
+
+  async function loadRenderedShots() {
+    if (_shotsClearedThisSession) return;
+    try {
+      const r = await fetch('/api/drafts/shots');
+      const d = await r.json();
+      renderRenderedShots(d);
+    } catch (e) { console.warn('loadRenderedShots error:', e.message); }
+  }
+
+  function renderRenderedShots(data) {
+    if (_shotsClearedThisSession) return;
+    const card  = document.getElementById('renderedShotsCard');
+    const body  = document.getElementById('renderedShotsBody');
+    const label = document.getElementById('renderedShotsEpLabel');
+
+    if (!data.ok || !data.scenes?.length) { card.style.display = 'none'; return; }
+
+    card.style.display = 'block';
+    label.textContent  = data.episode?.title || '';
+
+    body.innerHTML = data.scenes.map(scene => {
+      const failedShots = scene.shots.filter(s => s.status === 'failed');
+      return `
+      <div class="scene-block">
+        <div class="scene-header">
+          <span class="scene-label">Scene ${scene.sceneNumber}</span>
+          <span class="scene-shot-count">${scene.shots.length} shot${scene.shots.length !== 1 ? 's' : ''}${failedShots.length ? ` · <span style="color:#f87171">${failedShots.length} failed</span>` : ''}</span>
+          <button class="recompile-btn" onclick="recompileScene(${scene.sceneNumber}, this)">🔄 Recompile</button>
+          <button class="recompile-btn" title="Regenerate every shot in this scene from scratch (new images + videos), then recompile" onclick="regenerateScene(${scene.sceneNumber}, this)">🎬 Regenerate Scene</button>
+          ${scene.compiledUrl
+            ? `<a class="scene-compiled-link" href="${esc(scene.compiledUrl)}" target="_blank">▶ Compiled scene ↗</a>`
+            : ''}
+        </div>
+        <div class="shots-row">
+          ${scene.shots.map(shot => renderShotTile(scene.sceneNumber, shot)).join('')}
+        </div>
+        ${failedShots.map(shot => renderShotFailPanel(scene.sceneNumber, shot)).join('')}
+      </div>`;
+    }).join('');
+  }
+
+  function renderShotTile(sceneNumber, shot) {
+    if (shot.status === 'done' && shot.clipUrl) {
+      const removedBadge = shot.enabled === false
+        ? '<div style="position:absolute;left:6px;top:6px;background:rgba(239,68,68,.92);color:#fff;font-size:10px;padding:3px 6px;border-radius:5px;font-weight:700">REMOVED</div>'
+        : '';
+      return `
+            <div class="shot-thumb" style="position:relative" onclick="openShotEditModal(${sceneNumber}, ${shot.shotIndex})">
+              ${removedBadge}
+              <video src="${esc(shot.clipUrl)}" muted playsinline preload="none"
+                onmouseenter="this.play()" onmouseleave="this.pause();this.currentTime=0"></video>
+              <button class="regen-btn" title="Quick regenerate (no edits)" onclick="event.stopPropagation();regenerateShot(${sceneNumber}, ${shot.shotIndex}, this)">↻</button>
+              <div class="shot-label">T${shot.shotIndex}${shot.clipDuration ? ' · ' + parseFloat(shot.clipDuration).toFixed(1) + 's' : ''}</div>
+            </div>`;
+    }
+    if (shot.status === 'failed') {
+      return `
+            <div class="shot-thumb-failed" title="${esc(shot.lastError || 'Shot failed')}" onclick="openShotEditModal(${sceneNumber}, ${shot.shotIndex})">
+              <div class="shot-failed-box">⚠</div>
+              <div class="shot-label" style="color:#f87171">T${shot.shotIndex} · failed</div>
+            </div>`;
+    }
+    // pending / mh_submitted — still generating in the background
+    return `
+            <div class="shot-thumb-pending" title="Regenerating…">
+              <div class="shot-pending-box">Generating…</div>
+              <div class="shot-label">T${shot.shotIndex}</div>
+            </div>`;
+  }
+
+  // Failed shots get an inline panel below the scene's shot row: the error,
+  // and — for content-flagged failures — the exact prompt that was sent, in
+  // an editable field so the operator can fix the flagged wording and
+  // retrigger generation without guessing what was actually sent.
+  function renderShotFailPanel(sceneNumber, shot) {
+    const panelId  = `fail-panel-${sceneNumber}-${shot.shotIndex}`;
+    const isFlag   = shot.failureReason === 'content_flag';
+    const promptId = `fail-prompt-${sceneNumber}-${shot.shotIndex}`;
+    return `
+        <div class="shot-fail-panel" id="${panelId}">
+          <div class="shot-fail-panel-head">
+            <span>⚠ Shot T${shot.shotIndex} failed</span>
+            <span class="shot-fail-reason-badge">${esc(shot.failureReason || 'unknown')}</span>
+          </div>
+          <div class="shot-fail-msg">${esc(shot.lastError || 'No error detail recorded.')}</div>
+          ${shot.lastPrompt ? `
+            <textarea class="shot-fail-prompt" id="${promptId}" spellcheck="false">${esc(shot.lastPrompt)}</textarea>
+          ` : ''}
+          <div class="shot-fail-actions">
+            <button class="shot-fail-btn primary" onclick="openShotEditModal(${sceneNumber}, ${shot.shotIndex})">✎ Edit & Fix Shot</button>
+            ${isFlag && shot.lastPrompt
+              ? `<button class="shot-fail-btn" onclick="retryShotWithEditedPrompt(${sceneNumber}, ${shot.shotIndex}, '${promptId}', this)">↻ Quick retry with edited image prompt</button>`
+              : ''}
+            <button class="shot-fail-btn" onclick="regenerateShot(${sceneNumber}, ${shot.shotIndex}, this)">↻ Retry as-is</button>
+          </div>
+        </div>`;
+  }
+
+  function clearRenderedShots() {
+    _shotsClearedThisSession = true;
+    clearInterval(_shotsRefreshTimer);
+    _shotsRefreshTimer = null;
+    document.getElementById('renderedShotsCard').style.display = 'none';
+  }
+
+  // ── HF token pool panel ───────────────────────────────────────────────────
+  async function loadHfTokens() {
+    try {
+      const r = await fetch('/api/hf-tokens');
+      const d = await r.json();
+      renderHfTokens(d);
+    } catch (e) { console.warn('loadHfTokens error:', e.message); }
+  }
+
+  function renderHfTokens(data) {
+    const card = document.getElementById('hfTokensCard');
+    const body = document.getElementById('hfTokensBody');
+    const tokens = (data && data.ok && data.tokens) || [];
+
+    if (!tokens.length) {
+      // Not an error necessarily — e.g. VIDEO_PROVIDER=magichour has no HF pool.
+      card.style.display = 'none';
+      return;
+    }
+    card.style.display = 'block';
+
+    body.innerHTML = tokens.map(t => {
+      const isBad = t.status !== 'active';
+      const cooldown = t.cooldown_remaining_s > 0
+        ? `back in ${fmtCooldown(t.cooldown_remaining_s)}`
+        : (isBad ? 'retrying next use' : '');
+      return `
+        <div class="hf-token-row">
+          <span class="hf-token-dot ${esc(t.status)}"></span>
+          <span class="hf-token-id">Token ${t.index + 1} · ${esc(t.masked_token)}</span>
+          ${t.is_current ? '<span class="hf-token-current">current</span>' : ''}
+          ${cooldown ? `<span class="hf-token-cooldown">${esc(cooldown)}</span>` : ''}
+          <span class="hf-token-status ${esc(t.status)}">${esc(t.status)}</span>
+        </div>`;
+    }).join('');
+  }
+
+  function fmtCooldown(seconds) {
+    const s = Math.max(0, Math.round(seconds));
+    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+    if (h > 0) return `${h}h ${m}m`;
+    if (m > 0) return `${m}m`;
+    return `${s}s`;
+  }
+
+  // ── Clip modal ──────────────────────────────────────────────────────────────
+  function openClipModal(url) {
+    const modal = document.getElementById('clipModal');
+    const vid   = document.getElementById('clipModalVideo');
+    vid.src = url;
+    modal.classList.add('open');
+    document.body.style.overflow = 'hidden';
+  }
+
+  function closeClipModal() {
+    const modal = document.getElementById('clipModal');
+    const vid   = document.getElementById('clipModalVideo');
+    modal.classList.remove('open');
+    document.body.style.overflow = '';
+    vid.pause();
+    vid.src = '';
+  }
+
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') { closeClipModal(); closePruneModal(); closeShotEditModal(); } });
+
+  // ── Shot editor modal (HIL) ──────────────────────────────────────────────
+  let _shotEditCtx = null; // { sceneNumber, shotIndex, episodeId? }
+
+  async function openShotEditModal(sceneNumber, shotIndex, episodeId = null) {
+    _shotEditCtx = { sceneNumber, shotIndex, episodeId };
+    const modal = document.getElementById('shotEditModal');
+    document.getElementById('shotEditTitle').textContent = `Edit Shot — Scene ${sceneNumber}, T${shotIndex}`;
+    document.getElementById('shotEditImgWrap').innerHTML = '<span style="color:var(--muted);font-size:12px;padding:30px">Loading…</span>';
+    document.getElementById('shotEditImagePrompt').value = '';
+    document.getElementById('shotEditVideoPrompt').value = '';
+    document.getElementById('shotEditDuration').value = '';
+    document.getElementById('shotEditTrimStart').value = '';
+    document.getElementById('shotEditTrimEnd').value = '';
+    document.getElementById('shotEditVideoWrap').style.display = 'none';
+    document.getElementById('shotEditVideo').removeAttribute('src');
+    document.getElementById('shotEditFailure').style.display = 'none';
+    document.getElementById('shotEditFailure').textContent = '';
+    document.getElementById('shotEditRegenBothBtn').disabled = true;
+    document.getElementById('shotEditRegenVideoBtn').disabled = true;
+    modal.classList.add('open');
+    document.body.style.overflow = 'hidden';
+
+    try {
+      const detailUrl = episodeId ? `/api/shot-detail/${sceneNumber}/${shotIndex}?episodeId=${encodeURIComponent(episodeId)}` : `/api/shot-detail/${sceneNumber}/${shotIndex}`;
+      const r = await fetch(detailUrl);
+      const d = await r.json();
+      if (!d.ok) { alert(d.error || 'Could not load shot detail'); closeShotEditModal(); return; }
+
+      document.getElementById('shotEditImgWrap').innerHTML = d.imageUrl
+        ? `<img src="${esc(d.imageUrl)}" alt="Shot starting frame">`
+        : '<span style="color:var(--muted);font-size:12px;padding:30px">No saved input image for this shot yet — regenerating will create one.</span>';
+      document.getElementById('shotEditImagePrompt').value = d.imagePrompt || '';
+      document.getElementById('shotEditVideoPrompt').value = d.videoPrompt || '';
+      document.getElementById('shotEditTrimStart').value = d.trimStart ?? '';
+      document.getElementById('shotEditTrimEnd').value = d.trimEnd ?? '';
+      if (d.clipUrl) {
+        const vw = document.getElementById('shotEditVideoWrap');
+        const v = document.getElementById('shotEditVideo');
+        v.src = d.clipUrl;
+        vw.style.display = 'block';
+      }
+      document.getElementById('shotEditVideoPromptNote').textContent =
+        d.videoProvider === 'magichour' ? '(sent to Magic Hour to animate the frame)' : '(sent to LTX to animate the frame)';
+      document.getElementById('shotEditDuration').value = d.duration || 4;
+
+      if (d.lastError) {
+        const failure = document.getElementById('shotEditFailure');
+        failure.style.display = 'block';
+        failure.innerHTML = `<strong>Last failure${d.failureReason ? ` · ${esc(d.failureReason)}` : ''}:</strong> ${esc(d.lastError)}`;
+      }
+
+      document.getElementById('shotEditRegenBothBtn').disabled = false;
+      // "Video only" only makes sense if we actually have a saved image to keep.
+      document.getElementById('shotEditRegenVideoBtn').disabled = !d.imageUrl;
+    } catch (err) {
+      alert(err.message);
+      closeShotEditModal();
+    }
+  }
+
+  function closeShotEditModal() {
+    const modal = document.getElementById('shotEditModal');
+    modal.classList.remove('open');
+    document.body.style.overflow = '';
+    _shotEditCtx = null;
+  }
+
+  async function applyShotEditorial() {
+    if (!_shotEditCtx) return;
+    const { sceneNumber, shotIndex } = _shotEditCtx;
+    const startRaw = document.getElementById('shotEditTrimStart').value;
+    const endRaw = document.getElementById('shotEditTrimEnd').value;
+    const btn = document.getElementById('shotEditApplyTrimBtn');
+    btn.disabled = true;
+    try {
+      const r = await fetch(`/api/shot-editor/${sceneNumber}/${shotIndex}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          episodeId: _shotEditCtx.episodeId || undefined,
+          trimStart: startRaw === '' ? null : Number(startRaw),
+          trimEnd: endRaw === '' ? null : Number(endRaw),
+          removed: false
+        })
+      });
+      const d = await r.json();
+      if (!d.ok) throw new Error(d.error || 'Could not apply trim');
+      alert(`Trim applied to T${shotIndex}. The original Cloudinary asset remains intact.`);
+      closeShotEditModal();
+      loadRenderedShots();
+    } catch (e) {
+      alert(e.message);
+      btn.disabled = false;
+    }
+  }
+
+  async function removeShotEditorial() {
+    if (!_shotEditCtx) return;
+    const { sceneNumber, shotIndex } = _shotEditCtx;
+    if (!confirm(`Remove T${shotIndex} from the episode timeline? The original Cloudinary asset will remain available.`)) return;
+    const btn = document.getElementById('shotEditRemoveBtn');
+    btn.disabled = true;
+    try {
+      const r = await fetch(`/api/shot-editor/${sceneNumber}/${shotIndex}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ episodeId: _shotEditCtx.episodeId || undefined, removed: true })
+      });
+      const d = await r.json();
+      if (!d.ok) throw new Error(d.error || 'Could not remove shot');
+      closeShotEditModal();
+      loadRenderedShots();
+    } catch (e) {
+      alert(e.message);
+      btn.disabled = false;
+    }
+  }
+
+  async function submitShotEdit(keepImage) {
+    if (!_shotEditCtx) return;
+    const { sceneNumber, shotIndex } = _shotEditCtx;
+
+    const imagePrompt = document.getElementById('shotEditImagePrompt').value.trim();
+    const videoPrompt = document.getElementById('shotEditVideoPrompt').value.trim();
+    const duration    = parseFloat(document.getElementById('shotEditDuration').value);
+
+    const body = {};
+    if (imagePrompt) body.promptOverride = imagePrompt;
+    if (videoPrompt) body.videoPromptOverride = videoPrompt;
+    if (Number.isFinite(duration) && duration > 0) body.duration = duration;
+    if (keepImage) body.keepImage = true;
+    if (_shotEditCtx.episodeId) body.episodeId = _shotEditCtx.episodeId;
+
+    if (keepImage && imagePrompt) {
+      if (!confirm('You edited the image prompt but chose "Video Only" — the existing image will be kept as-is and the image prompt edit will be ignored. Continue?')) return;
+    }
+
+    const btn = document.getElementById(keepImage ? 'shotEditRegenVideoBtn' : 'shotEditRegenBothBtn');
+    const otherBtn = document.getElementById(keepImage ? 'shotEditRegenBothBtn' : 'shotEditRegenVideoBtn');
+    const originalLabel = btn.textContent;
+    btn.disabled = true;
+    otherBtn.disabled = true;
+    btn.textContent = '…';
+
+    try {
+      const r = await fetch(`/api/regenerate-shot/${sceneNumber}/${shotIndex}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await r.json();
+      if (data.ok) {
+        btn.textContent = '✓ Queued';
+        closeShotEditModal();
+        loadRenderedShots();
+        if (_shotEditCtx?.episodeId) loadEpisodeEditor(_shotEditCtx.episodeId);
+      } else {
+        alert(data.error || 'Shot regeneration failed to queue');
+        btn.textContent = originalLabel;
+        btn.disabled = false;
+        otherBtn.disabled = false;
+      }
+    } catch (err) {
+      alert(err.message);
+      btn.textContent = originalLabel;
+      btn.disabled = false;
+      otherBtn.disabled = false;
+    }
+  }
+
+  // ── Prune DB modal ──────────────────────────────────────────────────────────
+  function openPruneModal() {
+    const m = document.getElementById('pruneModal');
+    document.getElementById('pruneResult').style.display = 'none';
+    document.getElementById('pruneConfirmBtn').disabled  = false;
+    document.getElementById('pruneConfirmBtn').textContent = 'Yes, Wipe Everything';
+    m.style.display = 'flex';
+    document.body.style.overflow = 'hidden';
+  }
+
+  function closePruneModal(evt) {
+    if (evt && evt.target !== document.getElementById('pruneModal')) return;
+    const m = document.getElementById('pruneModal');
+    m.style.display = 'none';
+    document.body.style.overflow = '';
+  }
+
+  async function confirmPrune() {
+    const btn      = document.getElementById('pruneConfirmBtn');
+    const resultEl = document.getElementById('pruneResult');
+    const secret   = document.getElementById('pruneSecretInput').value;
+
+    if (!secret) {
+      resultEl.style.cssText = 'margin-top:14px;font-size:12px;display:block;color:#f87171';
+      resultEl.textContent = '✗ Enter your admin secret to confirm';
+      return;
+    }
+
+    btn.disabled = true;
+    btn.textContent = 'Wiping…';
+    resultEl.style.display = 'none';
+    try {
+      const r = await fetch('/api/prune-db', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ secret }),
+      });
+      const data = await r.json();
+      if (data.ok) {
+        const d = data.deleted || {};
+        resultEl.style.cssText = 'margin-top:14px;font-size:12px;display:block;color:#4ade80';
+        resultEl.textContent = `✓ Wiped: ${d.storylines||0} shows, ${d.episodes||0} episodes, ${d.characters||0} chars, ${d.shots||0} shots — engine state reset`;
+        btn.textContent = 'Done';
+        document.getElementById('pruneSecretInput').value = '';
+        loadHistory();
+        loadDrafts();
+        setTimeout(() => {
+          document.getElementById('pruneModal').style.display = 'none';
+          document.body.style.overflow = '';
+        }, 2500);
+      } else {
+        resultEl.style.cssText = 'margin-top:14px;font-size:12px;display:block;color:#f87171';
+        resultEl.textContent = '✗ ' + (data.error || 'unknown error');
+        btn.disabled = false;
+        btn.textContent = 'Wipe Everything';
+      }
+    } catch (err) {
+      resultEl.style.cssText = 'margin-top:14px;font-size:12px;display:block;color:#f87171';
+      resultEl.textContent = '✗ ' + err.message;
+      btn.disabled = false;
+      btn.textContent = 'Wipe Everything';
+    }
+  }
+
+  // ── Recompile / Regenerate controls ─────────────────────────────────────────
+  async function recompileAllScenes() {
+    const btn = document.getElementById('recompileAllBtn');
+    if (!confirm('Purge all compiled scene URLs and recompile every scene from existing shots, then merge into a final episode?')) return;
+    btn.disabled = true;
+    btn.textContent = 'Recompiling…';
+    try {
+      const r = await fetch('/api/recompile-all', { method: 'POST' });
+      const data = await r.json();
+      if (data.ok) {
+        btn.textContent = '✓ Done';
+        setTimeout(() => { btn.textContent = '🔄 Purge & Recompile All'; btn.disabled = false; }, 3000);
+        loadRenderedShots();
+        loadHistory();
+      } else {
+        alert(data.error || 'Recompile failed');
+        btn.textContent = '🔄 Purge & Recompile All';
+        btn.disabled = false;
+      }
+    } catch (err) {
+      alert(err.message);
+      btn.textContent = '🔄 Purge & Recompile All';
+      btn.disabled = false;
+    }
+  }
+
+  async function recompileScene(sceneNumber, btn) {
+    if (!confirm(`Recompile scene ${sceneNumber} from existing shots?`)) return;
+    btn.disabled = true;
+    btn.textContent = 'Recompiling…';
+    try {
+      const r = await fetch(`/api/recompile-scene/${sceneNumber}`, { method: 'POST' });
+      const data = await r.json();
+      if (data.ok) {
+        btn.textContent = '✓ Done';
+        setTimeout(() => { btn.textContent = '🔄 Recompile'; btn.disabled = false; }, 3000);
+        loadRenderedShots();
+      } else {
+        alert(data.error || 'Scene recompile failed');
+        btn.textContent = '🔄 Recompile';
+        btn.disabled = false;
+      }
+    } catch (err) {
+      alert(err.message);
+      btn.textContent = '🔄 Recompile';
+      btn.disabled = false;
+    }
+  }
+
+  async function regenerateScene(sceneNumber, btn) {
+    if (!confirm(`Regenerate ALL shots in scene ${sceneNumber} from scratch? This creates new images and videos for every shot in the scene, then recompiles it. This can take a while.`)) return;
+    const originalLabel = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = '🎬 Queuing…';
+    try {
+      // regenerateScene queues the work server-side and returns immediately —
+      // it does not wait for generation to finish, so the dashboard (and any
+      // other action you take) stays responsive. loadRenderedShots() polls
+      // every 10s and will show each shot moving to done/failed as it lands.
+      const r = await fetch(`/api/regenerate-scene/${sceneNumber}`, { method: 'POST' });
+      const data = await r.json();
+      if (data.ok) {
+        btn.textContent = `✓ Queued (${data.shotsQueued} shots)`;
+        setTimeout(() => { btn.textContent = originalLabel; btn.disabled = false; }, 3000);
+        loadRenderedShots();
+      } else {
+        alert(data.error || 'Scene regeneration failed to queue');
+        btn.textContent = originalLabel;
+        btn.disabled = false;
+      }
+    } catch (err) {
+      alert(err.message);
+      btn.textContent = originalLabel;
+      btn.disabled = false;
+    }
+  }
+
+  async function regenerateShot(sceneNumber, shotIndex, btn) {
+    if (!confirm(`Regenerate shot ${sceneNumber}/${shotIndex} from scratch? This will create a new image and video, then recompile the scene.`)) return;
+    await _triggerShotRegen(sceneNumber, shotIndex, null, btn);
+  }
+
+  async function retryShotWithEditedPrompt(sceneNumber, shotIndex, promptTextareaId, btn) {
+    const promptOverride = document.getElementById(promptTextareaId)?.value?.trim();
+    if (!promptOverride) { alert('Prompt is empty'); return; }
+    await _triggerShotRegen(sceneNumber, shotIndex, promptOverride, btn);
+  }
+
+  async function _triggerShotRegen(sceneNumber, shotIndex, promptOverride, btn) {
+    const originalLabel = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = '…';
+    try {
+      // This call returns as soon as the shot is queued — it does NOT block
+      // until the shot finishes regenerating, so you're free to keep using
+      // the dashboard (regenerate other shots, switch tabs, etc.) while it
+      // runs in the background. The shot tile switches to "Generating…" and
+      // loadRenderedShots()'s 10s poll picks up done/failed automatically.
+      const r = await fetch(`/api/regenerate-shot/${sceneNumber}/${shotIndex}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(promptOverride ? { promptOverride } : {}),
+      });
+      const data = await r.json();
+      if (data.ok) {
+        btn.textContent = '✓ Queued';
+        loadRenderedShots();
+      } else {
+        alert(data.error || 'Shot regeneration failed to queue');
+        btn.textContent = originalLabel;
+        btn.disabled = false;
+      }
+    } catch (err) {
+      alert(err.message);
+      btn.textContent = originalLabel;
+      btn.disabled = false;
+    }
+  }
+
+  // ── Helpers ────────────────────────────────────────────────────────────────
+  function esc(s) {
+    return String(s)
+      .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+  function fmtDate(iso) {
+    if (!iso) return '—';
+    return new Date(iso).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
+  }
+
+  // ── Full Episode HIL editor ───────────────────────────────────────────────
+  let _episodeEditId = null;
+
+  async function openEpisodeEditor(episodeId) {
+    _episodeEditId = episodeId;
+    document.getElementById('episodeEditModal').classList.add('open');
+    document.body.style.overflow = 'hidden';
+    await loadEpisodeEditor(episodeId);
+  }
+
+  function closeEpisodeEditModal(evt) {
+    if (evt && evt.target !== document.getElementById('episodeEditModal')) return;
+    document.getElementById('episodeEditModal').classList.remove('open');
+    document.body.style.overflow = '';
+    _episodeEditId = null;
+  }
+
+  async function loadEpisodeEditor(episodeId) {
+    const body = document.getElementById('episodeEditBody');
+    body.innerHTML = '<div style="color:var(--muted);padding:20px">Loading episode…</div>';
+    try {
+      const r = await fetch(`/api/episodes/${episodeId}/editor`);
+      const d = await r.json();
+      if (!d.ok) throw new Error(d.error || 'Could not load episode');
+      document.getElementById('episodeEditTitle').textContent = d.episode.title;
+      document.getElementById('episodeEditSubtitle').textContent = `${d.episode.showTitle} · ${d.episode.genre || ''} · ${d.episode.status}`;
+      const publishBtn = document.getElementById('episodePublishBtn');
+      if (publishBtn) publishBtn.style.display = d.episode.status === 'ready' && d.episode.videoUrl ? '' : 'none';
+      body.innerHTML = d.episode.scenes.map(scene => `
+        <section class="episode-scene">
+          <div class="episode-scene-head">
+            <div><strong>Scene ${scene.sceneNumber}</strong><div style="font-size:11px;color:var(--muted);margin-top:3px">${esc(scene.description || scene.title || '')}</div></div>
+            ${scene.compiledUrl ? `<a class="lnk" href="${esc(scene.compiledUrl)}" target="_blank">Scene preview ↗</a>` : ''}
+          </div>
+          <div class="episode-shot-grid">
+            ${scene.shots.length ? scene.shots.map(shot => `
+              <button class="episode-shot-card" onclick="openShotEditModal(${scene.sceneNumber},${shot.shotIndex},'${esc(episodeId)}')">
+                <div class="episode-shot-thumb">${shot.clipUrl ? `<video src="${esc(shot.clipUrl)}" muted preload="metadata"></video>` : shot.imageUrl ? `<img src="${esc(shot.imageUrl)}" alt="Shot ${shot.shotIndex}">` : '<span style="color:var(--muted);font-size:11px">No media</span>'}</div>
+                <div class="episode-shot-meta"><strong>T${shot.shotIndex}</strong> · ${esc(shot.status || '')}<br><span style="color:${shot.enabled ? 'var(--muted)' : '#f87171'}">${shot.enabled ? 'Included' : 'Removed'}</span>${shot.lastError ? `<br><span style="color:#fca5a5">${esc(shot.lastError).slice(0,90)}</span>` : ''}</div>
+              </button>`).join('') : '<div style="color:var(--muted);font-size:12px">No shots recorded for this scene.</div>'}
+          </div>
+        </section>`).join('');
+    } catch (e) {
+      body.innerHTML = `<div style="color:var(--danger);padding:20px">${esc(e.message)}</div>`;
+    }
+  }
+
+  async function publishEditedEpisode() {
+    if (!_episodeEditId) return;
+    if (!confirm('Publish this reviewed episode now? This will post the final video and advance the storyline.')) return;
+    const btn = document.getElementById('episodePublishBtn');
+    if (btn) { btn.disabled = true; btn.textContent = '⏳ Publishing…'; }
+    try {
+      const r = await fetch(`/api/episodes/${_episodeEditId}/publish`, { method: 'POST', headers: { 'Content-Type': 'application/json' } });
+      const d = await r.json();
+      if (!d.ok) throw new Error(d.error || 'Publish failed');
+      alert('Episode published successfully.');
+      await loadEpisodeEditor(_episodeEditId);
+      loadEpisodesTab();
+      loadHistory();
+    } catch (e) {
+      alert(e.message);
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = '🚀 Publish Episode'; }
+    }
+  }
+
+  function reloadEpisodeEditor() { if (_episodeEditId) loadEpisodeEditor(_episodeEditId); }
+
+  async function recompileEditedEpisode() {
+    if (!_episodeEditId) return;
+    if (!confirm('Recompile this entire episode from the current edited shots and update its final video?')) return;
+    const btn = document.getElementById('episodeRecompileBtn');
+    const original = btn.textContent; btn.disabled = true; btn.textContent = '⏳ Recompiling…';
+    try {
+      const r = await fetch(`/api/episodes/${_episodeEditId}/recompile`, { method: 'POST' });
+      const d = await r.json();
+      if (!d.ok) throw new Error(d.error || 'Episode recompile failed');
+      alert(`Episode recompiled — ${d.scenesCompiled} scene(s) rebuilt.`);
+      await loadEpisodeEditor(_episodeEditId);
+      loadEpisodesTab();
+      loadHistory();
+    } catch (e) {
+      alert(e.message);
+    } finally { btn.disabled = false; btn.textContent = original; }
+  }
+
+  // ── Tabs ───────────────────────────────────────────────────────────────────
+  let _activeTab = 'control';
+  let _adminToken = localStorage.getItem('sv_admin_token') || '';
+  let _editingUserId = null;
+  let _analyticsRequestPage = 1;
+  const ANALYTICS_REQUEST_PAGE_SIZE = 20;
+
+  function adminHeaders() {
+    return _adminToken ? { 'Content-Type':'application/json', Authorization:`Bearer ${_adminToken}` } : { 'Content-Type':'application/json' };
+  }
+  function requireAdminAccess(next) {
+    if (_adminToken) return next();
+    document.getElementById('adminLoginModal').classList.add('open');
+    document.getElementById('adminPassword').focus();
+    window._afterAdminLogin = next;
+  }
+  async function adminLogin() {
+    const errEl=document.getElementById('adminLoginError'); errEl.style.display='none';
+    try {
+      const r=await fetch('/api/admin/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:document.getElementById('adminPassword').value})});
+      const d=await r.json(); if(!r.ok||!d.ok) throw new Error(d.error||'Admin login failed');
+      _adminToken=d.token; localStorage.setItem('sv_admin_token',_adminToken); document.getElementById('adminPassword').value=''; closeAdminLogin();
+      const next=window._afterAdminLogin; window._afterAdminLogin=null; if(next) next();
+    } catch(e){errEl.textContent=e.message;errEl.style.display='block';}
+  }
+  function closeAdminLogin(){document.getElementById('adminLoginModal').classList.remove('open');}
+  function invalidateAdmin(){_adminToken='';localStorage.removeItem('sv_admin_token');requireAdminAccess(()=>switchTab(_activeTab));}
+  async function adminFetch(url, options={}) {
+    const r=await fetch(url,{...options,headers:{...adminHeaders(),...(options.headers||{})}});
+    if(r.status===401){invalidateAdmin();throw new Error('Admin session expired');}
+    const d=await r.json().catch(()=>({})); if(!r.ok||d.ok===false) throw new Error(d.error||`Request failed (${r.status})`); return d;
+  }
+
+
+  async function loadCheckpointEpisodes() {
+    try {
+      const d = await adminFetch('/api/checkpoints/episodes');
+      const s = document.getElementById('checkpointEpisodeSelect');
+      s.innerHTML = '<option value="">Select an episode…</option>' + (d.episodes || []).map(e => `<option value="${esc(e.id)}">${esc(e.show_title)} S${e.season_number}E${e.episode_number} — ${esc(e.status)}</option>`).join('');
+    } catch(e) { document.getElementById('checkpointStatus').textContent = e.message; }
+  }
+
+  async function loadEpisodeCheckpoints(id) {
+    const body = document.getElementById('checkpointBody');
+    if (!id) return;
+    try {
+      const d = await adminFetch('/api/checkpoints?episode_id=' + encodeURIComponent(id));
+      body.innerHTML = (d.checkpoints || []).map(cp => `<tr><td><strong>${esc(cp.stage)}</strong></td><td>${cp.scene_number ?? '—'}</td><td>${cp.shot_index ?? '—'}</td><td>${esc(cp.status)}</td><td>${esc(cp.created_at || '')}</td><td><button class="shot-fail-btn" onclick="rollbackCheckpoint('${cp.id}')">Rollback here</button></td></tr>`).join('') || '<tr><td colspan="6" style="padding:20px;text-align:center">No checkpoints.</td></tr>';
+    } catch(e) { body.innerHTML = `<tr><td colspan="6" style="color:var(--danger);padding:20px">${esc(e.message)}</td></tr>`; }
+  }
+
+  async function rollbackCheckpoint(id) {
+    if (!confirm('Rollback to this checkpoint? Downstream production artifacts will be removed.')) return;
+    try {
+      const d = await adminFetch('/api/checkpoints/rollback', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({checkpoint_id:id})});
+      document.getElementById('checkpointStatus').textContent = 'Rolled back to ' + d.resumed_from_stage;
+      await loadEpisodeCheckpoints(document.getElementById('checkpointEpisodeSelect').value);
+      if (typeof loadDrafts === 'function') loadDrafts();
+      if (typeof loadRenderedShots === 'function') loadRenderedShots();
+    } catch(e) { alert('Rollback failed: ' + e.message); }
+  }
+  function switchTab(tab) {
+    _activeTab = tab;
+    const panels=['control','episodes','analytics','users','announcements','checkpoints'];
+    for(const name of panels){const panel=document.getElementById(`tabPanel${name[0].toUpperCase()+name.slice(1)}`); if(panel) panel.style.display=name===tab?'':'none';}
+    const activeStyle='background:var(--surface);border:1px solid var(--border);border-bottom:none;color:var(--text);padding:9px 18px;border-radius:8px 8px 0 0;font-size:13px;font-weight:600;cursor:pointer';
+    const inactiveStyle='background:transparent;border:1px solid transparent;color:var(--muted);padding:9px 18px;border-radius:8px 8px 0 0;font-size:13px;font-weight:600;cursor:pointer';
+    for(const name of panels){const btn=document.getElementById(`tabBtn${name[0].toUpperCase()+name.slice(1)}`);if(btn)btn.style.cssText=name===tab?activeStyle:inactiveStyle;}
+    if(tab==='episodes') loadEpisodesTab();
+    if(tab==='checkpoints') loadCheckpointEpisodes();
+    if(['analytics','users','announcements'].includes(tab)) requireAdminAccess(()=>{ if(tab==='analytics')loadAnalytics(); if(tab==='users')loadUsers(); if(tab==='announcements')loadAnnouncements(); });
+  }
+
+
+  // ── Episodes tab ─────────────────────────────────────────────────────────────
+  async function loadEpisodesTab() {
+    const tbody = document.getElementById('episodesBody');
+    try {
+      const r = await fetch('/api/episodes');
+      const d = await r.json();
+      if (!d.ok) throw new Error(d.error);
+      renderEpisodesTab(d.episodes || []);
+    } catch (e) {
+      tbody.innerHTML = `<tr><td colspan="6" style="color:var(--danger);text-align:center;padding:20px">Failed to load: ${esc(e.message)}</td></tr>`;
+    }
+  }
+
+  function renderEpisodesTab(episodes) {
+    const tbody = document.getElementById('episodesBody');
+    if (!episodes.length) {
+      tbody.innerHTML = '<tr><td colspan="6" style="color:var(--muted);text-align:center;padding:20px">No episodes yet</td></tr>';
+      return;
+    }
+    const groups = new Map();
+    for (const ep of episodes) {
+      const key = ep.showId || ep.showTitle || 'Unknown Show';
+      if (!groups.has(key)) groups.set(key, { title: ep.showTitle || key, genre: ep.genre || '', episodes: [] });
+      groups.get(key).episodes.push(ep);
+    }
+    tbody.innerHTML = [...groups.values()].map((g, gi) => `
+      <tr><td colspan="6" style="padding:16px 10px 8px;background:rgba(255,255,255,.02)">
+        <div style="font-size:15px;font-weight:700">${esc(g.title)}</div><div style="font-size:11px;color:var(--muted);margin-top:3px">${esc(g.genre)}</div>
+      </td></tr>
+      ${g.episodes.map((ep, i) => `
+      <tr id="ep-row-${esc(ep.id)}">
+        <td style="color:var(--muted)">${i + 1}</td>
+        <td><div style="font-weight:600">Season ${ep.seasonNumber} · Episode ${ep.episodeNumber}</div><div style="font-size:12px;color:var(--muted)">${esc(ep.title)}</div></td>
+        <td><span class="pill ${ep.status === 'posted' ? '' : 'idle'}" style="font-size:11px;padding:2px 9px">${esc(ep.status)}</span></td>
+        <td style="color:var(--muted);white-space:nowrap">${ep.shotsDone}/${ep.shotsTotal} video · ${ep.shotsWithImage}/${ep.shotsTotal} image</td>
+        <td>${ep.videoUrl ? `<a href="${esc(ep.videoUrl)}" target="_blank" class="lnk">View ↗</a>` : '<span style="color:var(--muted)">—</span>'}</td>
+        <td style="display:flex;gap:6px;flex-wrap:wrap">
+          <button onclick="openEpisodeEditor('${esc(ep.id)}')" style="background:rgba(8,145,178,.12);color:#67e8f9;border:1px solid rgba(8,145,178,.35);padding:5px 12px;border-radius:6px;font-size:12px;cursor:pointer">✎ Edit Episode</button>
+          <button onclick="regenerateEpisodeVideos('${esc(ep.id)}')" id="ep-regen-btn-${esc(ep.id)}" style="background:rgba(245,158,11,.1);color:var(--warning);border:1px solid rgba(245,158,11,.3);padding:5px 12px;border-radius:6px;font-size:12px;cursor:pointer" title="Regenerate video only from saved stills">🔁 Regen Videos</button>
+          ${ep.status === 'ready' && ep.videoUrl ? `<button onclick="publishEpisode('${esc(ep.id)}')" id="ep-publish-btn-${esc(ep.id)}" style="background:rgba(34,197,94,.12);color:#86efac;border:1px solid rgba(34,197,94,.35);padding:5px 12px;border-radius:6px;font-size:12px;cursor:pointer;font-weight:600" title="Publish this reviewed episode">🚀 Publish Episode</button>` : ''}
+        </td>
+      </tr>`).join('')}`).join('');
+  }
+
+  async function regenerateEpisodeVideos(episodeId) {
+    if (!confirm('This will purge every compiled clip for this episode and re-render all videos from the existing shot images (no CF Worker calls). Continue?')) return;
+    const btn = document.getElementById(`ep-regen-btn-${episodeId}`);
+    const originalLabel = btn ? btn.innerHTML : '';
+    if (btn) { btn.disabled = true; btn.innerHTML = '⏳ Regenerating…'; }
+    try {
+      const r = await fetch(`/api/episodes/${episodeId}/regenerate-videos`, { method: 'POST' });
+      const d = await r.json();
+      if (d.ok) {
+        alert(`Done — ${d.successes}/${d.totalShots} shot video(s) regenerated${d.skipped ? `, ${d.skipped} skipped (no saved image)` : ''}.`);
+      } else {
+        alert(`Regeneration stopped: ${d.error}`);
+      }
+    } catch (e) {
+      alert(`Request failed: ${e.message}`);
+    } finally {
+      if (btn) { btn.disabled = false; btn.innerHTML = originalLabel; }
+      loadEpisodesTab();
+    }
+  }
+
+
+  function fmtSeconds(s){s=Math.max(0,Math.round(Number(s)||0));const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=s%60;return h?`${h}h ${m}m`:m?`${m}m ${sec}s`:`${sec}s`;}
+  function flagEmoji(code){if(!code||!/^[A-Z]{2}$/.test(code))return '🌐';return String.fromCodePoint(...code.split('').map(c=>127397+c.charCodeAt(0)));}
+
+  function goToAnalyticsRequestPage(page) {
+    _analyticsRequestPage = Math.max(1, Number(page) || 1);
+    loadAnalytics();
+  }
+
+  function renderAnalyticsRequestPagination(pagination) {
+    const el = document.getElementById('analyticsRequestsPagination');
+    if (!el) return;
+
+    const current = Math.max(1, Number(pagination?.page || 1));
+    const totalPages = Math.max(1, Number(pagination?.totalPages || 1));
+    const total = Math.max(0, Number(pagination?.total || 0));
+    _analyticsRequestPage = current;
+
+    if (totalPages <= 1) {
+      el.innerHTML = total ? `<span class="muted-mini">${total.toLocaleString()} request${total === 1 ? '' : 's'}</span>` : '';
+      return;
+    }
+
+    const pages = new Set([1, totalPages, current - 1, current, current + 1]);
+    const ordered = [...pages].filter(p => p >= 1 && p <= totalPages).sort((a, b) => a - b);
+    const controls = [
+      `<button class="analytics-page-btn" ${current === 1 ? 'disabled' : ''} onclick="goToAnalyticsRequestPage(${current - 1})">‹</button>`,
+    ];
+    let previous = 0;
+    for (const page of ordered) {
+      if (previous && page - previous > 1) controls.push('<span class="muted-mini" style="padding:0 3px">…</span>');
+      controls.push(`<button class="analytics-page-btn ${page === current ? 'active' : ''}" onclick="goToAnalyticsRequestPage(${page})">${page}</button>`);
+      previous = page;
+    }
+    controls.push(`<button class="analytics-page-btn" ${current === totalPages ? 'disabled' : ''} onclick="goToAnalyticsRequestPage(${current + 1})">›</button>`);
+    controls.push(`<span class="muted-mini" style="margin-left:6px">${total.toLocaleString()} total</span>`);
+    el.innerHTML = controls.join('');
+  }
+
+  async function loadAnalytics(resetRequestPage = false){
+    if (resetRequestPage) _analyticsRequestPage = 1;
+    requireAdminAccess(async()=>{
+      try{
+        const days=document.getElementById('analyticsDays').value;
+        const d=await adminFetch(`/api/admin/analytics?days=${encodeURIComponent(days)}&page=${_analyticsRequestPage}&pageSize=${ANALYTICS_REQUEST_PAGE_SIZE}`);
+        const s=d.summary||{}; const visitors=Number(s.visitors||0),sessions=Number(s.sessions||0),watch=Number(s.watch_seconds||0);
+        document.getElementById('analyticsStats').innerHTML=[
+          ['Unique Visitors',visitors.toLocaleString()],['Sessions',sessions.toLocaleString()],['Frontend Requests',Number(s.requests||0).toLocaleString()],['Video Views',Number(s.video_views||0).toLocaleString()],['Watch Time',fmtSeconds(watch)],['Avg Session',fmtSeconds(Math.round(Number(s.avg_session_seconds||0)))],['Countries',String((d.countries||[]).length)],['Avg Video Position',`${Math.round(Number(s.avg_video_position||0))}s`]
+        ].map(x=>`<div class="sheet-stat"><div class="label">${esc(x[0])}</div><div class="value">${esc(x[1])}</div></div>`).join('');
+        const repeatMap=new Map((d.repeat||[]).map(x=>[x.country_code,Number(x.repeat_visitors||0)]));
+        document.getElementById('analyticsCountriesBody').innerHTML=(d.countries||[]).map(x=>`<tr><td><span class="flag">${flagEmoji(x.code)}</span><strong>${esc(x.code==='ZZ'?'Unknown':x.code)}</strong></td><td>${Number(x.visitors||0).toLocaleString()}</td><td>${Number(x.sessions||0).toLocaleString()}</td><td>${Number(x.requests||0).toLocaleString()}</td><td>${fmtSeconds(x.watch_seconds)}</td><td>${Number(repeatMap.get(x.code)||0).toLocaleString()}</td><td>${fmtDate(x.last_seen)}</td></tr>`).join('')||'<tr><td colspan="7" class="muted-mini" style="text-align:center;padding:18px">No analytics yet.</td></tr>';
+        document.getElementById('analyticsVideosBody').innerHTML=(d.videos||[]).map(x=>{const starts=Number(x.starts||0),complete=Number(x.completions||0);return `<tr><td><strong>${esc(x.show_title||'Unknown Show')}</strong><div class="muted-mini">S${x.season_number||'?'}E${x.episode_number||'?'} · ${esc(x.episode_id||'')}</div></td><td>${Number(x.unique_viewers||0).toLocaleString()}</td><td>${starts.toLocaleString()}</td><td>${complete.toLocaleString()}</td><td>${fmtSeconds(x.watch_seconds)}</td><td>${starts?Math.round(complete/starts*100)+'%':'—'}</td><td>${fmtDate(x.last_watched)}</td></tr>`}).join('')||'<tr><td colspan="7" class="muted-mini" style="text-align:center;padding:18px">No video events yet.</td></tr>';
+        const showAnalyticsCard=document.getElementById('analyticsShowsBody'); if(showAnalyticsCard) showAnalyticsCard.innerHTML=(d.shows||[]).map(x=>{const starts=Number(x.starts||0),complete=Number(x.completions||0);return `<tr><td><strong>${esc(x.show_title||'Unknown Show')}</strong></td><td>${Number(x.episodes_watched||0).toLocaleString()}</td><td>${Number(x.unique_viewers||0).toLocaleString()}</td><td>${starts.toLocaleString()}</td><td>${complete.toLocaleString()}</td><td>${fmtSeconds(x.watch_seconds)}</td><td>${starts?Math.round(complete/starts*100)+'%':'—'}</td><td>${fmtDate(x.last_watched)}</td></tr>`}).join('')||'<tr><td colspan="8" class="muted-mini" style="text-align:center;padding:18px">No show analytics yet.</td></tr>';
+        document.getElementById('analyticsRequestsBody').innerHTML=(d.requests||[]).map(x=>`<tr><td>${fmtDate(x.created_at)}</td><td><span class="pill-mini">${esc(x.event_type)}</span></td><td>${esc(x.path||'')}</td><td>${esc(x.episode_id||'—')}</td><td><span class="flag">${flagEmoji(x.country_code)}</span>${esc(x.country_code||'ZZ')}</td><td>${esc([x.device_type,x.browser,x.operating_system].filter(Boolean).join(' · '))}</td><td><code>${esc(String(x.visitor_id||'').slice(0,12))}…</code></td><td class="muted-mini">${esc(x.metadata||'')}</td></tr>`).join('')||'<tr><td colspan="8" class="muted-mini" style="text-align:center;padding:18px">No requests yet.</td></tr>';
+        renderAnalyticsRequestPagination(d.requestPagination);
+      }catch(e){alert(e.message);}
+    });
+  }
+
+  async function loadUsers(){
+    try{const d=await adminFetch('/api/admin/users');document.getElementById('usersBody').innerHTML=(d.users||[]).map(u=>`<tr><td><strong>${esc(u.email)}</strong><div class="muted-mini">${esc(u.id)}</div></td><td>${esc(u.display_name||'—')}</td><td><span class="pill-mini ${u.email_verified?'pill-green':'pill-red'}">${u.email_verified?'Verified':'Unverified'}</span></td><td><span class="pill-mini ${u.is_active?'pill-green':'pill-red'}">${u.is_active?'Active':'Disabled'}</span></td><td>${fmtDate(u.created_at)}</td><td>${fmtDate(u.last_login_at)}</td><td>${Number(u.favorite_count||0)}</td><td>${Number(u.video_starts||0)}</td><td><button class="refresh-btn" onclick='openEditUser(${JSON.stringify({id:u.id,email:u.email,displayName:u.display_name||'',emailVerified:!!u.email_verified,isActive:!!u.is_active}).replace(/'/g,"&#39;")})'>✎ Edit</button></td></tr>`).join('')||'<tr><td colspan="9" class="muted-mini" style="text-align:center;padding:18px">No users yet.</td></tr>';}catch(e){document.getElementById('usersBody').innerHTML=`<tr><td colspan="9" style="color:var(--danger);text-align:center;padding:18px">${esc(e.message)}</td></tr>`;}
+  }
+  function openCreateUser(){_editingUserId=null;document.getElementById('userModalTitle').textContent='Create User';document.getElementById('userModalEmail').disabled=false;document.getElementById('userModalEmail').value='';document.getElementById('userModalName').value='';document.getElementById('userModalPassword').value='';document.getElementById('userModalVerified').checked=true;document.getElementById('userModalActiveWrap').style.display='none';document.getElementById('userModal').style.display='flex';}
+  function openEditUser(u){_editingUserId=u.id;document.getElementById('userModalTitle').textContent='Edit User';document.getElementById('userModalEmail').disabled=true;document.getElementById('userModalEmail').value=u.email;document.getElementById('userModalName').value=u.displayName;document.getElementById('userModalPassword').value='';document.getElementById('userModalVerified').checked=u.emailVerified;document.getElementById('userModalActive').checked=u.isActive;document.getElementById('userModalActiveWrap').style.display='flex';document.getElementById('userModal').style.display='flex';}
+  function closeUserModal(){document.getElementById('userModal').style.display='none';}
+  async function saveUserModal(){try{const payload={displayName:document.getElementById('userModalName').value,emailVerified:document.getElementById('userModalVerified').checked};const email=document.getElementById('userModalEmail').value.trim();const pw=document.getElementById('userModalPassword').value;if(!_editingUserId){payload.email=email;payload.password=pw;}else{payload.isActive=document.getElementById('userModalActive').checked;if(pw)payload.password=pw;}const d=await adminFetch(_editingUserId?`/api/admin/users/${encodeURIComponent(_editingUserId)}`:'/api/admin/users',{method:_editingUserId?'PUT':'POST',body:JSON.stringify(payload)});if(!d.ok)throw new Error(d.error||'User save failed');closeUserModal();loadUsers();}catch(e){document.getElementById('userModalError').textContent=e.message;document.getElementById('userModalError').style.display='block';}}
+
+  async function loadAnnouncements(){try{const d=await adminFetch('/api/admin/announcements');document.getElementById('announcementsBody').innerHTML=(d.announcements||[]).map(a=>`<tr><td>${fmtDate(a.published_at||a.created_at)}</td><td><strong>${esc(a.title)}</strong></td><td style="max-width:620px;white-space:pre-wrap">${esc(a.body)}</td><td><span class="pill-mini ${a.published_at?'pill-green':'pill-red'}">${a.published_at?'Published':'Draft'}</span></td><td><button class="refresh-btn" style="color:var(--danger);border-color:rgba(239,68,68,.35)" onclick="deleteAnnouncement('${a.id}')">🗑 Delete</button></td></tr>`).join('')||'<tr><td colspan="5" class="muted-mini" style="text-align:center;padding:18px">No announcements yet.</td></tr>';}catch(e){document.getElementById('announcementsBody').innerHTML=`<tr><td colspan="5" style="color:var(--danger);text-align:center;padding:18px">${esc(e.message)}</td></tr>`;}}
+  async function deleteAnnouncement(id){if(!confirm('Delete this announcement? This cannot be undone.'))return;try{await adminFetch(`/api/admin/announcements/${encodeURIComponent(id)}`,{method:'DELETE'});loadAnnouncements();}catch(e){alert(e.message);}}
+  async function sendAnnouncement(){const title=document.getElementById('announcementTitle').value.trim(),body=document.getElementById('announcementBody').value.trim();if(!title||!body)return alert('Enter a title and message.');try{await adminFetch('/api/admin/announcements',{method:'POST',body:JSON.stringify({title,body,publish:true})});document.getElementById('announcementTitle').value='';document.getElementById('announcementBody').value='';alert('Announcement published.');loadAnnouncements();}catch(e){alert(e.message);}}
+
+  // ── Init ───────────────────────────────────────────────────────────────────
+  fetch('/api/status').then(r => r.json()).then(renderState).catch(() => {});
+  loadHistory();
+  loadDrafts();
+  loadRenderedShots();
+  loadHfTokens();
+  // Refresh DB history every 60s (catches episodes posted by cron while tab is open).
+  // loadDrafts / loadRenderedShots are managed dynamically in renderState during generation.
+  setInterval(loadHistory, 60000);
+  setInterval(loadDrafts,  60000); // fallback for when SSE is not yet connected
+  setInterval(loadHfTokens, 20000); // token pool status — cheap read-only poll
+  connect();
+</script>
+</body>
+</html>
