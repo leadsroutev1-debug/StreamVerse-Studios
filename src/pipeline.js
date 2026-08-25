@@ -4509,16 +4509,83 @@ function _selectContinuityCharacterReferences(charsInShot = [], shot = {}, speak
   return result;
 }
 
+const STILL_IMAGE_NEGATIVE_CONSTRAINTS = [
+  'no motion blur',
+  'no ghosting',
+  'no temporal smear',
+  'no double exposure',
+  'no duplicate limbs',
+  'no extra arms',
+  'no extra legs',
+  'no extra fingers',
+  'no missing fingers',
+  'no fused hands',
+  'no malformed hands',
+  'no warped anatomy',
+  'no stretched limbs',
+  'no melted facial features',
+  'no duplicate faces',
+  'no merged characters',
+  'no hybrid faces',
+  'no face morphing',
+  'no identity swapping',
+  'no age drift',
+  'no hairstyle substitution',
+  'no wardrobe substitution',
+  'no duplicate people',
+  'no extra people',
+  'no phantom objects',
+  'no duplicated props',
+  'no floating props',
+  'no warped background geometry',
+  'no fisheye distortion',
+  'no split panels',
+  'no collage',
+  'no text',
+  'no subtitles',
+  'no logos',
+  'no watermark',
+].join(', ');
+
+const STILL_MOTION_VERBS = /\b(?:animate|animation|animated|moving|move|moves|movement|walking|walks|running|runs|turning|turns|reaching|reaches|approaching|approaches|steps|stepping|dancing|dances|driving|drives|pulling|pulls|pushing|pushes|jumping|jumps|falling|falls|camera\s+(?:moves?|push(?:es|ing)?|pull(?:s|ing)?|pans?|tilts?|cranes?|zooms?|tracks?)|dolly|tracking|pan\s+(?:left|right)|tilt\s+(?:up|down)|zooming|zoom\s+(?:in|out)|speaking|speaks|talking|talks|dialogue|lip[- ]?sync|voice[- ]?over|voiceover|audio|temporal|over\s+time|then|begins\s+to|continues\s+to|gradually\s+(?:moves|turns|walks|reaches|approaches))\b/i;
+
+function _staticizeImagePromptText(rawText) {
+  const text = String(rawText || '').trim();
+  if (!text) return '';
+  const cleaned = _sanitizeStillImagePrompt(text);
+  const sentences = cleaned
+    .split(/(?<=[.!?])\s+|\n+/)
+    .map(x => x.trim())
+    .filter(Boolean)
+    .filter(sentence => !STILL_MOTION_VERBS.test(sentence));
+  return sentences.join(' ').replace(/\s{2,}/g, ' ').trim();
+}
+
+function _staticCharacterState(row, fallbackPose = '') {
+  const staticParts = [];
+  if (row?.pose) staticParts.push(`frozen pose ${row.pose}`);
+  else if (fallbackPose) staticParts.push(`frozen pose ${fallbackPose}`);
+  if (row?.facing) staticParts.push(`facing ${row.facing}`);
+  if (row?.eyeline) staticParts.push(`eyeline ${row.eyeline}`);
+  if (row?.interaction && !STILL_MOTION_VERBS.test(String(row.interaction))) {
+    staticParts.push(`static interaction ${row.interaction}`);
+  }
+  if (row?.action && !STILL_MOTION_VERBS.test(String(row.action))) {
+    staticParts.push(`static physical state ${row.action}`);
+  }
+  return staticParts.join('; ') || 'frozen natural pose, stable posture, no transitional action';
+}
+
 function _buildShotImagePrompt(shot, storyline, charsInShot, prevShot = null, sceneBgImageUrl = null, focusChar = null, charRefSlots = [], speakerOnlyMode = false, previousEndFrameUrl = null) {
   const staging = shotStaging.getShotCharacterStaging(shot, charsInShot);
   const refs = charRefSlots.map(x => `input_image_${x.slotIndex} = ${x.char.name} character reference`).join('; ');
   const continuityBase = previousEndFrameUrl
-    ? 'input_image_0 is the EXACT terminal frame of the immediately preceding completed shot and is the authoritative physical canvas for this shot. Preserve its composition, camera, environment, lighting, wardrobe, props, spatial geography, body positions, gaze, hand/prop contact and emotional state unless the current shot intent explicitly requires a causal change.'
+    ? 'input_image_0 is the EXACT terminal frame of the immediately preceding completed shot and is the authoritative visual canvas for the current opening frame. Preserve its environment, composition, lighting, wardrobe, props, character identity, screen geography, body positions, gaze and hand/prop contact unless the current frozen opening state explicitly changes them.'
     : '';
   const bg = continuityBase
     ? continuityBase
     : sceneBgImageUrl
-      ? `input_image_0 is the character-free master background for this scene. Preserve its architecture, spatial geometry, props, lighting and camera geography exactly.`
+      ? 'input_image_0 is the character-free master background for this scene. Preserve its architecture, spatial geometry, props, lighting and camera geography exactly.'
       : 'No scene background reference was available; preserve the written scene geography exactly.';
 
   const previousEnd = prevShot
@@ -4527,47 +4594,50 @@ function _buildShotImagePrompt(shot, storyline, charsInShot, prevShot = null, sc
   const sameScene = !!prevShot && prevShot.scene_number === shot.scene_number;
   const startState = String(shot.start_frame_state || shot._start_frame_handoff || previousEnd || '').trim();
 
-  const speakerName = ttsGen.extractSpeakerName(shot.dialogue_or_action || '') || focusChar?.name || '';
-  const visibleDialogue = speakerOnlyMode ? speakerName : '';
+  // The ScriptWriter's image_prompt is authoritative for the FLUX still branch.
+  // Do not reconstruct a still from temporal fields such as subject_motion,
+  // temporal_arc, camera_movement, travel_stage, route_beat or end_frame_transition.
+  const authoredStill = _staticizeImagePromptText(shot.image_prompt || '');
+
   const stagingLines = staging.map(row => {
     const identity = row.visual_identity ? ` Identity cue: ${row.visual_identity}.` : '';
-    const speak = _namesMatch(row.name, speakerName) ? ' This character is the visible speaker.' : '';
-    return `CHARACTER ${row.name}: ${row.screen_position}, ${row.depth}; facing ${row.facing || 'the stated story focus'}; pose ${row.pose || shot.pose_state || 'natural, readable pose'}; visible action ${row.action || 'holds the established position'}; eyeline ${row.eyeline || row.facing || 'toward the immediate story focus'}; interaction ${row.interaction || 'none beyond the established scene relationship'}.${identity}${speak}`;
+    const staticState = _staticCharacterState(row, shot.pose_state);
+    return `CHARACTER ${row.name}: ${row.screen_position}, ${row.depth}; ${staticState}.${identity}`;
   }).join('\n');
 
-  const transition = shot._continuity_transition === 'context_change'
-    ? 'This is a deliberate context change. Establish the new geography causally; do not teleport characters.'
-    : sameScene && startState
-      ? `Open on the exact state inherited from the previous shot: ${startState}. Preserve every character body position, hand or prop contact, gaze, expression, screen position, depth and environment before any new movement.`
-      : 'Establish the declared opening visual state with stable screen geography.';
+  const staticContinuity = sameScene && startState
+    ? `Frozen opening state inherited from the previous shot: ${_staticizeImagePromptText(startState)}. Reproduce this state as a single settled frame; do not depict a transition or in-between motion state.`
+    : 'Establish the declared opening visual state as one settled, frozen instant; no transitional pose.';
 
   const focus = shot._multi_speaker
-    ? 'Use one shared composition containing every visible speaker and listener. Keep every body and face separately readable; never merge people.'
-    : visibleDialogue
-      ? `The visual focus is ${visibleDialogue}, while all other visible characters remain silent listeners with natural micro-reactions.`
-      : '';
+    ? 'Keep every visible character separately readable and spatially distinct. Use closed or naturally resting mouths unless the frozen reference state clearly shows otherwise.'
+    : '';
 
-  return [
-    'STILL IMAGE — one frozen cinematic opening frame only.',
-    `Genre/aesthetic: ${storyline.genre || 'cinematic'}; photorealistic 4K film frame; 9:16 vertical portrait composition.`,
-    `Shot framing: ${shot.shot_type || ''}; ${shot.framing || ''}; viewpoint only, no camera movement.`,
-    `Scene location: ${shot._scene_location || 'established scene location'}. Scene description: ${_sanitizeStillImagePrompt(shot._scene_description || shot.shot_description || '')}.`,
-    `Lighting: ${shot._lighting_design || 'consistent with the established scene lighting'}.`,
-    `LOCKED CHARACTER STAGING — this map is authoritative and must be visible exactly as described:\n${stagingLines}`,
+  const parts = [
+    'STILL IMAGE — one frozen cinematic opening frame only. This prompt is for a still-image generator, not a video model.',
+    `Genre/aesthetic: ${storyline.genre || 'cinematic'}; photorealistic cinematic film frame; 9:16 vertical portrait composition.`,
+    authoredStill ? `AUTHORED STILL DESCRIPTION: ${authoredStill}` : '',
+    `Shot framing: ${shot.shot_type || ''}; ${_staticizeImagePromptText(shot.framing || '')}; fixed viewpoint only.`,
+    `Scene location: ${shot._scene_location || 'established scene location'}.`,
+    `Static scene description: ${_staticizeImagePromptText(shot._scene_description || '')}.`,
+    `Lighting: ${_staticizeImagePromptText(shot._lighting_design || 'consistent with the established scene lighting')}.`,
+    `LOCKED CHARACTER STAGING — authoritative frozen spatial map:\n${stagingLines}`,
     bg,
-    refs ? `REFERENCE MAP: ${refs}. Preserve each reference identity in the character staging row with the same screen position.` : '',
-    `COMPOSITION SUMMARY: ${shot.character_positions || staging.map(row => `${row.name} at ${row.screen_position}, ${row.depth}`).join('; ')}.`,
-    `VISIBLE OPENING STATE: ${shot.pose_state || ''}; expression shown through facial expression and posture; eyelines follow the locked staging map.`,
-    transition,
+    refs ? `REFERENCE MAP: ${refs}. Each reference supplies identity only for the matching character; preserve the same identity, screen position and depth.` : '',
+    `COMPOSITION SUMMARY: ${staging.map(row => `${row.name} at ${row.screen_position}, ${row.depth}`).join('; ')}.`,
+    `VISIBLE OPENING STATE: ${_staticCharacterState(staging[0], shot.pose_state)}.`,
+    staticContinuity,
     continuityBase
-      ? 'CONTINUITY RE-ANCHOR RULE: Use the predecessor frame as the source-of-truth canvas. The canonical character references are authoritative only for persistent identity traits such as facial structure, hair, skin/feature geometry and body identity. Do NOT redesign the scene or casually change wardrobe, lighting, props, camera, composition, pose, gaze, spatial relationships or emotional state. Correct identity drift inside the existing frame rather than inventing a new shot.'
+      ? 'CONTINUITY RE-ANCHOR RULE: treat the predecessor frame as the scene canvas. Character references correct identity only; do not redesign the scene, swap identities, mirror positions, change wardrobe, invent props, or create a new composition.'
       : '',
     focus,
-    'Do not invent a different room, set, weather, wardrobe, props, time of day, or extra people. No text, logos or watermarks.',
-    'The image is silent and static: no dialogue, no speech, no lip-sync, no camera movement, no temporal language.',
-  ].filter(Boolean).join('\n');
-}
-/**
+    'Do not invent extra people, characters, props, wardrobe changes, locations, weather changes, time shifts, written text, logos or watermarks.',
+    `STATIC-IMAGE NEGATIVE CONSTRAINTS: ${STILL_IMAGE_NEGATIVE_CONSTRAINTS}.`,
+    'Absolutely no animation instructions, no movement instructions, no camera movement, no temporal progression, no dialogue, no speaking, no lip-sync, no audio, no motion blur, no transitional pose.',
+  ];
+
+  return parts.filter(Boolean).join('\n');
+}/**
  * Build the dynamic reference-index → character identity map sent to the
  * Cloudflare image Worker's `characters` field (see cfImageGen.js). Purely
  * derived from whichever characters are actually in this shot — no fixed
@@ -4594,16 +4664,16 @@ function _buildCharacterReferenceMap(charRefSlots, positions, shot) {
     const staticParts = [];
     if (position) staticParts.push(`positioned ${position}`);
     if (row?.depth) staticParts.push(row.depth);
-    if (row?.pose) staticParts.push(`pose ${row.pose}`);
-    if (row?.action) staticParts.push(`visible action ${row.action}`);
+    if (row?.pose) staticParts.push(`frozen pose ${row.pose}`);
     if (row?.eyeline) staticParts.push(`eyeline ${row.eyeline}`);
+    if (row?.facing) staticParts.push(`facing ${row.facing}`);
     if (ageMatch) staticParts.push(ageMatch[0]);
 
     return {
       name: char.name,
       reference_index: slotIndex,
       position: position || undefined,
-      action: staticParts.length ? staticParts.join(', ') : undefined,
+      action: staticParts.length ? `STATIC FRAME STATE: ${staticParts.join(', ')}` : 'STATIC FRAME STATE: stable frozen pose, no transitional action',
     };
   });
 }

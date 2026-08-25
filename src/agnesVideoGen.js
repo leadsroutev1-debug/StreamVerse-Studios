@@ -20,11 +20,32 @@ const DEFAULT_MAX_DURATION = 18;
 const DEFAULT_WIDTH = 1024;
 const DEFAULT_HEIGHT = 1536;
 const DEFAULT_NEGATIVE_PROMPT = [
+  // Text / overlay suppression
   'garbled text','gibberish','misspelled words','distorted lettering','unreadable text',
   'random symbols','subtitles','captions','closed captions','dialogue captions',
   'text overlays','UI overlays','title cards','watermarks','logos','extra typography',
   'floating text','duplicated text','malformed signs','malformed labels','screen text',
   'extra written words','on-screen graphics','words appearing from nowhere',
+  // Character identity / morphology suppression
+  'character morphing','face morphing','identity drift','identity swapping','face swapping',
+  'hybrid faces','merged faces','duplicated faces','age drift','age changing','body-shape drift',
+  'hairstyle changes','hair color changes','skin-tone drift','wardrobe changes','costume changes',
+  'extra people','duplicate people','vanishing characters','character cloning','character replacement',
+  // Anatomy / temporal artifact suppression
+  'extra arms','extra legs','extra hands','extra fingers','missing fingers','fused fingers',
+  'fused hands','malformed hands','rubbery limbs','stretched limbs','warped anatomy',
+  'deformed face','melted facial features','distorted teeth','crossed eyes','eye drift',
+  'wandering eyes','unnatural blinking','random mouth movement','mouth deformation','teeth popping',
+  'lip-sync drift','wrong-character lip-sync','ghosting','temporal smear','double exposure',
+  'frame flicker','texture swimming','background warping','geometry drift','object duplication',
+  'prop morphing','floating props','disappearing props','phantom objects',
+  // Artificial-performance suppression
+  'robotic movement','mechanical movement','puppet-like motion','mannequin movement',
+  'rubber-like motion','sliding feet','foot skating','weightless motion','teleporting',
+  'instant pose changes','unmotivated gestures','synchronized character motion',
+  'identical reactions','random secondary-character motion','random background activity',
+  'camera jitter','unmotivated camera shake','excessive zoom','excessive camera movement',
+  'motion blur','smearing','low-detail faces',
 ].join(', ');
 const CONTINUITY_FOLDER = process.env.AGNES_CONTINUITY_FRAME_FOLDER || 'ai-movies/continuity-frames';
 
@@ -219,8 +240,18 @@ async function _buildFinalAgnesPrompt(imageBuffer, shotMeta = {}, continuity = {
   }
 
   const continuityInstruction = continuity.usedContinuityFrame
-    ? 'The previous-shot terminal frame is available only as continuity context. The supplied current-shot image is the authoritative opening frame. Preserve the inherited physical state, identity, wardrobe, props, lighting, geography, eyelines and emotional state that were re-anchored into this image, then perform the new shot action. Do not reset, teleport, swap, mirror, or replace characters.'
-    : 'The supplied image is the authoritative authored opening still for this shot. Begin from that exact visual state and perform the new shot action.';
+    ? 'The previous-shot terminal frame is available only as continuity context. The supplied current-shot image is the authoritative opening frame. Preserve the inherited identity, wardrobe, props, lighting, geography, eyelines, hand/prop contact and emotional state that were re-anchored into this image. Do not reset, teleport, mirror, swap, replace, clone, age, or morph any character.'
+    : 'The supplied image is the authoritative authored opening still for this shot. Begin from that exact visual state. Do not redesign the composition, replace characters, or invent new identities.';
+
+  const behaviorGuardrail = [
+    'CHARACTER PERFORMANCE GUARDRAILS: perform only movement that is explicitly present in the authored shot intent or necessary for the exact dialogue beat.',
+    'Do not invent independent movement for every visible person. Silent listeners and background people may remain mostly still; use only small natural reactions when they are explicitly supported by the shot.',
+    'Never make multiple characters move in synchronized or mirrored ways unless the story explicitly requires coordination.',
+    'Preserve stable facial identity, hair, wardrobe, body proportions, age, skin/features, and spatial identity throughout the shot.',
+    'Do not introduce spontaneous smiles, blinks, head turns, hand gestures, eye darts, mouth movements, prop interactions, or background activity merely to make the frame feel alive.',
+    'Maintain grounded weight, foot contact and believable body mechanics. No sliding feet, rubber limbs, puppet-like movement, mannequin motion, or sudden pose snaps.',
+    'The current still is settled and authoritative. Do not create an artificial transition from an invented pose; start exactly from the supplied pixels and evolve only the authored action.',
+  ].join(' ');
 
   const dialogueInstruction = /(?:dialogue|speaker|speaking|"|“|”|tts_mode)/i.test(String(shot.dialogue_or_action || shot.videoPrompt || shot.agnesPrompt || ''))
     ? 'This is a live-action conversational performance. Preserve exact speaker attribution, let the correct speaker visibly articulate the words, and give listening characters natural reactive facial and body performance without inventing extra dialogue.'
@@ -232,12 +263,12 @@ async function _buildFinalAgnesPrompt(imageBuffer, shotMeta = {}, continuity = {
     shot,
     scene: visionContext.scene || {},
     characters: visionContext.characters || [],
-    repairInstruction: `${continuityInstruction}${dialogueInstruction ? ` ${dialogueInstruction}` : ''}`,
+    repairInstruction: `${continuityInstruction}${dialogueInstruction ? ` ${dialogueInstruction}` : ''} ${behaviorGuardrail}`,
   });
   const finalPrompt = String(result || '').trim();
   if (!finalPrompt) throw new Error('[AgnesVideoGen] Vision Director returned an empty final Agnes prompt');
 
-  const providerPrompt = `${continuityInstruction} ${dialogueInstruction ? `${dialogueInstruction} ` : ''}${finalPrompt}`.trim();
+  const providerPrompt = `${continuityInstruction} ${behaviorGuardrail} ${dialogueInstruction ? `${dialogueInstruction} ` : ''}${finalPrompt}`.trim();
 
   // Persist the EXACT string that will be passed to the Agnes HTTP request.
   // This is intentionally after all Vision Director/continuity composition.

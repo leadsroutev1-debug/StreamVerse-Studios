@@ -183,12 +183,24 @@ function _build3030RecoveryPrompt(originalPrompt, attempt) {
  * @param {string}   prompt              Full image prompt
  * @param {string[]} referenceImageUrls  Character reference portrait URLs (up to 4)
  * @param {number|null} seed             Unused — worker handles internally
- * @param {string|null} negativePrompt   Unused — not supported by worker protocol
+ * @param {string|null} negativePrompt   Optional caller-supplied visual exclusion terms; embedded into the prompt because Klein 9B does not expose a separate negative_prompt field
  * @param {Array<{name:string, reference_index:number, position?:string, action?:string}>} [characterMap]
  *   Dynamic reference-index → character identity mapping, built by the caller
  *   from whichever characters are actually present in the current scene.
  * @returns {Buffer} Raw image bytes (JPEG/PNG/WebP)
  */
+const FLUX_STILL_NEGATIVE_CONSTRAINTS = [
+  'no motion blur', 'no ghosting', 'no temporal smear', 'no double exposure',
+  'no duplicate limbs', 'no extra arms', 'no extra legs', 'no extra fingers',
+  'no missing fingers', 'no fused hands', 'no malformed hands', 'no warped anatomy',
+  'no stretched limbs', 'no melted facial features', 'no duplicate faces',
+  'no merged characters', 'no hybrid faces', 'no face morphing', 'no identity swapping',
+  'no age drift', 'no hairstyle substitution', 'no wardrobe substitution',
+  'no duplicate people', 'no extra people', 'no phantom objects', 'no duplicated props',
+  'no floating props', 'no warped background geometry', 'no fisheye distortion',
+  'no split panels', 'no collage', 'no text', 'no subtitles', 'no logos', 'no watermark',
+].join(', ');
+
 async function generateImage(prompt, referenceImageUrls = [], seed = null, negativePrompt = null, characterMap = []) {
   const urlCount = config.cfWorkerUrls.length;
   const keyCount = config.cfWorkerKeys.length;
@@ -210,6 +222,11 @@ async function generateImage(prompt, referenceImageUrls = [], seed = null, negat
 
   let lastError;
   let currentPrompt = String(prompt || '').trim();
+  const callerNegative = String(negativePrompt || '').trim();
+  const effectiveNegative = [callerNegative, FLUX_STILL_NEGATIVE_CONSTRAINTS].filter(Boolean).join(', ');
+  if (effectiveNegative && !/FLUX-STILL-NEGATIVE-CONSTRAINTS/i.test(currentPrompt)) {
+    currentPrompt = `${currentPrompt}\n\nFLUX-STILL-NEGATIVE-CONSTRAINTS: ${effectiveNegative}`.trim();
+  }
   let safetyRetries = 0;
 
   // Outer loop: rotate through worker URLs on quota exhaustion.

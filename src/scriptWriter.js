@@ -202,9 +202,11 @@ DO NOT specify any of the following in your script:
   - "ffmpeg_effects" block (removed — no longer needed)
   - "composition" layout (removed — all scenes use basic "cut" concatenation)
 
-The visual style of each shot is conveyed through the "image_prompt" field, which
-${_VIDEO_BACKEND_NAME}'s video model interprets during generation. Focus on describing the
-cinematic look, camera movement, lighting, and atmosphere in the image_prompt.`;
+The visual style of each shot is conveyed through the "image_prompt" field as a FROZEN STILL FRAME only.
+The still-image model receives this field before video generation. Focus on frozen composition, subject identity,
+pose, eyeline, spatial relationships, framing, lighting, palette, environment and atmosphere.
+Camera movement, subject motion, dialogue, temporal progression, travel beats, animation, audio and end-state
+changes belong only to the downstream video prompt fields and MUST NOT be placed in image_prompt.`;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Multi-Scene Narrative Continuity Schema
@@ -397,10 +399,13 @@ ${IS_AGNES_PROVIDER ? AGNES_CONVERSATIONAL_RULES : ''}
 3. VISUAL STAGING — MASTER SPATIAL CONTRACT
    - characters_in_shot must include every visible speaking and listening character.
    - character_staging must contain exactly one row for every visible character. Each row must specify:
-     screen_position, depth, facing/facing_toward, action/observable_action, pose, eyeline/gaze,
-     interaction, speaking, and a short visual_identity disambiguator.
+     screen_position, depth, facing/facing_toward, a STATIC physical state or contact/prop relationship,
+     pose, eyeline/gaze, interaction, speaking, and a short visual_identity disambiguator.
+   - The staging "action" field is a FROZEN PHYSICAL STATE, never a movement instruction. Prefer
+     "right hand resting on the table" or "standing with both feet planted" over "reaches for the table"
+     or "walks toward the table."
    - Build the frozen opening image from character_staging. The image_prompt must visibly realize the exact
-     same screen position, depth, pose, eyeline, facing direction and interaction for every character.
+     same screen position, depth, pose, eyeline, facing direction and static interaction for every character.
    - The downstream video prompt must reuse this same spatial map. Do not invent a second spatial layout.
 
 4. CONTINUITY
@@ -411,8 +416,11 @@ ${IS_AGNES_PROVIDER ? AGNES_CONVERSATIONAL_RULES : ''}
    - When the context genuinely changes, establish the new geography and causal transition; characters do not teleport.
 
 5. STILL / VIDEO BOUNDARY
-   - image_prompt = one exact frozen visual opening frame.
-   - dialogue_or_action, subject_motion, camera_movement, end-frame progression and ambience belong downstream.
+   - image_prompt = one exact frozen visual opening frame and NOTHING ELSE.
+   - image_prompt must contain zero movement instructions, temporal language, dialogue, audio, camera movement,
+     travel instructions, end-state progression, or animation language.
+   - dialogue_or_action, subject_motion, camera_movement, temporal_arc, travel stages, route beats, end-frame
+     progression and ambience belong exclusively downstream to the video-generation branch.
    - Only spoken words are quoted. All descriptive staging remains unquoted.
 
 6. TRAVEL INTEGRITY
@@ -2632,7 +2640,7 @@ const SHOT_SCHEMA = `{
       "route_beat": "Concrete visible movement that changes physical position during this shot, or empty if stationary.",
       "scene_environment": "The most narratively important environmental context visible in this shot",
       "pose_state": "standing|sitting|walking|running|leaning|crouching|lying|turning|reaching|fighting",
-      "image_prompt": "STILL-FRAME prompt for the Cloudflare image model. Build the single frozen opening frame directly from character_staging. Explicitly describe each visible character's exact screen position, depth, pose, eyeline, facing direction, visible action and interaction, then framing, camera viewpoint, lighting, palette, environment and atmosphere. The image MUST depict the same spatial map that LTX will animate. NEVER write speaking, talking, lips moving, dialogue delivery, camera movement, animation, audio, or temporal instructions. 9:16 vertical, 768x1365, photorealistic 4K cinematic. Character identity comes from supplied reference images; do not invent alternate physical descriptions.",
+      "image_prompt": "STILL-FRAME prompt for the Cloudflare FLUX.2 image model. Describe ONE settled opening frame only: exact visible characters, immutable identity cues supplied by references, screen position, depth, frozen pose, facing, eyeline, static hand/prop contact, framing, fixed viewpoint, lighting, palette, environment and atmosphere. The staging action field must describe a frozen physical state, never a movement. NEVER write speaking, talking, lips moving, dialogue delivery, camera movement, animation, audio, temporal progression, travel instructions, motion verbs or end-frame transitions. 9:16 vertical photorealistic cinematic frame. Character identity comes from supplied reference images; do not invent alternate physical descriptions.",
       "duration": 10,
       "clip_duration": 9,
       "shot_pacing_type": "hook|action|reaction|broll_cutaway|dialogue_mid|dialogue_full|slow_dramatic|establishing",
@@ -3201,6 +3209,9 @@ ${SHOT_SCHEMA}`;
 
     const orderedShots = result.shots.map(shot => {
       const sanitizedShot = _sanitizeDialogueOrActionSemantics({ ...shot });
+      if (typeof sanitizedShot.image_prompt === 'string') {
+        sanitizedShot.image_prompt = _sanitizeStillImagePromptText(sanitizedShot.image_prompt);
+      }
       const normalizedStaging = shotStaging.getShotCharacterStaging(sanitizedShot, []);
       sanitizedShot.character_staging = normalizedStaging;
       sanitizedShot.character_positions = normalizedStaging.length
@@ -3339,6 +3350,20 @@ Return JSON:
  * provider-agnostic: it can fill missing fields without requiring a source-code
  * edit for every new edge case discovered in production.
  */
+function _sanitizeStillImagePromptText(text) {
+  const raw = String(text || '').trim();
+  if (!raw) return '';
+  const blockedSentence = /\b(?:animate|animation|animated|camera\s+(?:moves?|push(?:es|ing)?|pull(?:s|ing)?|pans?|tilts?|cranes?|zooms?|tracks?)|dolly|tracking shot|walking|walks|running|runs|turning|turns|reaching|reaches|approaching|approaches|stepping|steps|moving|moves|movement|speaking|speaks|talking|talks|dialogue|lip[- ]?sync|voice[- ]?over|voiceover|audio|temporal|over time|then begins|continues to)\b/i;
+  return raw
+    .split(/(?<=[.!?])\s+|\n+/)
+    .map(sentence => sentence.trim())
+    .filter(Boolean)
+    .filter(sentence => !blockedSentence.test(sentence))
+    .join(' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
 async function repairShotForRetry({ shot, storyline, previousShot = null, error = '', failedPrompt = null, attempt = 1, maxRetries = 3 }) {
   const safeShot = shot && typeof shot === 'object' ? shot : {};
   const systemPrompt = `${DIRECTOR_PERSONA}
@@ -3427,14 +3452,9 @@ Do not add keys outside this patch schema.`;
   const n = Number(sanitized.duration);
   sanitized.duration = Number.isFinite(n) ? Math.max(8, Math.min(10, Math.round(n))) : 10;
 
-  // Never let the repair introduce explicit video/audio instructions into the still prompt.
-  // Keep ordinary visible pose words intact (e.g. "standing", "walking pose") because those
-  // can describe a single frozen frame. Remove only unmistakable temporal/meta directives.
+  // Never let retry repair reintroduce video/temporal language into the still prompt.
   if (typeof sanitized.image_prompt === 'string') {
-    sanitized.image_prompt = sanitized.image_prompt
-      .replace(/\b(?:use this image|animate this image|camera moves?[^.]*|lips? moving[^.]*|is speaking[^.]*|is talking[^.]*|delivers? dialogue[^.]*|voice(?:over)?[^.]*|audio[^.]*|says aloud[^.]*)/gi, ' ')
-      .replace(/\s{2,}/g, ' ')
-      .trim();
+    sanitized.image_prompt = _sanitizeStillImagePromptText(sanitized.image_prompt);
   }
 
   return sanitized;

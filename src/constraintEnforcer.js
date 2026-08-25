@@ -239,25 +239,9 @@ function _validateDirectiveCompliance(shot, imagePrompt) {
     });
   }
 
-  // Check for temporal directive
-  if (shot._temporal_directive && !promptText.includes('temporal consistency')) {
-    violations.push({
-      type: 'directive_missing',
-      severity: SEVERITY.LOW,
-      message: 'Temporal consistency directive was missing from the prompt',
-      correction: shot._temporal_directive,
-    });
-  }
-
-  // Check for camera simulation directive
-  if (shot._camera_sim?.promptFragment && !promptText.includes('camera simulation')) {
-    violations.push({
-      type: 'directive_missing',
-      severity: SEVERITY.LOW,
-      message: 'Camera simulation directive was missing from the prompt',
-      correction: shot._camera_sim.promptFragment,
-    });
-  }
+  // NEVER inject temporal/camera simulation instructions into a FLUX still prompt.
+  // Those directives belong exclusively to the downstream video branch.
+  // The still branch validates only visual/static continuity and structural requirements.
 
   return violations;
 }
@@ -273,6 +257,12 @@ function _validateDirectiveCompliance(shot, imagePrompt) {
  * @param {Array}  violations      - Violations from all validation passes
  * @returns {string} The corrected prompt for the next generation attempt
  */
+function _isStillSafeCorrection(correction = '') {
+  const text = String(correction || '').trim();
+  if (!text) return false;
+  return !/\b(?:camera\s+(?:moves?|movement|push|pull|pan|tilt|crane|zoom|track)|animate|animation|motion|moving|movement|walk(?:ing)?|run(?:ning)?|turn(?:ing)?|reach(?:ing)?|approach(?:ing)?|travel|choreograph|temporal|over time|route beat|spoken dialogue|lip[- ]?sync|audio|voice[- ]?over)\b/i.test(text);
+}
+
 function _buildCorrectedPrompt(originalPrompt, violations) {
   const parts = [originalPrompt || ''];
 
@@ -283,7 +273,7 @@ function _buildCorrectedPrompt(originalPrompt, violations) {
   });
 
   for (const v of sorted) {
-    if (v.correction) {
+    if (v.correction && _isStillSafeCorrection(v.correction)) {
       const prefix = v.severity === SEVERITY.HIGH
         ? `⚠️ MANDATORY CORRECTION (${v.type}):`
         : v.severity === SEVERITY.MEDIUM
@@ -354,7 +344,7 @@ function _validateDirectorialState(shot, prevShot = null) {
         type: 'teleport',
         severity: SEVERITY.HIGH,
         message: `Shot is ${stage} but its opening state appears to place the character at the destination.`,
-        correction: `Show the true ${stage} state from ${origin || 'the origin'} before the destination is reached.`,
+        correction: `Render the true frozen ${stage} opening state from ${origin || 'the origin'}; do not show the destination as the opening frame.`,
       });
     }
 
@@ -363,7 +353,7 @@ function _validateDirectorialState(shot, prevShot = null) {
         type: 'travel',
         severity: SEVERITY.MEDIUM,
         message: 'Transit shot has no route beat.',
-        correction: `Describe a concrete physical movement between ${origin} and ${destination}.`,
+        correction: `Render a frozen in-transit state between ${origin} and ${destination}; do not depict the movement itself.`,
       });
     }
 
@@ -385,7 +375,7 @@ function _validateDirectorialState(shot, prevShot = null) {
         type: 'teleport',
         severity: SEVERITY.HIGH,
         message: `Location jumps from "${prevLoc}" to "${nextLoc}" without a transition stage.`,
-        correction: `Use departure/transit/approach/arrival choreography from ${prevLoc} to ${nextLoc}.`,
+        correction: `Render a frozen, spatially consistent opening state appropriate to the current location transition from ${prevLoc} to ${nextLoc}; do not depict the travel motion itself.`,
       });
     }
   }
