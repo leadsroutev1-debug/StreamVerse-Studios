@@ -2787,6 +2787,7 @@ function _buildInitialUser({
   intent,
   scene,
   characterHints,
+  visibleCharacterNames = [],
   repairInstruction,
   previousDescription,
   sourceLines,
@@ -3494,6 +3495,7 @@ async function describeForLTX({
             intent,
             scene,
             characterHints,
+            visibleCharacterNames,
             repairInstruction:
               currentRepairInstruction,
             previousDescription,
