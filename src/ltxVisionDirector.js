@@ -1713,17 +1713,36 @@ function _dialogueBeatRegistry(value, options = {}) {
   return _normalizeAuthoredDialogueInput(value, options);
 }
 
-function _formatDialogueBeatRegistry(beats) {
+function _formatDialogueBeatRegistry(beats, visibleCharacters = []) {
   if (!beats.length) {
     return 'No speaker identity was explicitly supplied. Infer the intended speaker from the shot intent and visible staging, but assign each authored line to ONE character only.';
   }
+
+  const visible = [...new Set(
+    (Array.isArray(visibleCharacters) ? visibleCharacters : [])
+      .map(value => _isPlainObject(value)
+        ? _cleanText(value.name || value.character || value.character_name || '')
+        : _cleanText(value)
+      )
+      .filter(Boolean)
+  )];
 
   return beats.map((beat, index) => {
     const speaker = beat.speaker
       ? beat.speaker
       : 'SPEAKER NOT EXPLICITLY NAMED — infer exactly one intended speaker from shot intent';
 
-    return `${index + 1}. SPEAKER: ${speaker}. SPOKEN LINE: "${beat.line}".`;
+    const listeners = visible.filter(
+      name => !_speakerNameMatches(name, beat.speaker || '')
+    );
+
+    return [
+      `${index + 1}. ACTIVE SPEAKER: ${speaker}.`,
+      `SPOKEN LINE: "${beat.line}".`,
+      'ONLY THIS CHARACTER MAY ARTICULATE, MOUTH, OR LIP-SYNC THIS EXACT LINE.',
+      listeners.length ? `SILENT LISTENERS FOR THIS BEAT: ${listeners.join(', ')}.` : '',
+      'KEEP THIS TURN DISTINCT FROM THE NEXT SPEAKER TURN.',
+    ].filter(Boolean).join(' ');
   }).join(' ');
 }
 
@@ -2379,7 +2398,197 @@ function _removeDuplicateAuthoredDialogue(
  * 4. The same authored line may NOT appear twice.
  * 5. Unrelated/generated dialogue may occur before or between authored lines.
  */
-function _dialogueIntegrity(sourceLines, description, dialogueBeats = []) {
+
+function _speakerMentionedNear(description, speaker, quoteIndex, windowSize = 420) {
+  const before = String(description || '')
+    .slice(Math.max(0, Number(quoteIndex) - windowSize), Number(quoteIndex))
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  for (const alias of _speakerAliases(speaker)) {
+    if (new RegExp(`\\b${_escapeRegex(alias)}\\b`, 'i').test(before)) return true;
+  }
+  return false;
+}
+
+
+function _normalizeSpeakerForValidation(value) {
+  return _cleanText(value)
+    .toLowerCase()
+    .replace(/[’']/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function _speakerNameMatches(actual, expected) {
+  const a = _normalizeSpeakerForValidation(actual);
+  const e = _normalizeSpeakerForValidation(expected);
+  if (!a || !e) return false;
+  if (a === e) return true;
+  return a.includes(e) || e.includes(a);
+}
+
+function _speakerAliases(name) {
+  const raw = _cleanText(name);
+  if (!raw) return [];
+  const parts = raw.split(/\s+/).filter(Boolean);
+  const set = new Set([raw]);
+  if (parts.length >= 2) {
+    set.add(parts[0]);
+    set.add(parts[parts.length - 1]);
+  }
+  return [...set];
+}
+
+function _speakerPerformanceNear(description, speaker, quoteIndex) {
+  const before = String(description || '')
+    .slice(Math.max(0, Number(quoteIndex) - 420), Number(quoteIndex))
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  for (const alias of _speakerAliases(speaker)) {
+    const escaped = _escapeRegex(alias);
+    const patterns = [
+      new RegExp(`\\b${escaped}\\b[^.!?]{0,220}\\b(?:says?|speaks?|replies?|answers?|asks?|whispers?|shouts?|calls?|mutters?|murmurs?|declares?|insists?|interrupts?|articulates?)\\b[^.!?]{0,160}$`, 'i'),
+      new RegExp(`\\b${escaped}\\b\\s*:\\s*[^\\n]{0,220}$`, 'i'),
+      new RegExp(`\\b${escaped}\\b[^.!?]{0,220}\\b(?:mouth|lips?|articulates?|speaking|speaks|talks?|talking)\\b[^.!?]{0,160}$`, 'i'),
+    ];
+    if (patterns.some(re => re.test(before))) return true;
+  }
+  return false;
+}
+
+function _listenerSpeakingNear(description, listener, quoteStart, quoteEnd, authoritativeSpeaker) {
+  const region = String(description || '').slice(
+    Math.max(0, Number(quoteStart) - 420),
+    Math.min(String(description || '').length, Number(quoteEnd) + 220)
+  );
+
+  for (const alias of _speakerAliases(listener)) {
+    const escaped = _escapeRegex(alias);
+    const speaking = new RegExp(
+      `\\b${escaped}\\b[^.!?]{0,240}\\b(?:says?|speaks?|replies?|answers?|asks?|whispers?|shouts?|calls?|mutters?|murmurs?|declares?|insists?|interrupts?|articulates?|speaking|speaks|talks?|talking)\\b`,
+      'i'
+    );
+    if (!speaking.test(region)) continue;
+
+    // If the authoritative speaker is clearly named around the same beat,
+    // listener speech is still a contradiction because this line has one owner.
+    const ownerClear = _speakerPerformanceNear(region, authoritativeSpeaker, region.length);
+    if (!ownerClear || !_speakerNameMatches(listener, authoritativeSpeaker)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function _speakerAttributionDiagnostics(description, dialogueBeats, visibleCharacters = []) {
+  const visible = [...new Set(
+    (Array.isArray(visibleCharacters) ? visibleCharacters : [])
+      .map(value => _isPlainObject(value)
+        ? _cleanText(value.name || value.character || value.character_name || '')
+        : _cleanText(value))
+      .filter(Boolean)
+  )];
+
+  const diagnostics = [];
+  for (const beat of dialogueBeats || []) {
+    if (!beat?.speaker || !beat?.line) continue;
+
+    const occurrence = _bestSemanticDialogueOccurrence(
+      description,
+      beat.line,
+      { quotedOnly: true }
+    );
+
+    if (!occurrence) continue;
+
+    const speakerFound = _speakerMentionedNear(
+      description,
+      beat.speaker,
+      occurrence.index,
+      420
+    );
+
+    const speakerPerformanceFound = _speakerPerformanceNear(
+      description,
+      beat.speaker,
+      occurrence.index
+    );
+
+    const listenerContradictions = visible
+      .filter(name => !_speakerNameMatches(name, beat.speaker))
+      .filter(name =>
+        _listenerSpeakingNear(
+          description,
+          name,
+          occurrence.index,
+          occurrence.index + occurrence.length,
+          beat.speaker
+        )
+      );
+
+    diagnostics.push({
+      speaker: beat.speaker,
+      line: beat.line,
+      speakerFound,
+      speakerPerformanceFound,
+      listenerContradictions,
+      valid: speakerPerformanceFound && listenerContradictions.length === 0,
+    });
+  }
+
+  return {
+    diagnostics,
+    invalid: diagnostics.filter(d => !d.valid),
+    valid: diagnostics.every(d => d.valid),
+  };
+}
+
+function _speakerAttributionRepairInstruction(diagnostics, visibleCharacters = []) {
+  const invalid = (diagnostics || []).filter(d => !d.valid);
+  if (!invalid.length) return '';
+
+  const visible = [...new Set(
+    (Array.isArray(visibleCharacters) ? visibleCharacters : [])
+      .map(value => _isPlainObject(value)
+        ? _cleanText(value.name || value.character || value.character_name || '')
+        : _cleanText(value))
+      .filter(Boolean)
+  )];
+
+  const corrections = invalid.map((d, i) => {
+    const listenerText = d.listenerContradictions?.length
+      ? ` These characters were incorrectly described as speaking during the same beat: ${d.listenerContradictions.join(', ')}.`
+      : '';
+
+    return [
+      `ATTRIBUTION ERROR ${i + 1}.`,
+      `The exact authored line "${d.line}" belongs ONLY to ${d.speaker}.`,
+      d.speakerPerformanceFound
+        ? ''
+        : `${d.speaker} must be explicitly named immediately before or during the speaking action.`,
+      listenerText,
+      `${d.speaker} is the only character permitted to articulate, mouth, or lip-sync that line.`,
+      `Every other visible character must be explicitly silent for that beat, with mouths closed or naturally still.`,
+    ].filter(Boolean).join(' ');
+  }).join(' ');
+
+  return [
+    'TARGETED SPEAKER-ATTRIBUTION RETRY.',
+    'This is NOT a request to remove or split a legitimate multi-speaker exchange.',
+    'Preserve all authored lines, their original order, the existing camera/composition, character identities, wardrobe, props, lighting and physical blocking.',
+    'Repair only the speaker-to-line performance mapping.',
+    'Each authored line has exactly one active speaker.',
+    'A later authored line may belong to another character; preserve the turn-taking sequence.',
+    'Never use vague pronouns such as they, both, the pair, or the characters for a speaking action.',
+    'Name the active speaker, give their frame position/orientation, bind the exact spoken words to them, then explicitly describe the other visible characters as silent listeners/reactions.',
+    corrections,
+    'Return the complete ltx_shot_description as one natural chronological description.',
+  ].filter(Boolean).join(' ');
+}
+
+function _dialogueIntegrity(sourceLines, description, dialogueBeats = [], visibleCharacters = []) {
   const required = (sourceLines || [])
     .map(_canonicalDialogueLine)
     .filter(Boolean);
@@ -2428,23 +2637,27 @@ function _dialogueIntegrity(sourceLines, description, dialogueBeats = []) {
   const order = _dedupePreserveOrder(outOfOrder);
   const duplicates = _dedupePreserveOrder(duplicateLines);
 
-  /* If an authored beat has an explicit speaker, verify that the surrounding
-   * description contains that speaker before its matching quote. We never use
-   * this as a hard failure; it is diagnostic guidance for repair only. */
-  const speakerDiagnostics = (dialogueBeats || []).map((beat, idx) => ({
-    index: idx,
-    speaker: _cleanText(beat.speaker),
-    line: _canonicalDialogueLine(beat.line),
-    speakerFound: beat.speaker
-      ? new RegExp(_escapeRegex(beat.speaker), 'i').test(description || '')
-      : true,
-  }));
+  /*
+   * Speaker ownership is deliberately a RETRY signal, not a fatal error.
+   * Multi-speaker shots are valid. We only ask the Vision Director for another
+   * pass when the prose fails to bind an authored line to its one intended
+   * physical performer or describes another visible character speaking during
+   * that exact beat.
+   */
+  const speakerPerformance = _speakerAttributionDiagnostics(
+    description,
+    dialogueBeats,
+    visibleCharacters
+  );
 
   return {
     outputLines: output.map(m => m.text),
     missingLines: missing,
     outOfOrder: order,
     duplicateLines: duplicates,
+    speakerDiagnostics: speakerPerformance.diagnostics,
+    speakerAttributionInvalid: speakerPerformance.invalid,
+    speakerAttributionValid: speakerPerformance.valid,
     authoredOutputPositions: matchedRequired.map(m => ({
       line: m.output,
       index: m.outputIndex,
@@ -2460,9 +2673,9 @@ function _dialogueIntegrity(sourceLines, description, dialogueBeats = []) {
 /* Never let a malformed repair response terminate the pipeline merely because
  * it uses screenplay/meta prose inside the quoted repair text. The final shot
  * is accepted only when all authored beats are semantically recoverable. */
-function _recoverDialogueIntegrity(sourceLines, description, dialogueBeats = []) {
+function _recoverDialogueIntegrity(sourceLines, description, dialogueBeats = [], visibleCharacters = []) {
   const cleaned = _sanitizeNonDialogueQuotes(description, sourceLines);
-  const integrity = _dialogueIntegrity(sourceLines, cleaned, dialogueBeats);
+  const integrity = _dialogueIntegrity(sourceLines, cleaned, dialogueBeats, visibleCharacters);
   if (integrity.valid) return { accepted: true, description: cleaned, integrity };
 
   /* A common Mistral failure is a single quoted block containing all authored
@@ -2474,7 +2687,7 @@ function _recoverDialogueIntegrity(sourceLines, description, dialogueBeats = [])
     if (occurrence) semanticHits.push(occurrence);
   }
   if (semanticHits.length === sourceLines.length) {
-    const rechecked = _dialogueIntegrity(sourceLines, cleaned, dialogueBeats);
+    const rechecked = _dialogueIntegrity(sourceLines, cleaned, dialogueBeats, visibleCharacters);
     if (rechecked.missingLines.length === 0 && rechecked.outOfOrder.length === 0) {
       return { accepted: true, description: cleaned, integrity: rechecked };
     }
@@ -2612,6 +2825,7 @@ function _buildInitialUser({
           'Do not create a separate dialogue list or dialogue block in addition to the cinematic action.',
 
           'Each authored line belongs to exactly ONE named speaker. Never let two characters share, echo, lip-sync, mouth, or visibly perform the same line.',
+          'MULTI-SPEAKER SHOTS ARE VALID AND EXPECTED: when the authoritative speaker registry contains multiple speakers, keep all authored turns in the same shot unless the shot intent explicitly requires a cut. Preserve chronological turn-taking: speaker A performs line A, speaker B performs line B, speaker A may then perform line C, and so on.',
           'For every authored line, explicitly direct WHO is speaking before the spoken words: identify the character by name and make that character the only active speaker.',
           'Describe the speaker’s exact screen position and orientation at the moment of speech (for example: left foreground, center-right midground, seated behind the table, three-quarter profile facing camera-left), plus the listener positions around them.',
           'Describe each visible character separately: identity, screen position, body orientation, head direction, eyeline, posture, and whether they are SPEAKING or LISTENING.',
@@ -2621,7 +2835,7 @@ function _buildInitialUser({
           'When multiple characters are visible, anchor them left/right/foreground/background relative to the frame so their identities cannot be swapped during generation.',
 
           'AUTHORITATIVE SPEAKER-BEAT REGISTRY:',
-          _formatDialogueBeatRegistry(dialogueBeats),
+          _formatDialogueBeatRegistry(dialogueBeats, visibleCharacterNames),
 
           'Quotation marks may surround only audible speech.',
           'Do not quote written text, labels, screens, UI, names, captions, internal thoughts, actions, emotions, camera movement, atmosphere or sound effects.',
@@ -2649,10 +2863,17 @@ function _buildInitialUser({
         scene.emotional_beat || '',
     }),
 
-    'LOCKED CHARACTER HINTS:',
-    JSON.stringify(
-      characterHints
-    ),
+    'LOCKED CHARACTER HINTS — EXHAUSTIVE PER-CHARACTER MAP:',
+    JSON.stringify(characterHints, null, 2),
+
+    'CHARACTER-BY-CHARACTER PERFORMANCE MAP:',
+    JSON.stringify({
+      visible_characters: visibleCharacterNames,
+      character_staging: intent.character_staging || [],
+      character_positions: intent.character_positions || '',
+      speakers_in_shot: intent.speakers_in_shot || [],
+      rule: 'Describe every visible character separately. State identity, hair/face-defining traits, wardrobe, accessories, carried props, screen position, depth, facing, eyeline, posture, interaction, and whether that character is SPEAKING or LISTENING for each dialogue beat.'
+    }, null, 2),
 
     'DIALOGUE REQUIREMENT:',
     dialogueRequirement,
@@ -2925,6 +3146,37 @@ function _buildIntent({
       )
         ? shot.characters_in_shot
         : [],
+
+    character_staging:
+      Array.isArray(shot.character_staging)
+        ? shot.character_staging
+        : [],
+
+    character_positions:
+      shot.character_positions || '',
+
+    speakers_in_shot:
+      Array.isArray(shot.speakers_in_shot)
+        ? shot.speakers_in_shot
+        : [],
+
+    start_frame_state:
+      shot.start_frame_state || '',
+
+    end_frame_state:
+      shot.end_frame_state || '',
+
+    temporal_arc:
+      shot.temporal_arc || '',
+
+    subject_motion:
+      shot.subject_motion || '',
+
+    ambient_motion:
+      shot.ambient_motion || '',
+
+    pose_state:
+      shot.pose_state || '',
   };
 }
 
@@ -3016,27 +3268,41 @@ async function describeForLTX({
   const characterHints =
     (characters || [])
       .filter(character => {
-        const name =
-          String(
-            character.name || ''
-          ).toLowerCase();
-
-        return intent.characters_in_shot.some(
-          requested =>
-            String(
-              requested || ''
-            ).toLowerCase() === name
+        const name = String(character.name || '').toLowerCase();
+        return intent.characters_in_shot.some(requested =>
+          String(_isPlainObject(requested)
+            ? requested.name || requested.character || requested.character_name || ''
+            : requested || ''
+          ).toLowerCase() === name
         );
       })
-      .map(character => ({
-        name:
-          character.name,
+      .map(character => {
+        const staging = (intent.character_staging || []).find(item =>
+          _isPlainObject(item) &&
+          String(item.name || '').toLowerCase() === String(character.name || '').toLowerCase()
+        ) || {};
 
-        visual_anchor:
-          character.visual_anchor ||
-          character.description ||
-          '',
-      }));
+        return {
+          name: character.name,
+          visual_anchor: character.visual_anchor || character.visual_profile || character.description || '',
+          visual_profile: character.visual_profile || character.visual_anchor || character.description || '',
+          appearance: character.appearance || character.physical_description || character.description || '',
+          wardrobe: character.wardrobe || character.costume || character.clothing || '',
+          signature_features: character.signature_features || character.distinguishing_features || '',
+          carried_props: character.carried_props || character.props || '',
+          voice_identity: character.voice_identity || character.voice_profile || '',
+          shot_staging: staging,
+        };
+      });
+
+  const visibleCharacterNames = [...new Set(
+    (intent.characters_in_shot || [])
+      .map(value => _cleanText(_isPlainObject(value)
+        ? value.name || value.character || value.character_name || ''
+        : value))
+      .filter(Boolean)
+  )];
+
 
   /*
    * AUTHORITATIVE DIALOGUE REGISTRY.
@@ -3131,6 +3397,8 @@ async function describeForLTX({
     'The final prompt must preserve the current authored still as the settled opening state of the new shot. Do not replace the authored still with the previous frame or blend the two into one impossible composition.',
 
     'Cover character identity and staging, physical action, reactions, camera movement, environmental change, lighting evolution, sound or ambience when supported, vocal performance and the terminal visual state.',
+    'EXHAUSTIVE CHARACTER DESCRIPTION RULE: for every visible character, separately state identity-defining face/hair traits, wardrobe and dressing, accessories, carried/touched props, screen position, depth, body orientation, head direction, eyeline, posture and interaction. Never merge two visible people into one generic subject description.',
+    'The locked character profile and shot-specific staging are authoritative. Do not invent alternate wardrobe, accessories, hair, physical traits or props.',
 
     'MULTI-CHARACTER CONTROL: inspect the actual pixels and identify visible humans, but only animate those with authored or clearly supported motion. Do not infer a requirement to animate every visible person.',
     'For each character who is actually moving, state the exact authored action and keep all other characters stable or minimally reactive.',
@@ -3351,6 +3619,15 @@ async function describeForLTX({
           description
         );
 
+        _safeLog(
+          '[LTXVision] SPEAKER PERFORMANCE DIAGNOSTICS:',
+          _speakerAttributionDiagnostics(
+            description,
+            dialogueBeats,
+            visibleCharacterNames
+          )
+        );
+
         /*
          * Final semantic integrity check.
          */
@@ -3358,11 +3635,45 @@ async function describeForLTX({
           _recoverDialogueIntegrity(
             sourceLines,
             description,
-            dialogueBeats
+            dialogueBeats,
+            visibleCharacterNames
           );
 
         description = recovery.description;
         const integrity = recovery.integrity;
+
+        const speakerRetryInstruction =
+          integrity.speakerAttributionInvalid?.length
+            ? _speakerAttributionRepairInstruction(
+                integrity.speakerAttributionInvalid,
+                visibleCharacterNames
+              )
+            : '';
+
+        if (speakerRetryInstruction) {
+          previousDescription = description;
+          currentRepairInstruction = speakerRetryInstruction;
+
+          console.warn(
+            `[LTXVision] speaker attribution requires targeted retry | ` +
+            `invalidBeats=${integrity.speakerAttributionInvalid.length}`
+          );
+
+          if (repairAttempt < MAX_TARGETED_REPAIRS_PER_KEY) {
+            continue;
+          }
+
+          /*
+           * Speaker attribution remains a quality/retry condition rather than a
+           * fatal validation error. We have exhausted targeted repair for this
+           * key, so preserve the complete multi-speaker description instead of
+           * collapsing the scene or failing the pipeline.
+           */
+          console.warn(
+            '[LTXVision] speaker attribution retry budget exhausted; accepting semantically complete multi-speaker description'
+          );
+          return description;
+        }
 
         if (
           recovery.accepted || integrity.valid
@@ -3454,7 +3765,7 @@ async function describeForLTX({
 
           if (semanticallyComplete) {
             const cleaned = _sanitizeNonDialogueQuotes(description, sourceLines);
-            const finalIntegrity = _dialogueIntegrity(sourceLines, cleaned, dialogueBeats);
+            const finalIntegrity = _dialogueIntegrity(sourceLines, cleaned, dialogueBeats, visibleCharacters);
             if (finalIntegrity.missingLines.length === 0 && finalIntegrity.outOfOrder.length === 0) {
               console.warn('[LTXVision] duplicate-only validation warning recovered; accepting semantic-complete shot');
               return cleaned;
@@ -3569,6 +3880,8 @@ module.exports = {
   _findDialogueOccurrence,
   _dialogueIntegrity,
   _dialogueBeatRegistry,
+  _speakerAttributionDiagnostics,
+  _speakerAttributionRepairInstruction,
   _formatDialogueBeatRegistry,
   _extractAtomicQuotedBeats,
   _normalizeAuthoredDialogueInput,
