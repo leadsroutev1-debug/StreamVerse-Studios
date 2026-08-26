@@ -334,7 +334,7 @@ INTER-SCENE HOOK:
   End each scene with a meaningful unresolved visual or narrative turn that can live inside the full temporal canvas: revelation, decision, threat, silence, reversal, arrival, discovery, or environmental change.
 
 FORBIDDEN:
-  - Do not set duration to 4 or 5 as a fake fallback. Use 10 as the raw intended duration because the StreamVerse planner clamps safely downstream and the pipeline will clamp safely.
+  - Do not use an artificial 4-5 second fallback. Use the active provider canvas defined above; Agnes may use up to 18 seconds, while LTX remains capped at 10 seconds.
   - Do not make every shot a close-up of a speaking character. Use environment, objects, architecture, background action, and spatial geography.
   - Do not repeat the same environmental detail across consecutive shots unless continuity requires it.
 `;
@@ -2641,8 +2641,8 @@ const SHOT_SCHEMA = `{
       "scene_environment": "The most narratively important environmental context visible in this shot",
       "pose_state": "standing|sitting|walking|running|leaning|crouching|lying|turning|reaching|fighting",
       "image_prompt": "STILL-FRAME prompt for the Cloudflare FLUX.2 image model. Describe ONE settled opening frame only: exact visible characters, immutable identity cues supplied by references, screen position, depth, frozen pose, facing, eyeline, static hand/prop contact, framing, fixed viewpoint, lighting, palette, environment and atmosphere. The staging action field must describe a frozen physical state, never a movement. NEVER write speaking, talking, lips moving, dialogue delivery, camera movement, animation, audio, temporal progression, travel instructions, motion verbs or end-frame transitions. 9:16 vertical photorealistic cinematic frame. Character identity comes from supplied reference images; do not invent alternate physical descriptions.",
-      "duration": 10,
-      "clip_duration": 9,
+      "duration": ${_SCRIPT_MAX_DURATION},
+      "clip_duration": ${_SCRIPT_MAX_DURATION},
       "shot_pacing_type": "hook|action|reaction|broll_cutaway|dialogue_mid|dialogue_full|slow_dramatic|establishing",
       "narrative_complexity": "low|medium|high",
       "motion_level": "low|medium|high",
@@ -3041,8 +3041,8 @@ function _fallbackSceneShots(scene) {
       speaker_name: speaker || undefined,
       end_frame_transition: isLast ? `The scene holds on the final emotional state established by ${emotion}.` : 'The ending gaze and environmental state create a direct handoff into the next shot.',
       next_shot_continuity: isLast ? 'Carry the emotional state forward into the next scene.' : 'Inherit the established gaze, posture, light, environment and unresolved emotional beat.',
-      duration: 10,
-      clip_duration: 9,
+      duration: _SCRIPT_MAX_DURATION,
+      clip_duration: _SCRIPT_MAX_DURATION,
       _fallback_generated: true,
       _speech_guarded: Boolean(speaker),
       _speech_guard_reason: speaker ? 'deterministic-internal-monologue-fallback' : undefined,
@@ -3208,6 +3208,25 @@ ${SHOT_SCHEMA}`;
     }
 
     const orderedShots = result.shots.map(shot => {
+      // Normalize every authored shot duration at the writer boundary so a model
+      // cannot reintroduce the legacy 10-second value when Agnes is selected.
+      const authoredDuration = Number(shot?.duration);
+      const activeMaxDuration = _SCRIPT_MAX_DURATION;
+      const normalizedDuration = Number.isFinite(authoredDuration)
+        ? Math.max(1, Math.min(activeMaxDuration, Math.round(authoredDuration)))
+        : activeMaxDuration;
+      shot = {
+        ...shot,
+        duration: normalizedDuration,
+        clip_duration: normalizedDuration,
+      };
+
+      console.log(
+        `[ScriptWriter] Shot duration normalized | provider=${IS_AGNES_PROVIDER ? 'agnes' : 'ltx'} ` +
+        `requested=${Number.isFinite(authoredDuration) ? authoredDuration : 'missing'} ` +
+        `effective=${normalizedDuration}s max=${activeMaxDuration}s`
+      );
+
       const sanitizedShot = _sanitizeDialogueOrActionSemantics({ ...shot });
       if (typeof sanitizedShot.image_prompt === 'string') {
         sanitizedShot.image_prompt = _sanitizeStillImagePromptText(sanitizedShot.image_prompt);
@@ -3381,8 +3400,8 @@ SEMANTIC CONTRACT:
   lip movement, camera motion, audio, or instructions to an image model in image_prompt.
 - temporal_arc, subject_motion, environmental_story_beat, end_frame_transition and
   next_shot_continuity describe what happens over time and are never quoted.
-- duration must be an integer from 8 to 10 for LTX-first production unless a legitimate
-  provider constraint is explicitly present.
+- duration must respect the active provider contract: Agnes may use 1-18 seconds (18s maximum),
+  while LTX remains capped at 10 seconds. Do not impose an LTX duration rule on Agnes.
 - Keep one speaking character per shot.
 - Preserve character names and story continuity unless the error itself indicates a field is invalid.
 - The movie should remain engaging and strongly dialogue-forward when the scene naturally supports speech.
@@ -3419,7 +3438,7 @@ or should change to make the shot safely retryable. Preserve valid existing valu
   "image_prompt": "A vivid frozen-frame description for the still-image model only.",
   "dialogue_or_action": "Plain descriptive action, OR spoken dialogue with quoted spoken words, OR NAME (V.O.): unquoted internal voice-over thought.",
   "tts_mode": "spoken | ambient | phone_vo | internal_monologue",
-  "duration": 10,
+  "duration": ${_SCRIPT_MAX_DURATION},
   "temporal_arc": "A complete visual micro-arc from beginning state through development to end state.",
   "environmental_story_beat": "A concrete environmental event that matters to the scene.",
   "music_cue": "none | subtle | prominent",
@@ -3448,9 +3467,14 @@ Do not add keys outside this patch schema.`;
   // Apply the same semantic dialogue hygiene used in normal shot generation.
   const sanitized = _sanitizeDialogueOrActionSemantics(out);
 
-  // Normalize duration defensively; never let a repair return an unusable value.
-  const n = Number(sanitized.duration);
-  sanitized.duration = Number.isFinite(n) ? Math.max(8, Math.min(10, Math.round(n))) : 10;
+  // Normalize duration defensively against the ACTIVE provider contract.
+  // Agnes: max 18s. LTX: max 10s.
+  const requestedDuration = Number(sanitized.duration);
+  const providerMaxDuration = IS_AGNES_PROVIDER ? 18 : 10;
+  const providerMinDuration = 1;
+  sanitized.duration = Number.isFinite(requestedDuration)
+    ? Math.max(providerMinDuration, Math.min(providerMaxDuration, Math.round(requestedDuration)))
+    : _SCRIPT_MAX_DURATION;
 
   // Never let retry repair reintroduce video/temporal language into the still prompt.
   if (typeof sanitized.image_prompt === 'string') {
