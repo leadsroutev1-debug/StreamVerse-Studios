@@ -878,7 +878,16 @@ function _semanticDialogueSimilarity(source, candidate) {
   const exactCandidate = _normalizeDialogueForMatch(candidate);
   if (!exactSource || !exactCandidate) return 0;
   if (exactSource === exactCandidate) return 1;
-  if (exactCandidate.includes(exactSource) || exactSource.includes(exactCandidate)) return 0.985;
+  /* Never treat a larger quoted sentence as the authored line merely because
+   * it contains the authored words. Quoted dialogue is an atomic speech channel.
+   * A quoted span may differ in punctuation/contractions, but it must remain
+   * approximately the same utterance rather than wrapping narration around it. */
+  const sourceTokens = _semanticDialogueTokens(exactSource);
+  const candidateTokens = _semanticDialogueTokens(exactCandidate);
+  if (!sourceTokens.length || !candidateTokens.length) return 0;
+
+  const tokenRatio = candidateTokens.length / Math.max(1, sourceTokens.length);
+  if (tokenRatio > 1.25 || tokenRatio < 0.75) return 0;
 
   const lexical = _dialogueTokenOverlap(exactSource, exactCandidate);
   const charSim = _levenshteinSimilarity(exactSource, exactCandidate);
@@ -1021,56 +1030,48 @@ function _dedupePreserveOrder(lines) {
  * poison the dialogue validator.
  */
 function _sanitizeNonDialogueQuotes(description, authoritativeLines = []) {
-  let text = String(description || '');
+  const text = String(description || '');
   if (!text) return '';
 
   const auth = (authoritativeLines || [])
     .map(_canonicalDialogueLine)
     .filter(Boolean);
 
-  const protectedSpans = [];
-  for (const match of _scanQuotedDialogue(text)) {
-    const isAuth = auth.some(line =>
-      _isSemanticallySameDialogue(line, match.text)
-    );
-    if (isAuth) {
-      protectedSpans.push({
-        start: match.index,
-        end: match.end,
-      });
-    }
-  }
-
-  if (!protectedSpans.length) {
+  const matches = _scanQuotedDialogue(text);
+  if (!matches.length) {
     return text
-      .replace(/[“”]/g, '"')
-      .replace(/"([^"]+)"/g, '$1')
+      .replace(/[“”"]/g, '')
       .replace(/\s{2,}/g, ' ')
       .trim();
   }
 
-  const chars = Array.from(text);
-  const protectedAt = new Uint8Array(chars.length);
-  for (const span of protectedSpans) {
-    for (let i = span.start; i < Math.min(span.end, chars.length); i++) {
-      protectedAt[i] = 1;
-    }
+  const replacements = matches.map(match => {
+    const isAuth = auth.some(line =>
+      _isSemanticallySameDialogue(line, match.text)
+    );
+
+    return {
+      index: match.index,
+      length: match.length,
+      replacement: isAuth
+        ? `"${_canonicalDialogueLine(match.text)}"`
+        : match.text,
+    };
+  });
+
+  replacements.sort((a, b) => b.index - a.index);
+
+  let working = text;
+  for (const replacement of replacements) {
+    working =
+      working.slice(0, replacement.index) +
+      replacement.replacement +
+      working.slice(replacement.index + replacement.length);
   }
 
-  let out = '';
-  for (let i = 0; i < chars.length; i++) {
-    const ch = chars[i];
-    if (!protectedAt[i] && (ch === '“' || ch === '”')) {
-      out += '';
-      continue;
-    }
-    if (!protectedAt[i] && ch === '"') {
-      continue;
-    }
-    out += ch;
-  }
-
-  return out
+  /* Paired quote spans have already been normalized above. Keep the authored
+   * speech delimiters intact and only clean whitespace/punctuation. */
+  return working
     .replace(/\s{2,}/g, ' ')
     .replace(/\s+([,.!?;:])/g, '$1')
     .trim();
@@ -1085,7 +1086,7 @@ function _inferSpeakerBeforeQuote(text, quoteIndex, inheritedSpeaker = '') {
 
   const patterns = [
     /([A-Za-z][A-Za-z0-9 ._'’\-]{1,90})\s*(?:\([^)]{0,180}\))?\s*,?\s*(?:speaks?|says?|replies?|answers?|asks?)\s*:\s*$/i,
-    /([A-Z][A-Z0-9 ._'’\-]{1,80})\s*:\s*$/,
+    /([A-Za-z][A-Za-z0-9 ._'’\-]{1,80})\s*:\s*$/,
   ];
 
   for (const pattern of patterns) {
@@ -1352,7 +1353,98 @@ async function _resolveSpeakersWithVision({
   return out;
 }
 
-function _normalizeAuthoredDialogueInput(value) {
+/*
+ * Dialogue-input contract.
+ *
+ * `dialogue_or_action` is a mixed upstream field. A plain prose string in that
+ * field is NOT safe to interpret as speech because it can contain action,
+ * ambience, sound design, blocking, camera direction or environment notes.
+ * Only explicit speech syntax is authoritative there:
+ *   - quoted utterance
+ *   - SPEAKER: utterance
+ *   - an object carrying an explicit speaker + line/text
+ *
+ * Pure `dialogue` / `spoken_*` fields remain allowed to contain a single plain
+ * utterance because the field itself already declares speech semantics.
+ */
+function _extractDialogueBeatsFromMixedInput(value, inheritedSpeaker = '') {
+  if (value == null) return [];
+
+  if (Array.isArray(value)) {
+    return value.flatMap(item =>
+      _extractDialogueBeatsFromMixedInput(item, inheritedSpeaker)
+    );
+  }
+
+  if (_isPlainObject(value)) {
+    const speaker = _cleanText(
+      value.speaker || value.character || value.character_name ||
+      value.characterName || value.name || inheritedSpeaker || ''
+    );
+
+    const explicitDialogueKeys = [
+      'lines',
+      'dialogue',
+      'spoken_dialogue',
+      'spoken_words',
+      'spokenWords',
+      'dialogue_lines',
+      'dialogueLines',
+      'conversation',
+      'exchange',
+      'dialogue_or_action',
+    ];
+
+    for (const key of explicitDialogueKeys) {
+      if (Object.prototype.hasOwnProperty.call(value, key)) {
+        const nested = _extractDialogueBeatsFromMixedInput(value[key], speaker);
+        if (nested.length) return nested;
+      }
+    }
+
+    /* A structured node with an explicit speaker may safely use `line` or
+     * `text`; the speaker field turns those properties into an authored speech
+     * beat instead of generic prose. */
+    if (speaker && (Object.prototype.hasOwnProperty.call(value, 'line') ||
+                    Object.prototype.hasOwnProperty.call(value, 'text'))) {
+      const line = _canonicalDialogueLine(value.line || value.text || '');
+      if (line) return [{ speaker, line }];
+    }
+
+    return [];
+  }
+
+  const raw = _cleanText(value);
+  if (!raw) return [];
+
+  const labelled = _splitEmbeddedSpeakerLabels(raw);
+  if (labelled.length) return labelled;
+
+  const atomic = _extractAtomicQuotedBeats(raw, inheritedSpeaker);
+  if (atomic.length) return atomic;
+
+  /* Critical safety rule: never promote unquoted mixed prose to speech. */
+  return [];
+}
+
+function _normalizeAuthoredDialogueInput(value, { mixedInput = false } = {}) {
+  if (mixedInput) {
+    const mixedBeats = _extractDialogueBeatsFromMixedInput(value);
+    const seen = new Set();
+    return mixedBeats
+      .map(beat => ({
+        speaker: _cleanText(beat.speaker),
+        line: _canonicalDialogueLine(beat.line),
+      }))
+      .filter(beat => {
+        if (!beat.line) return false;
+        const key = `${beat.speaker.toLowerCase()}|${_normalizeDialogueForMatch(beat.line)}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+  }
+
   const beats = [];
   const visit = (node, inheritedSpeaker = '') => {
     if (node == null) return;
@@ -1367,7 +1459,7 @@ function _normalizeAuthoredDialogueInput(value) {
       );
       const keys = [
         'lines','dialogue','spoken_dialogue','spoken_words','spokenWords',
-        'dialogue_lines','dialogueLines','conversation','exchange','text','line'
+        'dialogue_lines','dialogueLines','conversation','exchange'
       ];
       for (const key of keys) {
         if (Object.prototype.hasOwnProperty.call(node, key)) {
@@ -1376,11 +1468,12 @@ function _normalizeAuthoredDialogueInput(value) {
           if (beats.length > before) return;
         }
       }
-      const line = _canonicalDialogueLine(
-        node.spoken_words || node.spokenWords || node.dialogue ||
-        node.line || node.text || ''
-      );
-      if (line) beats.push({ speaker, line });
+
+      if (speaker && (Object.prototype.hasOwnProperty.call(node, 'line') ||
+                      Object.prototype.hasOwnProperty.call(node, 'text'))) {
+        const line = _canonicalDialogueLine(node.line || node.text || '');
+        if (line) beats.push({ speaker, line });
+      }
       return;
     }
 
@@ -1405,7 +1498,7 @@ function _normalizeAuthoredDialogueInput(value) {
     if (matched) return;
 
     const line = _canonicalDialogueLine(raw);
-    if (line && !_looksLikeCinematicNarration(line)) {
+    if (!mixedInput && line && !_looksLikeCinematicNarration(line)) {
       beats.push({ speaker: _cleanText(inheritedSpeaker), line });
     }
   };
@@ -1616,8 +1709,8 @@ function _splitEmbeddedSpeakerLabels(text) {
   return out;
 }
 
-function _dialogueBeatRegistry(value) {
-  return _normalizeAuthoredDialogueInput(value);
+function _dialogueBeatRegistry(value, options = {}) {
+  return _normalizeAuthoredDialogueInput(value, options);
 }
 
 function _formatDialogueBeatRegistry(beats) {
@@ -1750,7 +1843,7 @@ function _scanQuotedDialogue(description) {
   const matches = [];
 
   const regex =
-    /(?:\*{1,3})?"([^"]*)"(?:\*{1,3})?|(?:\*{1,3})?“([^”]*)”(?:\*{1,3})?/g;
+    /(?:\*{1,3})?"([^"]*)"(?:\*{1,3})?|(?:\*{1,3})?“([^”]*)”(?:\*{1,3})?|(?:\*{1,3})?'([^'\r\n]+)'(?:\*{1,3})?/g;
 
   let match;
 
@@ -1763,7 +1856,9 @@ function _scanQuotedDialogue(description) {
       _canonicalDialogueLine(
         match[1] != null
           ? match[1]
-          : match[2]
+          : match[2] != null
+            ? match[2]
+            : match[3]
       );
 
     if (!text) {
@@ -1844,6 +1939,26 @@ function _findDialogueOccurrence(
    * Exact / flexible unquoted match remains as a recovery path. It is never
    * preferred over a semantically valid quoted utterance.
    */
+  /* Unquoted recovery must never search inside a quoted span that failed the
+   * atomic dialogue test. Otherwise a quote such as `\"Stay here, before the lights change.\"`
+   * can still expose `Stay here` to the unquoted fallback and cause the whole
+   * sentence to be re-quoted as speech. Mask all quoted spans before fallback. */
+  let unquotedDescription = String(description || '');
+  const quotedSpansForFallback = _scanQuotedDialogue(unquotedDescription);
+  if (quotedSpansForFallback.length) {
+    const chars = Array.from(unquotedDescription);
+    const masked = new Uint8Array(chars.length);
+    for (const span of quotedSpansForFallback) {
+      for (let i = span.index; i < Math.min(span.end, chars.length); i++) {
+        masked[i] = 1;
+      }
+    }
+    for (let i = 0; i < chars.length; i++) {
+      if (masked[i]) chars[i] = ' ';
+    }
+    unquotedDescription = chars.join('');
+  }
+
   const sourceWords =
     normalizedSource
       .split(/\s+/)
@@ -1878,7 +1993,7 @@ function _findDialogueOccurrence(
 
   const match =
     flexibleRegex.exec(
-      description
+      unquotedDescription
     );
 
   if (match) {
@@ -1930,7 +2045,7 @@ function _findDialogueOccurrence(
         `(?<![\\p{L}\\p{N}_])(${tokenPattern})(?![\\p{L}\\p{N}_])`,
         'iu'
       );
-      const semanticMatch = semanticRegex.exec(description);
+      const semanticMatch = semanticRegex.exec(unquotedDescription);
 
       if (semanticMatch) {
         return {
@@ -1954,7 +2069,7 @@ function _findDialogueOccurrence(
    */
   const sentenceRegex = /[^.!?\n]+[.!?]?/g;
   let sentenceMatch;
-  while ((sentenceMatch = sentenceRegex.exec(description)) !== null) {
+  while ((sentenceMatch = sentenceRegex.exec(unquotedDescription)) !== null) {
     const candidate = sentenceMatch[0];
     const similarity = _semanticDialogueSimilarity(source, candidate);
 
@@ -2586,6 +2701,8 @@ function _buildInitialUser({
     'Do not output analysis, commentary, scene graphs, shot contracts, spatial maps, metadata, negative prompts or implementation instructions.',
 
     'FINAL QUOTE CONTRACT: quotation marks may surround only audible spoken dialogue.',
+    'Never quote or speak descriptive action, sound, ambience, environment, screen text, labels, internal thoughts or camera instructions.',
+    'If the source contains dialogue_or_action prose without explicit speech syntax, treat that prose as visual/action description and do not put it in the speech channel.',
 
     'Return JSON with exactly one field: ltx_shot_description.',
     'The ltx_shot_description value MUST be one string containing the complete cinematic description.',
@@ -2778,6 +2895,15 @@ function _buildIntent({
       shot.conversation ||
       '',
 
+    dialogue_source:
+      shot.dialogue_or_action
+        ? 'dialogue_or_action'
+        : shot.dialogue
+          ? 'dialogue'
+          : shot.conversation
+            ? 'conversation'
+            : '',
+
     conversation_reason:
       shot.conversation_reason ||
       '',
@@ -2920,7 +3046,8 @@ async function describeForLTX({
    */
   let dialogueBeats =
     _dialogueBeatRegistry(
-      intent.dialogue
+      intent.dialogue,
+      { mixedInput: intent.dialogue_source === 'dialogue_or_action' }
     );
 
   // First resolve speakers deterministically from explicit source/context cues.
@@ -3034,6 +3161,13 @@ async function describeForLTX({
 
     'Quotation marks are exclusively the spoken-dialogue channel.',
     'Use quotation marks only for audible speech.',
+
+
+    'DIALOGUE CHANNEL HARD LOCK: Only text that is actual audible speech may ever be enclosed in quotation marks.',
+    'Never turn physical action, blocking, facial expression, emotion, camera direction, environment, ambience, sound design, radio noise, captions, written words or internal thoughts into spoken words.',
+    'The field named dialogue_or_action is mixed input: treat unquoted action/narration in that field as DESCRIPTION, not speech. Only explicit quoted utterances or explicit speaker-labelled lines from that field are spoken dialogue.',
+    'When describing anything that is not spoken, use descriptive declarative prose with NO quotation marks.',
+    'Do not place quotation marks around descriptive fragments merely to emphasize them.',
 
     'Never quote signs, labels, screen text, UI, names, written notes, captions, logos, internal thoughts, memories, actions, emotions, camera behavior, staging, ambience or sound effects.',
 
