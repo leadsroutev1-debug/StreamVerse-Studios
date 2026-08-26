@@ -2588,6 +2588,86 @@ function _speakerAttributionRepairInstruction(diagnostics, visibleCharacters = [
   ].filter(Boolean).join(' ');
 }
 
+
+function _positionFirstDiagnostics(description, visibleCharacters = []) {
+  const text = String(description || '').trim();
+  const opening = text.slice(0, 1400);
+  const lowerOpening = opening.toLowerCase();
+
+  const names = [...new Set(
+    (Array.isArray(visibleCharacters) ? visibleCharacters : [])
+      .map(value => _isPlainObject(value)
+        ? _cleanText(value.name || value.character || value.character_name || '')
+        : _cleanText(value)
+      )
+      .filter(Boolean)
+  )];
+
+  const positionPattern =
+    /\b(?:screen[-\s]?(?:left|right|center|centre)|left|right|center|centre|foreground|midground|background|upper|lower|near[-\s]?foreground|far[-\s]?background)\b/i;
+
+  const missingFromOpening = names.filter(name =>
+    !lowerOpening.includes(name.toLowerCase())
+  );
+
+  const missingPositionAnchors = names.filter(name => {
+    const idx = lowerOpening.indexOf(name.toLowerCase());
+    if (idx < 0) return true;
+
+    const context = opening.slice(
+      Math.max(0, idx - 180),
+      Math.min(opening.length, idx + name.length + 240)
+    );
+
+    return !positionPattern.test(context);
+  });
+
+  const startsWithMap = /^(?:opening frame|opening visual map|opening composition|current opening frame)\s*:/i.test(text);
+
+  const valid =
+    names.length === 0
+      ? startsWithMap || text.length === 0
+      : startsWithMap &&
+        missingFromOpening.length === 0 &&
+        missingPositionAnchors.length === 0;
+
+  return {
+    valid,
+    startsWithMap,
+    openingCharacterMap: names.length > 0
+      ? valid
+      : startsWithMap,
+    missingFromOpening,
+    missingPositionAnchors,
+    visibleCharacterNames: names,
+  };
+}
+
+function _positionFirstRepairInstruction(diagnostics) {
+  if (!diagnostics || diagnostics.valid) return '';
+
+  const missingNames = diagnostics.missingFromOpening || [];
+  const missingPositions = diagnostics.missingPositionAnchors || [];
+
+  return [
+    'POSITION-FIRST OUTPUT CONTRACT FAILED.',
+    'Rewrite the COMPLETE ltx_shot_description, do not patch only one sentence.',
+    'The very first paragraph MUST begin exactly with "Opening frame:".',
+    'Before describing any motion, dialogue, camera movement, reaction, transition, or atmosphere, identify EVERY visible character from the current authored image one by one.',
+    'For each visible character, state: exact character name, screen position (screen-left/screen-center/screen-right), depth (foreground/midground/background), visible crop/extent, body orientation, head direction, eyeline, posture, wardrobe/identity anchors, and current interaction or prop contact.',
+    'Keep each character as a separate named subject. Never introduce a visible character only later in the paragraph.',
+    missingNames.length
+      ? `These visible characters are missing from the opening map and MUST be included there: ${missingNames.join(', ')}.`
+      : '',
+    missingPositions.length
+      ? `These characters appear without a nearby explicit screen-position anchor and MUST be rewritten with one: ${missingPositions.join(', ')}.`
+      : '',
+    'After the complete opening character map is established, continue with the chronological cinematic action.',
+    'Do not begin with "The shot opens with..." followed by one character and then introduce the others later.',
+    'The opening map is not optional metadata; it is the first visual description of the current image and must remain faithful to the pixels.',
+  ].filter(Boolean).join(' ');
+}
+
 function _dialogueIntegrity(sourceLines, description, dialogueBeats = [], visibleCharacters = []) {
   const required = (sourceLines || [])
     .map(_canonicalDialogueLine)
@@ -2904,6 +2984,14 @@ function _buildInitialUser({
       : 'The current still is the authoritative opening state of the shot.',
 
     'Write ONE complete natural chronological cinematic LTX image-to-video description that preserves this visual continuity and then carries the current shot through its terminal state.',
+
+    'POSITION-FIRST HARD CONTRACT: the first paragraph is a visual identity and screen-geography map of the CURRENT AUTHORED IMAGE. It MUST begin exactly with "Opening frame:".',
+    'In that first paragraph, enumerate EVERY visible character one by one before describing ANY motion, dialogue, camera movement, reaction, transition, sound, atmosphere or later action.',
+    'For EVERY visible character in the opening map, state the exact character name, screen position (screen-left/screen-center/screen-right), depth (foreground/midground/background), visible crop/extent, body orientation, head direction, eyeline, posture, distinctive identity anchors, wardrobe and any prop contact visible in the current image.',
+    'Do not introduce one character later after starting the action. The full visible-character roster MUST be established first so the video model can independently identify who is where.',
+    'When a character is only partially visible, explicitly say so and state where that visible portion sits in frame, for example "Eleanor Voss is screen-left foreground, only her right shoulder and upper back visible".',
+    'Use the CURRENT IMAGE 2 pixels as the authoritative source for positions. Do not borrow positions from IMAGE 1 when the current image differs.',
+    'After the opening map is complete, continue in chronological order with the current-shot action and dialogue while preserving those locked screen positions unless an authored movement explicitly changes them.',
 
     'The authored dialogue must be embedded once into the unfolding action, not copied into a separate dialogue section.',
 
@@ -3398,6 +3486,15 @@ async function describeForLTX({
     'Write ONE complete natural chronological cinematic description of the shot unfolding in real time.',
     'Do not summarize the shot.',
 
+    'NON-NEGOTIABLE OUTPUT ORDER: FIRST establish the CURRENT IMAGE visually, THEN describe motion.',
+    'The output MUST begin exactly with "Opening frame:".',
+    'The FIRST PARAGRAPH is a complete visible-character identity and screen-geography map of the CURRENT AUTHORED IMAGE.',
+    'Before any action, dialogue, camera movement, transition, atmosphere or reaction, enumerate EVERY visible character separately with exact name + screen-left/screen-center/screen-right position + foreground/midground/background depth + visible crop/extent + body orientation + head direction + eyeline + posture + identity/wardrobe anchors + prop contact.',
+    'Do not start the narrative with one character and introduce the other visible characters later. No character may first appear after the opening map.',
+    'If only part of a person is visible, explicitly identify the visible portion and its screen position instead of treating the person as an unnamed shoulder, silhouette or generic figure.',
+    'Use CURRENT IMAGE 2 as the authoritative source for this opening map whenever a previous end frame is also supplied. IMAGE 1 is continuity context only.',
+    'After the complete opening map, continue with the natural chronological cinematic description while preserving the established screen geography unless authored motion explicitly changes it.',
+
     'Use the current authored still to establish the exact opening composition.',
     'When a previous end frame is supplied, first reason about the visual delta from the previous terminal frame to the current authored still and make that transition physically and cinematographically coherent before describing the current-shot motion.',
     'Treat the previous end frame as the continuity predecessor, not as the current shot opening image.',
@@ -3626,6 +3723,48 @@ async function describeForLTX({
           '[LTXVision] FINAL CANDIDATE AFTER DIALOGUE NORMALIZATION:',
           description
         );
+
+        const positionDiagnostics =
+          _positionFirstDiagnostics(
+            description,
+            visibleCharacterNames
+          );
+
+        _safeLog(
+          '[LTXVision] POSITION-FIRST DIAGNOSTICS:',
+          positionDiagnostics
+        );
+
+        if (!positionDiagnostics.valid) {
+          const positionRetryInstruction =
+            _positionFirstRepairInstruction(
+              positionDiagnostics
+            );
+
+          previousDescription = description;
+          currentRepairInstruction = [
+            currentRepairInstruction,
+            positionRetryInstruction,
+          ].filter(Boolean).join(' ');
+
+          console.warn(
+            '[LTXVision] position-first contract failed | ' +
+            `missingCharacters=${positionDiagnostics.missingFromOpening.length} ` +
+            `missingPositionAnchors=${positionDiagnostics.missingPositionAnchors.length} ` +
+            `startsWithMap=${positionDiagnostics.startsWithMap}`
+          );
+
+          if (repairAttempt < MAX_TARGETED_REPAIRS_PER_KEY) {
+            continue;
+          }
+
+          const error = new Error(
+            '[LTXVision] POSITION_FIRST_CONTRACT_FAILED: generated shot did not establish all visible characters and their screen positions before motion.'
+          );
+          error.code = 'LTX_VISION_POSITION_FIRST_CONTRACT';
+          error.diagnostics = positionDiagnostics;
+          throw error;
+        }
 
         _safeLog(
           '[LTXVision] SPEAKER PERFORMANCE DIAGNOSTICS:',
@@ -3898,4 +4037,6 @@ module.exports = {
   _applyDeterministicSpeakerResolution,
   _sanitizeNonDialogueQuotes,
   _recoverDialogueIntegrity,
+  _positionFirstDiagnostics,
+  _positionFirstRepairInstruction,
 };
