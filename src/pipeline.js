@@ -1645,8 +1645,14 @@ async function generateShot(shot, storyline, characterList, globalEpisodeNumber,
    * This URL is passed through shot metadata to ltxVisionDirector, which
    * downloads the actual pixels and presents them alongside the current still.
    */
+  const resolvedEpisodeId =
+    shot?._episode_id ||
+    shot?.episode_id ||
+    shot?.episodeId ||
+    null;
+
   let previousEndFrameUrl = await _resolvePreviousShotEndFrameUrl({
-    episodeId: shot?._episode_id || shot?.episode_id || shot?.episodeId || null,
+    episodeId: resolvedEpisodeId,
     prevShot,
   });
 
@@ -1655,7 +1661,7 @@ async function generateShot(shot, storyline, characterList, globalEpisodeNumber,
   // populated, while keeping the exact predecessor pixels authoritative.
   if (!previousEndFrameUrl && prevShot && typeof videoGen.retrieveContinuityFrames === 'function') {
     try {
-      const episodeId = shot?._episode_id || shot?.episode_id || shot?.episodeId || null;
+      const episodeId = resolvedEpisodeId;
       if (episodeId) {
         const previousRow = await db.queryOne(
           `SELECT clip_url FROM shots
@@ -5652,6 +5658,10 @@ async function regenerateEpisodeVideos(episodeId) {
     const allShots = scenes.flatMap(sc =>
       (sc.shots || []).map(sh => ({
         ...sh,
+        // Continuity regeneration must carry the exact episode identity through
+        // generateShot() so predecessor terminal frames can be resolved from DB.
+        _episode_id:         episodeId,
+        episode_id:           episodeId,
         scene_number:        sc.scene_number,
         composition:         sc.composition,
         characters_in_shot:  sh.characters_in_shot || sc.characters_present || [],
@@ -5704,8 +5714,26 @@ async function regenerateEpisodeVideos(episodeId) {
       state.setProgress(i + 1, allShots.length, `Regenerating video ${i + 1}/${allShots.length} — Scene ${shot.scene_number}`);
 
       try {
+        // Defensive continuity invariant: make the episode identity explicit on
+        // the exact object entering generateShot(), even if any preceding
+        // transformation removed transient metadata.
+        const regenShot = {
+          ...shot,
+          _episode_id: episodeId,
+          episode_id: episodeId,
+        };
+
+        console.log(
+          `[RegenEpisodeVideos] Continuity identity | ` +
+          `S${regenShot.scene_number}/idx${regenShot.shot_index} episodeId=${regenShot._episode_id}`
+        );
+
         const { clipUrl } = await generateShot(
-          _attachLtxPromptCapture(shot, { episodeId, sceneNumber: shot.scene_number, shotIndex: shot.shot_index }), storyline, characterList, globalEpisodeNumber,
+          _attachLtxPromptCapture(regenShot, {
+            episodeId,
+            sceneNumber: regenShot.scene_number,
+            shotIndex: regenShot.shot_index,
+          }), storyline, characterList, globalEpisodeNumber,
           async (jobId, apiKey) => {
             await updateShotRow(episodeId, shot.scene_number, shot.shot_index, {
               status: 'mh_submitted', mh_job_id: jobId, mh_api_key: apiKey,
