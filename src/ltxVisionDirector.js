@@ -2442,16 +2442,17 @@ function _speakerAliases(name) {
 
 function _speakerPerformanceNear(description, speaker, quoteIndex) {
   const before = String(description || '')
-    .slice(Math.max(0, Number(quoteIndex) - 420), Number(quoteIndex))
+    .slice(Math.max(0, Number(quoteIndex) - 520), Number(quoteIndex))
     .replace(/\s+/g, ' ')
     .trim();
 
-  for (const alias of _speakerAliases(speaker)) {
+  const aliases = _speakerAliases(speaker);
+  const actionWords = '(?:says?|speaks?|replies?|answers?|asks?|whispers?|shouts?|calls?|mutters?|murmurs?|declares?|insists?|interrupts?|articulates?|speaking|talks?|talking)';
+  for (const alias of aliases) {
     const escaped = _escapeRegex(alias);
     const patterns = [
-      new RegExp(`\\b${escaped}\\b[^.!?]{0,220}\\b(?:says?|speaks?|replies?|answers?|asks?|whispers?|shouts?|calls?|mutters?|murmurs?|declares?|insists?|interrupts?|articulates?)\\b[^.!?]{0,160}$`, 'i'),
-      new RegExp(`\\b${escaped}\\b\\s*:\\s*[^\\n]{0,220}$`, 'i'),
-      new RegExp(`\\b${escaped}\\b[^.!?]{0,220}\\b(?:mouth|lips?|articulates?|speaking|speaks|talks?|talking)\\b[^.!?]{0,160}$`, 'i'),
+      new RegExp(`\\b${escaped}\\b[^.!?]{0,300}\\b${actionWords.replace('(?:','').replace(')','')}\\b[^.!?]{0,180}$`, 'i'),
+      new RegExp(`\\b${escaped}\\b\\s*:\s*[^\\n]{0,260}$`, 'i'),
     ];
     if (patterns.some(re => re.test(before))) return true;
   }
@@ -2480,6 +2481,64 @@ function _listenerSpeakingNear(description, listener, quoteStart, quoteEnd, auth
     }
   }
   return false;
+}
+
+function _extractSpeakerPosition(description, speaker) {
+  const opening = String(description || '').slice(0, 1800).replace(/\s+/g, ' ').trim();
+  const aliases = _speakerAliases(speaker);
+  const positionRegex = /\b(?:screen[-\s]?(?:left|right|center|centre)|left|right|center|centre)\b(?:\s+|,\s*)\b(?:foreground|midground|background)\b|\b(?:foreground|midground|background)\b(?:\s+|,\s*)\b(?:screen[-\s]?(?:left|right|center|centre)|left|right|center|centre)\b/i;
+
+  for (const alias of aliases) {
+    const m = new RegExp(`\\b${_escapeRegex(alias)}\\b`, 'i').exec(opening);
+    if (!m) continue;
+    const sentenceStart = Math.max(
+      opening.lastIndexOf('.', m.index) + 1,
+      opening.lastIndexOf(':', m.index) + 1,
+      opening.lastIndexOf(';', m.index) + 1,
+      opening.lastIndexOf('Opening frame:', m.index) + 'Opening frame:'.length
+    );
+    const nextStops = ['.', ';', ':'].map(ch => {
+      const i = opening.indexOf(ch, m.index + alias.length);
+      return i < 0 ? opening.length : i + 1;
+    });
+    const sentenceEnd = Math.min(...nextStops);
+    const sentence = opening.slice(sentenceStart, sentenceEnd);
+    const pm = sentence.match(positionRegex);
+    if (pm) return pm[0].replace(/\s+/g, ' ').trim();
+  }
+  return 'in the established opening position';
+}
+
+function _bindAuthoredDialogueSpeakers(description, dialogueBeats = [], visibleCharacters = []) {
+  let working = String(description || '');
+  const beats = (dialogueBeats || []).filter(beat => beat?.speaker && beat?.line);
+  if (!beats.length) return working;
+  const edits = [];
+  let searchFrom = 0;
+  for (const beat of beats) {
+    const occurrence = _bestSemanticDialogueOccurrence(working, beat.line, { quotedOnly: true, startIndex: searchFrom });
+    if (!occurrence) continue;
+    const before = working.slice(Math.max(0, occurrence.index - 420), occurrence.index).replace(/\s+/g, ' ').trim();
+    const speaker = _cleanText(beat.speaker);
+    const explicit = new RegExp(`\\b${_escapeRegex(speaker)}\\b[^.!?]{0,300}\\b(?:says?|speaks?|replies?|answers?|asks?|whispers?|shouts?|calls?|mutters?|murmurs?|declares?|insists?|interrupts?|articulates?|speaking|talks?|talking)\\b[^.!?]{0,180}$`, 'i').test(before);
+    if (!explicit) {
+      const position = _extractSpeakerPosition(working, speaker);
+      const listeners = (Array.isArray(visibleCharacters) ? visibleCharacters : [])
+        .map(v => _isPlainObject(v) ? _cleanText(v.name || v.character || v.character_name || '') : _cleanText(v))
+        .filter(Boolean)
+        .filter(name => !_speakerNameMatches(name, speaker));
+      const listenerText = listeners.length
+        ? ` ${listeners.map(name => `${name} remains silent in the established opening position, mouth closed and listening.`).join(' ')}`
+        : '';
+      edits.push({ index: occurrence.index, text: `${speaker}, ${position}, is the only active speaker for this beat.${listenerText} ` });
+    }
+    searchFrom = occurrence.index + occurrence.length;
+  }
+  for (let i = edits.length - 1; i >= 0; i--) {
+    const edit = edits[i];
+    working = working.slice(0, edit.index) + edit.text + working.slice(edit.index);
+  }
+  return working;
 }
 
 function _speakerAttributionDiagnostics(description, dialogueBeats, visibleCharacters = []) {
@@ -2624,12 +2683,16 @@ function _positionFirstDiagnostics(description, visibleCharacters = []) {
 
   const startsWithMap = /^(?:opening frame|opening visual map|opening composition|current opening frame)\s*:/i.test(text);
 
+  const firstQuote = text.indexOf('\"');
+  const allNamesBeforeFirstQuote = names.length === 0 || firstQuote < 0 || names.every(name => { const i = text.toLowerCase().indexOf(name.toLowerCase()); return i >= 0 && i < firstQuote; });
+
   const valid =
     names.length === 0
       ? startsWithMap || text.length === 0
       : startsWithMap &&
         missingFromOpening.length === 0 &&
-        missingPositionAnchors.length === 0;
+        missingPositionAnchors.length === 0 &&
+        allNamesBeforeFirstQuote;
 
   return {
     valid,
@@ -2639,6 +2702,7 @@ function _positionFirstDiagnostics(description, visibleCharacters = []) {
       : startsWithMap,
     missingFromOpening,
     missingPositionAnchors,
+    allNamesBeforeFirstQuote,
     visibleCharacterNames: names,
   };
 }
@@ -2906,7 +2970,7 @@ function _buildInitialUser({
 
           'Each authored line belongs to exactly ONE named speaker. Never let two characters share, echo, lip-sync, mouth, or visibly perform the same line.',
           'MULTI-SPEAKER SHOTS ARE VALID AND EXPECTED: when the authoritative speaker registry contains multiple speakers, keep all authored turns in the same shot unless the shot intent explicitly requires a cut. Preserve chronological turn-taking: speaker A performs line A, speaker B performs line B, speaker A may then perform line C, and so on.',
-          'For every authored line, explicitly direct WHO is speaking before the spoken words: identify the character by name and make that character the only active speaker.',
+          'For every authored line, the sentence immediately containing the spoken quote MUST name the speaker explicitly and include that speaker’s frame position before the speaking verb. Never use only pronouns such as he, she, his voice, her voice, they, or the character for the active speaker.',
           'Describe the speaker’s exact screen position and orientation at the moment of speech (for example: left foreground, center-right midground, seated behind the table, three-quarter profile facing camera-left), plus the listener positions around them.',
           'Describe each visible character separately: identity, screen position, body orientation, head direction, eyeline, posture, and whether they are SPEAKING or LISTENING.',
           'Only the speaking character may have visible mouth movement or lip-sync during that line. All listeners must remain silent with mouths closed or naturally still, even when they face the camera.',
@@ -3002,7 +3066,7 @@ function _buildInitialUser({
     'MOTION VARIETY WITHOUT SYNCHRONY: when multiple characters do move, do not mirror, synchronize or duplicate the same gesture across them unless coordination is authored.',
     'IDENTITY PRESERVATION: character identity is continuous throughout the clip. Never swap, merge, clone, age, de-age, recolor, redesign, or morph a face, hair style, wardrobe, body proportions or carried prop.',
     'BODY-MECHANICS GUARDRAIL: preserve grounded weight, believable foot contact, stable joints and realistic body mechanics. No sliding feet, rubber limbs, puppet-like motion, mannequin movement, sudden pose snaps, teleportation or impossible hand/prop contact.',
-    'For every dialogue beat, explicitly describe the speaker first by name and frame position, then the speaker action and spoken line, then the silent listener reactions. Never let two characters share the same speaking action.',
+    'For every dialogue beat, the sentence immediately containing the spoken quote MUST name the speaker explicitly and include that speaker’s frame position before the speaking verb. Use a structure such as: \"Javier Morales, screen-right background, speaks: \\\"Exact line.\\\"\". Never use his voice, her voice, he says, she says, they speak, or an unnamed voice for an authored line.',
     'When more than one character is visible, maintain persistent left/right/foreground/background identity throughout the description so LTX does not swap which character is speaking.',
     'Do not use vague dialogue staging such as "they face the camera and speak." State exactly which character speaks and that every other visible character remains silent.',
 
@@ -3719,6 +3783,12 @@ async function describeForLTX({
           }
         }
 
+        description = _bindAuthoredDialogueSpeakers(
+          description,
+          dialogueBeats,
+          visibleCharacterNames
+        );
+
         _safeLog(
           '[LTXVision] FINAL CANDIDATE AFTER DIALOGUE NORMALIZATION:',
           description
@@ -4039,4 +4109,6 @@ module.exports = {
   _recoverDialogueIntegrity,
   _positionFirstDiagnostics,
   _positionFirstRepairInstruction,
+  _bindAuthoredDialogueSpeakers,
+  _extractSpeakerPosition,
 };
