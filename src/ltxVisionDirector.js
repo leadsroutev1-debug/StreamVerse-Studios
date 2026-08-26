@@ -2665,7 +2665,6 @@ function _dialogueIntegrity(sourceLines, description, dialogueBeats = [], visibl
       source: m.source,
     })),
     matchedLines: matchedRequired,
-    speakerDiagnostics,
     valid: missing.length === 0 && order.length === 0 && duplicates.length === 0,
   };
 }
@@ -3774,7 +3773,7 @@ async function describeForLTX({
 
           if (semanticallyComplete) {
             const cleaned = _sanitizeNonDialogueQuotes(description, sourceLines);
-            const finalIntegrity = _dialogueIntegrity(sourceLines, cleaned, dialogueBeats, visibleCharacters);
+            const finalIntegrity = _dialogueIntegrity(sourceLines, cleaned, dialogueBeats, visibleCharacterNames);
             if (finalIntegrity.missingLines.length === 0 && finalIntegrity.outOfOrder.length === 0) {
               console.warn('[LTXVision] duplicate-only validation warning recovered; accepting semantic-complete shot');
               return cleaned;
