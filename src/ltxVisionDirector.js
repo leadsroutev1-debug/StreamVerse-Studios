@@ -3315,6 +3315,13 @@ async function describeForLTX({
       intent.dialogue,
       { mixedInput: intent.dialogue_source === 'dialogue_or_action' }
     );
+  console.log(
+    `[LTXVision] Visible character attribution set | ` +
+    `S${shot.scene_number || '0'}/idx${shot.shot_index || '0'} ` +
+    `count=${visibleCharacterNames.length} ` +
+    `names=${visibleCharacterNames.join(', ')}`
+  );
+
 
   // First resolve speakers deterministically from explicit source/context cues.
   // Only unresolved beats go through the constrained multimodal resolver.
