@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import random
+import re
 import threading
 import time
 from typing import Any
@@ -51,6 +52,70 @@ _QUOTA_PATTERNS = (
     "insufficient quota", "quota exceeded", "quota exhausted", "usage limit",
     "subscription quota",
 )
+
+# --- Resolution/frame-cap validation parsing -------------------------------
+#
+# Agnes returns a 400 that embeds the *real* provider error as a JSON string
+# nested (and escaped) inside its own JSON body, e.g.:
+#   {"code":"fail_to_fetch_task","message":"...{\"error\":{\"message\":\"...
+#     num_frames 433 exceeds maximum 241 for 1080p/3:4 (1216x1664). ...
+#     \\\"max_num_frames\\\":241,\\\"resolution\\\":\\\"1080p\\\", ...}}"}
+#
+# Rather than hardcode Agnes's pixel-budget-per-tier thresholds (undocumented
+# and liable to change), we read the cap Agnes itself just told us about and
+# step resolution down until our frame count fits under it. Duration/fps are
+# never touched here -- only width/height shrink.
+_MAX_FRAMES_RE = re.compile(r'"max_num_frames"\s*:\s*(\d+)')
+_RESOLUTION_TIER_RE = re.compile(r'"resolution"\s*:\s*"([^"]+)"')
+_RATIO_RE = re.compile(r'"ratio"\s*:\s*"([^"]+)"')
+_ECHO_WIDTH_RE = re.compile(r'"width"\s*:\s*(\d+)')
+_ECHO_HEIGHT_RE = re.compile(r'"height"\s*:\s*(\d+)')
+
+# Real broadcast-resolution area ratios (720p/1080p ~= 0.444, 480p/720p ~= 0.445),
+# so each tier step down is ~2/3 on both width and height. Agnes's own snapped
+# 1080p dims (e.g. 1216x1664) track this same ~2MP/0.92MP/0.41MP budget pattern,
+# so stepping our submitted dims down by this factor reliably lands one tier
+# lower without us needing to know Agnes's exact preset table.
+AGNES_RES_STEPDOWN_FACTOR = 2.0 / 3.0
+AGNES_MAX_RES_STEPDOWNS = 3
+AGNES_MIN_DIMENSION = 256
+
+
+def _unescape_body(body: str) -> str:
+    """Collapse one layer of JSON-string escaping so simple regexes work
+    regardless of how many times Agnes/litellm re-wrapped the inner error."""
+    cleaned = body
+    for _ in range(3):
+        if '\\"' not in cleaned:
+            break
+        cleaned = cleaned.replace('\\"', '"')
+    return cleaned
+
+
+def _parse_frame_cap_rejection(body: str) -> dict[str, Any] | None:
+    """Best-effort extraction of Agnes's reported frame cap / resolution tier
+    from a validation-error body. Returns None if the body doesn't look like
+    a num_frames-vs-resolution rejection."""
+    if not body or "max_num_frames" not in body and "exceeds maximum" not in body:
+        return None
+    cleaned = _unescape_body(body)
+    max_frames_match = _MAX_FRAMES_RE.search(cleaned)
+    if not max_frames_match:
+        return None
+    info: dict[str, Any] = {"max_num_frames": int(max_frames_match.group(1))}
+    tier_match = _RESOLUTION_TIER_RE.search(cleaned)
+    if tier_match:
+        info["resolution"] = tier_match.group(1)
+    ratio_match = _RATIO_RE.search(cleaned)
+    if ratio_match:
+        info["ratio"] = ratio_match.group(1)
+    width_match = _ECHO_WIDTH_RE.search(cleaned)
+    if width_match:
+        info["echo_width"] = int(width_match.group(1))
+    height_match = _ECHO_HEIGHT_RE.search(cleaned)
+    if height_match:
+        info["echo_height"] = int(height_match.group(1))
+    return info
 
 
 def _configured_keys() -> list[str]:
@@ -297,6 +362,10 @@ class AgnesProvider(VideoProvider):
 
         fps = max(1, min(60, int(config.AGNES_FRAME_RATE)))
         seconds = max(config.AGNES_DURATION_MIN, min(config.AGNES_DURATION_MAX, float(duration or 1)))
+        # Frame count is derived once from the requested duration and never
+        # reduced afterward -- the 18s (or whatever config caps it at) cap is
+        # sacred. Only width/height are allowed to shrink to fit a frame
+        # count into whatever resolution tier Agnes is willing to run it at.
         frames = _frames(seconds, fps, config.AGNES_MAX_FRAMES)
         resolved_negative_prompt = str(
             negative_prompt
@@ -307,12 +376,15 @@ class AgnesProvider(VideoProvider):
         refs = [str(url).strip() for url in (reference_image_urls or []) if str(url).strip()]
         use_keyframes = len(refs) >= 2
 
+        base_width = _dim(width or config.AGNES_WIDTH)
+        base_height = _dim(height or config.AGNES_HEIGHT)
+
         payload = {
             "model": config.AGNES_MODEL,
             "prompt": prompt.strip(),
             "image": image_url,
-            "width": _dim(width or config.AGNES_WIDTH),
-            "height": _dim(height or config.AGNES_HEIGHT),
+            "width": base_width,
+            "height": base_height,
             "num_frames": frames,
             "frame_rate": fps,
             "negative_prompt": resolved_negative_prompt,
@@ -350,125 +422,182 @@ class AgnesProvider(VideoProvider):
 
         for key_attempt in range(1, max_key_attempts + 1):
             api_key, key_slot = _KEYS.current()
-            logger.info(
-                "[Agnes] job=%s key_slot=%s/%s attempt=%s/%s mode=%s refs=%s frames=%s fps=%s size=%sx%s",
-                job_id,
-                key_slot + 1,
-                len(keys),
-                key_attempt,
-                max_key_attempts,
-                "keyframes" if use_keyframes else "img2video",
-                len(refs),
-                frames,
-                fps,
-                payload["width"],
-                payload["height"],
-            )
 
-            try:
-                response = self._request(
-                    "POST",
-                    f"{config.AGNES_BASE_URL}/v1/videos",
-                    api_key,
-                    operation=f"submit job={job_id}",
-                    json=payload,
-                    max_attempts=max(1, int(config.AGNES_SUBMIT_RETRIES)),
-                    diagnostic_context={
-                        "job_id": job_id,
-                        "key_slot": key_slot + 1,
-                        "phase": "submit",
-                        "mode": "keyframes" if use_keyframes else "img2video",
-                        "payload_diagnostics": _payload_diagnostics(payload),
-                    },
-                )
-                created = _json(response, "Agnes video submission")
-                video_id = created.get("video_id")
-                _structured(
-                    "submit_accepted",
-                    job_id=job_id,
-                    key_slot=key_slot + 1,
-                    http_status=response.status_code,
-                    response_headers=_response_headers(response),
-                    response_keys=sorted(created.keys()),
-                    video_id=str(video_id) if video_id else None,
-                    response_body=_safe(created),
-                )
-                if not video_id:
-                    raise ProviderError(
-                        "Agnes submission returned no video_id",
-                        category="model",
-                        detail={"response": _safe(created)},
-                    )
+            # Resolution-tier stepdown: try at the requested/base dimensions
+            # first, then shrink width/height (never frames/fps) if Agnes
+            # rejects the frame count for the tier it snapped us into.
+            current_width, current_height = base_width, base_height
 
-                result = self._poll(api_key, str(video_id), job_id)
-                video_url = result.get("url") or result.get("video_url")
-                if not isinstance(video_url, str) or not video_url.startswith(("http://", "https://")):
-                    raise ProviderError(
-                        "Agnes completed without a usable video URL",
-                        category="model",
-                        detail={"video_id": video_id, "response": _safe(result)},
-                    )
+            for res_attempt in range(1, AGNES_MAX_RES_STEPDOWNS + 2):
+                payload["width"] = current_width
+                payload["height"] = current_height
 
                 logger.info(
-                    "[Agnes] job=%s completed video_id=%s mode=%s refs=%s duration=%.3fs",
+                    "[Agnes] job=%s key_slot=%s/%s attempt=%s/%s res_attempt=%s/%s mode=%s refs=%s frames=%s fps=%s size=%sx%s",
                     job_id,
-                    video_id,
+                    key_slot + 1,
+                    len(keys),
+                    key_attempt,
+                    max_key_attempts,
+                    res_attempt,
+                    AGNES_MAX_RES_STEPDOWNS + 1,
                     "keyframes" if use_keyframes else "img2video",
                     len(refs),
-                    frames / fps,
+                    frames,
+                    fps,
+                    payload["width"],
+                    payload["height"],
                 )
-                _structured(
-                    "generation_completed",
-                    job_id=job_id,
-                    video_id=str(video_id),
-                    key_slot=key_slot + 1,
-                    mode="keyframes" if use_keyframes else "img2video",
-                    reference_count=len(refs),
-                    requested_seconds=seconds,
-                    actual_frame_seconds=frames / fps,
-                    frames=frames,
-                    fps=fps,
-                )
-                return GenerationResult(
-                    video_url=video_url,
-                    seed=result.get("seed", seed),
-                    raw={
-                        "provider": "agnes",
-                        "video_id": video_id,
-                        "status": result.get("status"),
-                        "requested_seconds": seconds,
-                        "actual_frame_seconds": frames / fps,
-                        "frames": frames,
-                        "fps": fps,
-                        "mode": "keyframes" if use_keyframes else "img2video",
-                        "reference_count": len(refs),
-                        "key_slot": key_slot,
-                        "canonical_uploader": "node",
-                    },
-                )
-            except ProviderError as exc:
-                last_error = exc
-                _structured(
-                    "generation_error",
-                    job_id=job_id,
-                    key_slot=key_slot + 1,
-                    category=exc.category,
-                    error=str(exc),
-                    detail=_safe(exc.detail),
-                )
-                if exc.category == "quota":
-                    try:
-                        _, next_slot = _KEYS.rotate_after_quota(api_key)
-                        logger.warning(
-                            "[Agnes] job=%s key_slot=%s quota exhausted; rotating to key_slot=%s",
-                            job_id,
-                            key_slot + 1,
-                            next_slot + 1,
+
+                try:
+                    response = self._request(
+                        "POST",
+                        f"{config.AGNES_BASE_URL}/v1/videos",
+                        api_key,
+                        operation=f"submit job={job_id}",
+                        json=payload,
+                        max_attempts=max(1, int(config.AGNES_SUBMIT_RETRIES)),
+                        diagnostic_context={
+                            "job_id": job_id,
+                            "key_slot": key_slot + 1,
+                            "phase": "submit",
+                            "res_attempt": res_attempt,
+                            "mode": "keyframes" if use_keyframes else "img2video",
+                            "payload_diagnostics": _payload_diagnostics(payload),
+                        },
+                    )
+                except ProviderError as exc:
+                    last_error = exc
+                    _structured(
+                        "generation_error",
+                        job_id=job_id,
+                        key_slot=key_slot + 1,
+                        res_attempt=res_attempt,
+                        category=exc.category,
+                        error=str(exc),
+                        detail=_safe(exc.detail),
+                    )
+
+                    if exc.category == "quota":
+                        try:
+                            _, next_slot = _KEYS.rotate_after_quota(api_key)
+                            logger.warning(
+                                "[Agnes] job=%s key_slot=%s quota exhausted; rotating to key_slot=%s",
+                                job_id,
+                                key_slot + 1,
+                                next_slot + 1,
+                            )
+                        except ProviderError:
+                            raise exc
+                        break  # go to next key_attempt with a fresh key
+
+                    if exc.category == "validation":
+                        body = str((exc.detail or {}).get("body", ""))
+                        cap_info = _parse_frame_cap_rejection(body)
+                        can_step_down = (
+                            cap_info is not None
+                            and frames > cap_info["max_num_frames"]
+                            and res_attempt <= AGNES_MAX_RES_STEPDOWNS
+                            and current_width > AGNES_MIN_DIMENSION
+                            and current_height > AGNES_MIN_DIMENSION
                         )
-                        continue
-                    except ProviderError:
-                        raise exc
-                raise
+                        if can_step_down:
+                            next_width = _dim(int(current_width * AGNES_RES_STEPDOWN_FACTOR))
+                            next_height = _dim(int(current_height * AGNES_RES_STEPDOWN_FACTOR))
+                            logger.warning(
+                                "[Agnes] job=%s frames=%s exceeds max_num_frames=%s for resolution=%s "
+                                "(agnes echoed %sx%s); stepping request dims %sx%s -> %sx%s and retrying "
+                                "same key/frames/fps",
+                                job_id,
+                                frames,
+                                cap_info["max_num_frames"],
+                                cap_info.get("resolution"),
+                                cap_info.get("echo_width"),
+                                cap_info.get("echo_height"),
+                                current_width,
+                                current_height,
+                                next_width,
+                                next_height,
+                            )
+                            current_width, current_height = next_width, next_height
+                            continue  # retry submit at the smaller resolution
+
+                    raise
+                else:
+                    created = _json(response, "Agnes video submission")
+                    video_id = created.get("video_id")
+                    _structured(
+                        "submit_accepted",
+                        job_id=job_id,
+                        key_slot=key_slot + 1,
+                        res_attempt=res_attempt,
+                        http_status=response.status_code,
+                        response_headers=_response_headers(response),
+                        response_keys=sorted(created.keys()),
+                        video_id=str(video_id) if video_id else None,
+                        response_body=_safe(created),
+                    )
+                    if not video_id:
+                        raise ProviderError(
+                            "Agnes submission returned no video_id",
+                            category="model",
+                            detail={"response": _safe(created)},
+                        )
+
+                    result = self._poll(api_key, str(video_id), job_id)
+                    video_url = result.get("url") or result.get("video_url")
+                    if not isinstance(video_url, str) or not video_url.startswith(("http://", "https://")):
+                        raise ProviderError(
+                            "Agnes completed without a usable video URL",
+                            category="model",
+                            detail={"video_id": video_id, "response": _safe(result)},
+                        )
+
+                    logger.info(
+                        "[Agnes] job=%s completed video_id=%s mode=%s refs=%s duration=%.3fs size=%sx%s",
+                        job_id,
+                        video_id,
+                        "keyframes" if use_keyframes else "img2video",
+                        len(refs),
+                        frames / fps,
+                        payload["width"],
+                        payload["height"],
+                    )
+                    _structured(
+                        "generation_completed",
+                        job_id=job_id,
+                        video_id=str(video_id),
+                        key_slot=key_slot + 1,
+                        mode="keyframes" if use_keyframes else "img2video",
+                        reference_count=len(refs),
+                        requested_seconds=seconds,
+                        actual_frame_seconds=frames / fps,
+                        frames=frames,
+                        fps=fps,
+                        final_width=payload["width"],
+                        final_height=payload["height"],
+                        res_attempt=res_attempt,
+                    )
+                    return GenerationResult(
+                        video_url=video_url,
+                        seed=result.get("seed", seed),
+                        raw={
+                            "provider": "agnes",
+                            "video_id": video_id,
+                            "status": result.get("status"),
+                            "requested_seconds": seconds,
+                            "actual_frame_seconds": frames / fps,
+                            "frames": frames,
+                            "fps": fps,
+                            "width": payload["width"],
+                            "height": payload["height"],
+                            "mode": "keyframes" if use_keyframes else "img2video",
+                            "reference_count": len(refs),
+                            "key_slot": key_slot,
+                            "resolution_stepdowns": res_attempt - 1,
+                            "canonical_uploader": "node",
+                        },
+                    )
 
         raise last_error or ProviderError("Agnes generation failed", category="unknown")
 
