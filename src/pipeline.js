@@ -1629,7 +1629,23 @@ async function generateShot(shot, storyline, characterList, globalEpisodeNumber,
   // sequential shots, the current still is always freshly authored from the target
   // semantic state. For retries, imageReuseUrl is safe only when it came from the
   // current invocation's image-generation callback.
-  let   imageReuseUrl = prevShot ? null : reuseImageUrl;
+  // Existing saved stills supplied by video-only regeneration are authoritative.
+  // Normal first-time generation may still reuse only its explicitly supplied
+  // same-invocation image. A predecessor shot must NOT automatically disable an
+  // explicit reuseImageUrl, because regenerateEpisodeVideos() passes the already
+  // generated current-shot still and must animate that exact image unchanged.
+  const explicitReuseImageUrl = String(reuseImageUrl || '').trim();
+  let imageReuseUrl = explicitReuseImageUrl || null;
+
+  if (imageReuseUrl) {
+    console.log(
+      `[Pipeline] Existing still reuse LOCKED | ` +
+      `S${shot.scene_number}/idx${shot.shot_index} ` +
+      `prevShot=${Boolean(prevShot)} ` +
+      `reuseImageUrl=${imageReuseUrl}`
+    );
+  }
+
   // Carries the constraint-corrected prompt across retry attempts. Without this,
   // each attempt rebuilt imagePrompt from scratch from currentShot.image_prompt,
   // silently discarding the correction (e.g. "force cool lighting") that was
@@ -1920,6 +1936,10 @@ async function generateShot(shot, storyline, characterList, globalEpisodeNumber,
       //    a new image (same character, same environment, different dialogue).
       let imageBuffer;
       if (imageReuseUrl) {
+      console.log(
+        `[Pipeline] Using existing shot still; image generation bypassed | ` +
+        `S${currentShot.scene_number}/idx${currentShot.shot_index}`
+      );
         console.log(`[Pipeline] Shot S${shot.scene_number}/idx${shot.shot_index} reusing existing image → ${imageReuseUrl.slice(-60)}`);
         try {
           const imgResp = await axios.get(imageReuseUrl, { responseType: 'arraybuffer', timeout: 30000 });
