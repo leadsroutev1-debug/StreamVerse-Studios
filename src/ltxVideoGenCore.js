@@ -62,7 +62,12 @@ class LTXTransientPollError extends Error {
 }
 
 const DEFAULT_MIN_DURATION = 1;
-const DEFAULT_MAX_DURATION = 10;
+// This core is retained for the LTX backend, whose native maximum remains 10s.
+// Agnes has its own provider adapter (`src/agnesVideoGen.js`) with an 18s ceiling.
+// Keep this fallback provider-aware so a missing config value cannot silently
+// reintroduce an LTX-era 10s default into an Agnes-configured runtime.
+const DEFAULT_LTX_MAX_DURATION = 10;
+const DEFAULT_AGNES_MAX_DURATION = 18;
 const HIGH_RES_WIDTH = 1024;
 const HIGH_RES_HEIGHT = 1536;
 const MAX_SEED = 2 ** 31 - 1;
@@ -91,14 +96,49 @@ function _resolveSeed(shotMeta = {}) {
 }
 
 function _resolveDuration(shotMeta = {}) {
-  const minDuration = _getPositiveNumber(config.ltxMinDuration, DEFAULT_MIN_DURATION);
+  const requested = Number(shotMeta.duration);
+
+  // Provider-aware fallback:
+  // - LTX stays capped at its verified 10s maximum.
+  // - Agnes is allowed up to its 18s maximum if this legacy core is ever
+  //   reached with Agnes selected, preventing an accidental 10s fallback.
+  const isAgnes = String(config.videoProvider || '').toLowerCase() === 'agnes';
+  const fallbackMaxDuration = isAgnes
+    ? DEFAULT_AGNES_MAX_DURATION
+    : DEFAULT_LTX_MAX_DURATION;
+
+  const configuredMinDuration = _getPositiveNumber(
+    config.ltxMinDuration,
+    DEFAULT_MIN_DURATION
+  );
+
+  const configuredMaxDuration = _getPositiveNumber(
+    config.ltxMaxDuration,
+    fallbackMaxDuration
+  );
+
+  const providerMaxDuration = isAgnes
+    ? DEFAULT_AGNES_MAX_DURATION
+    : DEFAULT_LTX_MAX_DURATION;
+
+  const minDuration = Math.min(
+    configuredMinDuration,
+    providerMaxDuration
+  );
+
   const maxDuration = Math.max(
     minDuration,
-    _getPositiveNumber(config.ltxMaxDuration, DEFAULT_MAX_DURATION)
+    Math.min(configuredMaxDuration, providerMaxDuration)
   );
-  const requested = Number(shotMeta.duration);
-  const duration = Number.isFinite(requested) ? requested : minDuration;
-  return Math.min(maxDuration, Math.max(minDuration, duration));
+
+  const duration = Number.isFinite(requested)
+    ? requested
+    : minDuration;
+
+  return Math.min(
+    maxDuration,
+    Math.max(minDuration, duration)
+  );
 }
 
 function _quotedDialogue(text) {
@@ -364,6 +404,12 @@ async function submitVideoJob(imageBuffer, shotMeta = {}) {
   const duration = _resolveDuration(shotMeta);
   const { width, height } = _resolveResolution(shotMeta);
   const seed = _resolveSeed(shotMeta);
+
+  console.log(
+    `[LTXVideoGen] Effective duration=${duration}s ` +
+    `provider=${String(config.videoProvider || 'ltx').toLowerCase()} ` +
+    `requested=${Number.isFinite(Number(shotMeta.duration)) ? Number(shotMeta.duration) : 'default'}`
+  );
   const randomizeSeed = Boolean(config.ltxRandomizeSeed);
   const enhancePrompt = false;
 
