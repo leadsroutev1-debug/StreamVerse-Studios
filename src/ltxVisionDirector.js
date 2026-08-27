@@ -2856,7 +2856,132 @@ function _strictSpeakerPositionNear(description, speaker, quoteIndex) {
   return false;
 }
 
-function _hardDialogueSubmissionAudit(description, sourceLines, dialogueBeats = [], visibleCharacters = []) {
+async function _semanticSpeakerOwnershipAudit(description, dialogueBeats = [], visibleCharacters = [], model = DEFAULT_MODEL) {
+  const beats = (Array.isArray(dialogueBeats) ? dialogueBeats : [])
+    .filter(beat => beat && beat.line && beat.speaker)
+    .map((beat, index) => ({
+      turn: index + 1,
+      speaker: _cleanText(beat.speaker),
+      line: _canonicalDialogueLine(beat.line),
+    }))
+    .filter(beat => beat.speaker && beat.line);
+
+  if (!beats.length) {
+    return {
+      valid: true,
+      evaluations: [],
+      unresolved: [],
+      invalid: [],
+      reason: 'no_named_dialogue_beats',
+    };
+  }
+
+  const candidateSpeakers = [...new Set([
+    ...(Array.isArray(visibleCharacters) ? visibleCharacters : []),
+    ...beats.map(beat => beat.speaker),
+  ].map(value => _cleanText(_isPlainObject(value)
+    ? value.name || value.character || value.character_name || value.speaker || value.speaker_name || ''
+    : value)).filter(Boolean))];
+
+  const system = [
+    'You are the semantic dialogue-ownership judge for a cinematic LTX image-to-video pipeline.',
+    'Read the COMPLETE generated shot description for meaning, chronology, dialogue context, character actions, reactions, voice attribution, pronouns, turn order, and staging.',
+    'Do NOT use rigid proximity rules, fixed word windows, punctuation patterns, or exact grammar templates.',
+    'Do NOT require the speaker name to appear immediately before the quotation.',
+    'Determine semantically whether each AUTHORITATIVE dialogue line is clearly spoken by its assigned character.',
+    'Equivalent constructions are valid: the character speaks, answers, responds, replies, mutters, whispers, their voice sounds, they say the words, the character delivers the line, etc.',
+    'Pronouns may establish ownership when the surrounding chronology makes the referent unambiguous.',
+    'A speaker may be established earlier and continue speaking across subsequent dialogue turns when there is no competing speaker cue.',
+    'Conversational turn order, listener reactions, gaze, body language, and explicit scene geography are valid semantic evidence.',
+    'Do not invent a speaker. Use only the candidate speakers supplied by the caller.',
+    'A line is invalid only when its ownership is genuinely ambiguous, contradictory, assigned to another character, or absent from the narrative.',
+    'Return JSON only with: evaluations, valid.',
+    'Each evaluation must contain line, assigned_speaker, confident, confidence, evidence, contradiction.',
+    'confidence must be from 0 to 1.',
+  ].join(' ');
+
+  const userText = JSON.stringify({
+    candidate_speakers: candidateSpeakers,
+    authoritative_dialogue_turns: beats,
+    generated_shot_description: String(description || ''),
+    instruction: 'Judge ownership by semantic meaning of the complete description. Do not reject merely because the speaker name is not syntactically adjacent to the quote.',
+  }, null, 2);
+
+  const keys = _keys();
+  if (!keys.length) {
+    throw new Error('[LTXVision] No Mistral keys configured for semantic dialogue audit');
+  }
+
+  const response = await axios.post(
+    'https://api.mistral.ai/v1/chat/completions',
+    {
+      model,
+      messages: [
+        { role: 'system', content: system },
+        { role: 'user', content: userText },
+      ],
+      temperature: 0.0,
+      response_format: { type: 'json_object' },
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${keys[0]}`,
+        'Content-Type': 'application/json',
+      },
+      timeout: REQUEST_TIMEOUT_MS,
+    }
+  );
+
+  const parsed = _parseStructuredContent(
+    response?.data?.choices?.[0]?.message?.content
+  );
+
+  const evaluations = Array.isArray(parsed?.evaluations)
+    ? parsed.evaluations
+    : [];
+
+  const byLine = new Map(
+    evaluations.map(item => [
+      _normalizeDialogueForMatch(item?.line || ''),
+      item,
+    ])
+  );
+
+  const invalid = [];
+  const unresolved = [];
+
+  for (const beat of beats) {
+    const evaluation = byLine.get(_normalizeDialogueForMatch(beat.line));
+    const speaker = _cleanText(evaluation?.assigned_speaker || '');
+    const confidence = Number(evaluation?.confidence);
+    const confident = evaluation?.confident === true || confidence >= 0.80;
+    const speakerAllowed = candidateSpeakers.some(name =>
+      name.toLowerCase() === speaker.toLowerCase()
+    );
+
+    if (!evaluation || !speaker || !speakerAllowed || !confident) {
+      const row = {
+        line: beat.line,
+        speaker: beat.speaker,
+        assignedSpeaker: speaker,
+        confidence: Number.isFinite(confidence) ? confidence : null,
+        evidence: _cleanText(evaluation?.evidence || ''),
+        contradiction: _cleanText(evaluation?.contradiction || ''),
+      };
+      invalid.push(row);
+      if (!evaluation || !speaker) unresolved.push(row);
+    }
+  }
+
+  return {
+    valid: invalid.length === 0 && evaluations.length >= beats.length,
+    evaluations,
+    unresolved,
+    invalid,
+  };
+}
+
+async function _hardDialogueSubmissionAudit(description, sourceLines, dialogueBeats = [], visibleCharacters = [], model = DEFAULT_MODEL) {
   const required = _dedupePreserveOrder(sourceLines || []);
   const spans = _strictQuotedDialogueSpans(description);
 
@@ -2923,24 +3048,8 @@ function _hardDialogueSubmissionAudit(description, sourceLines, dialogueBeats = 
       continue;
     }
 
-    if (!_strictSpeakerPerformanceNear(description, speaker, chosen.span.index)) {
-      speakerFailures.push({
-        line,
-        speaker,
-        reason: 'speaker_not_explicitly_bound_to_quote',
-        quoteIndex: chosen.span.index,
-      });
-      continue;
-    }
-
-    if (!_strictSpeakerPositionNear(description, speaker, chosen.span.index)) {
-      speakerFailures.push({
-        line,
-        speaker,
-        reason: 'speaker_position_not_bound_to_quote',
-        quoteIndex: chosen.span.index,
-      });
-    }
+    // Speaker ownership is adjudicated semantically below from the complete
+    // generated description. Do not apply lexical proximity/position heuristics here.
   }
 
   let previousIndex = -1;
@@ -2957,6 +3066,25 @@ function _hardDialogueSubmissionAudit(description, sourceLines, dialogueBeats = 
       _normalizeDialogueForMatch(line) !== span.strictNormalized
     );
   }).map(span => span.text);
+
+  const semantic = await _semanticSpeakerOwnershipAudit(
+    description,
+    dialogueBeats,
+    visibleCharacters,
+    model
+  );
+
+  for (const item of semantic.invalid || []) {
+    speakerFailures.push({
+      line: item.line,
+      speaker: item.speaker,
+      reason: item.contradiction
+        ? `semantic_speaker_ownership_failed: ${item.contradiction}`
+        : 'semantic_speaker_ownership_failed',
+      confidence: item.confidence,
+      evidence: item.evidence,
+    });
+  }
 
   return {
     valid:
@@ -2999,8 +3127,8 @@ function _buildHardDialogueRepairInstruction(audit) {
     'The shot MUST NOT be considered complete until every authoritative dialogue line is present as its own exact quoted utterance.',
     'Quotation marks are mandatory around every authored spoken line. Do not rely on semantic recovery for submission.',
     'Every authored line must occur exactly once in straight double quotes in the final ltx_shot_description.',
-    'Every authored line must be explicitly owned by its named speaker in the same speaking clause; include the speaker position before the speaking verb.',
-    'Do not use pronouns or unnamed voices for authored dialogue.',
+    'Every authored line must be semantically and unambiguously owned by its named speaker. Evaluate the whole chronological description, not speaker-name proximity or a fixed wording pattern.',
+    'Pronouns and indirect speaker references are allowed when the surrounding meaning makes the speaker unambiguous; reject only genuinely ambiguous or contradictory ownership.',
     'Do not put narration, actions, labels, written text, sound effects, ambience or internal thoughts inside quotation marks.',
     'Do not append a dialogue block. Integrate the quoted line into the chronological action.',
     missing,
@@ -4084,16 +4212,24 @@ async function describeForLTX({
           visibleCharacterNames
         );
 
-        const hardDialogueAudit = _hardDialogueSubmissionAudit(
+        const hardDialogueAudit = await _hardDialogueSubmissionAudit(
           description,
           sourceLines,
           dialogueBeats,
-          visibleCharacterNames
+          visibleCharacterNames,
+          model
         );
 
         _safeLog(
           '[LTXVision] HARD DIALOGUE SUBMISSION AUDIT:',
           hardDialogueAudit
+        );
+        _safeLog(
+          '[LTXVision] SEMANTIC SPEAKER OWNERSHIP:',
+          {
+            valid: hardDialogueAudit.valid,
+            failures: hardDialogueAudit.speakerFailures,
+          }
         );
 
         if (!hardDialogueAudit.valid) {
@@ -4223,11 +4359,12 @@ async function describeForLTX({
            * Never submit a dialogue-bearing prompt when the active performer is
            * ambiguous.
            */
-          const hardAudit = _hardDialogueSubmissionAudit(
+          const hardAudit = await _hardDialogueSubmissionAudit(
             description,
             sourceLines,
             dialogueBeats,
-            visibleCharacterNames
+            visibleCharacterNames,
+            model
           );
           const hardError = new Error(
             '[LTXVision] HARD_DIALOGUE_SUBMISSION_GATE_FAILED: authored dialogue is not fully quoted and speaker-bound.'
