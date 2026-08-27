@@ -2256,6 +2256,50 @@ async function generateShot(shot, storyline, characterList, globalEpisodeNumber,
           width:       config.ltxWidth,
           height:      config.ltxHeight,
           seed:        shotSeed,
+          episodeId: currentShot._episode_id || null,
+          sceneNumber: currentShot.scene_number,
+          shotIndex: currentShot.shot_index,
+          continuityLastFrameUrl: previousEndFrameUrl || null,
+          visionPreviousEndFrameUrl: previousEndFrameUrl || null,
+          visionPreviousShot: prevShot
+            ? {
+                scene_number: Number(prevShot.scene_number),
+                shot_index: Number(prevShot.shot_index),
+                end_frame_state: prevShot.end_frame_state || null,
+                end_frame_transition: prevShot.end_frame_transition || null,
+                next_shot_continuity: prevShot.next_shot_continuity || null,
+              }
+            : null,
+          // Vision Director authority: pass the complete authored shot, scene
+          // context, and ordered cast. The LTX core reads this object when
+          // building the multimodal director request.
+          visionContext: {
+            imageMime: 'image/png',
+            shot: {
+              ...currentShot,
+              _imageGenerationSource: 'actual_current_shot_still',
+              _visualContinuityMode: semanticTransitionPlan
+                ? 'semantic_previous_end_frame_to_fresh_current_still'
+                : (previousEndFrameUrl ? 'previous_end_frame_to_current_still' : 'current_still_only'),
+              _visualContinuityPreviousEndFrameUrl: previousEndFrameUrl || null,
+              _temporalCanvasSeconds: _videoTemporalContract().maxSeconds,
+            },
+            scene: {
+              scene_number: currentShot.scene_number,
+              location: currentShot._scene_location || '',
+              scene_description: currentShot._scene_description || '',
+              emotional_beat: currentShot._scene_emotion || '',
+              lighting_design: currentShot._lighting_design || '',
+              camera_language: currentShot._camera_language || '',
+            },
+            characters: orderedChars.map(c => ({
+              name: c.name,
+              visual_anchor: c.visual_anchor || '',
+              reference_image_url: c.reference_image_url || null,
+              seed: c.seed ?? null,
+              voice_id: c.voice_id || null,
+            })),
+          },
         };
       }
       const { jobId, apiKey, imageTmpPublicId } = await videoGen.submitVideoJob(imageBuffer, submitMeta);
@@ -3015,20 +3059,14 @@ async function _runPipeline() {
     );
   }
 
-  // ── Enforce scene speech coverage before downstream rendering ───────────────
-  // This is required when authoring/processing a fresh or incomplete script.
-  // IMPORTANT: a media_generation_ready checkpoint is already a production-
-  // ready persisted artifact. Do NOT re-run speech authoring/normalization on
-  // media-only resume; doing so can reinterpret valid persisted multi-turn
-  // dialogue and crash before the media loop even starts.
-  if (!mediaResumeStage) {
-    episodeScript = await scriptWriter.ensureSceneSpeechCoverage(episodeScript, {
-      storyline,
-      characters: characterList,
-    });
-  } else {
-    console.log('[Pipeline] ↺ Media-only resume: preserved persisted speech/dialogue metadata; scene speech coverage pass skipped');
-  }
+  // ── Enforce scene speech coverage before any downstream rendering layers ──
+  // Every character-led scene must contain meaningful audible speech: spoken
+  // dialogue when the scene naturally supports it, otherwise a contextual
+  // internal voice-over. Characterless establishing scenes remain ambient.
+  episodeScript = await scriptWriter.ensureSceneSpeechCoverage(episodeScript, {
+    storyline,
+    characters: characterList,
+  });
   if (episodeSimulation && !isResuming) {
     episodeScript.episode_trajectory = currentEpisodeTrajectory;
     episodeScript.narrative_simulation = episodeSimulation;
