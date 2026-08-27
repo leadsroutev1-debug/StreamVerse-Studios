@@ -2855,13 +2855,34 @@ function _enforceShotSpeechMetadata(shot, scene, characters = [], { hardFail = t
       : 0;
 
   if ((mode === 'spoken' || mode === 'phone_vo') && quotedCount > 1) {
-    // Count speaker-label OCCURRENCES, not unique speaker names. A single speaker
-    // can legitimately deliver several consecutive turns, but every quoted turn
-    // must still carry its own explicit speaker label.
-    if (labelledTurns.length !== quotedCount) {
+    // A single authoritative speaker may legitimately deliver several quoted
+    // utterances in one shot. Only require one speaker label per utterance when
+    // the text actually contains multiple distinct speaker identities.
+    const deterministicSpeakerCount = new Set(
+      speakers.map(name => String(name).trim().toLowerCase()).filter(Boolean)
+    ).size;
+    const labelledSpeakerCount = new Set(
+      labelledTurns.map(name => String(name).trim().toLowerCase()).filter(Boolean)
+    ).size;
+
+    const singleSpeakerMultiTurn =
+      deterministicSpeakerCount === 1 && labelledSpeakerCount <= 1;
+
+    const clearlyMultiSpeaker =
+      deterministicSpeakerCount > 1 || labelledSpeakerCount > 1;
+
+    if (clearlyMultiSpeaker && labelledTurns.length !== quotedCount) {
       const reason =
         `multi-turn spoken shot has ${quotedCount} quoted utterances but ${labelledTurns.length} ` +
-        `speaker-label occurrences; every turn must name its speaker`;
+        `speaker-label occurrences across multiple speakers; every turn must identify its speaker`;
+      if (hardFail) throw new Error(`[ScriptWriter] SPEAKER_TURN_CONTRACT_FAILED: ${reason}`);
+      return { valid: false, shot: out, speakers, reason };
+    }
+
+    if (!singleSpeakerMultiTurn && !clearlyMultiSpeaker && labelledTurns.length !== quotedCount) {
+      const reason =
+        `multi-turn spoken shot has ${quotedCount} quoted utterances but speaker ownership could not be ` +
+        `deterministically established for every turn`;
       if (hardFail) throw new Error(`[ScriptWriter] SPEAKER_TURN_CONTRACT_FAILED: ${reason}`);
       return { valid: false, shot: out, speakers, reason };
     }
@@ -2891,6 +2912,25 @@ function _enforceShotSpeechMetadata(shot, scene, characters = [], { hardFail = t
     out.dialogue_or_action = mode === 'spoken'
       ? `${finalSpeakers[0]}: ${text}`
       : `${finalSpeakers[0]} (PHONE): ${text}`;
+  }
+
+  // When one speaker owns several quoted turns but the model supplied only one
+  // speaker label, make the ownership explicit on every turn before the shot is
+  // handed downstream. This avoids ambiguity without inventing another speaker.
+  if ((mode === 'spoken' || mode === 'phone_vo') &&
+      finalSpeakers.length === 1 &&
+      quotedCount > 1 &&
+      labelledTurns.length === 1) {
+    const soleSpeaker = finalSpeakers[0];
+    const quotedParts = text.match(/["“”]\s*[^"“”]+\s*["“”]/g) || [];
+    if (quotedParts.length === quotedCount) {
+      const withoutFirstSpeakerPrefix = text.replace(/^\s*[^:\n]{1,100}:\s*(?=["“])/, '');
+      const rebuilt = withoutFirstSpeakerPrefix.replace(
+        /["“”]\s*[^"“”]+\s*["“”]/g,
+        part => `${soleSpeaker}: ${part}`
+      );
+      out.dialogue_or_action = rebuilt;
+    }
   }
 
   if (Array.isArray(out.character_staging) && out.character_staging.length) {
