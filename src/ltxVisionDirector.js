@@ -1199,6 +1199,9 @@ function _collectSpeakerCandidates({ intent = {}, characters = [] } = {}) {
   addMany(characters || []);
   addMany(intent.speaker || intent.speaker_name || intent.speakerName || '');
   addMany(intent.dialogue_speaker || intent.dialogueSpeaker || '');
+  addMany(intent.speakers_in_shot || []);
+  addMany(intent.character_staging || []);
+  addMany(intent.character_positions || '');
 
   return out;
 }
@@ -2732,6 +2735,238 @@ function _positionFirstRepairInstruction(diagnostics) {
   ].filter(Boolean).join(' ');
 }
 
+
+/* ============================================================================
+ * HARD LTX DIALOGUE SUBMISSION GATE
+ * ========================================================================== */
+
+function _strictQuotedDialogueSpans(description) {
+  const matches = [];
+  const text = String(description || '');
+  const regex = /"([^"]*)"|“([^”]*)”/g;
+  let match;
+
+  while ((match = regex.exec(text)) !== null) {
+    const utterance = _canonicalDialogueLine(
+      match[1] != null ? match[1] : match[2]
+    );
+    if (!utterance) continue;
+
+    matches.push({
+      text: utterance,
+      normalized: _normalizeDialogueForMatch(utterance),
+      strictNormalized: _normalizeDialogueForMatch(utterance),
+      index: match.index,
+      length: match[0].length,
+      end: match.index + match[0].length,
+    });
+  }
+
+  return matches;
+}
+
+function _strictSpeakerPerformanceNear(description, speaker, quoteIndex) {
+  const before = String(description || '')
+    .slice(Math.max(0, Number(quoteIndex) - 700), Number(quoteIndex))
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const escaped = _escapeRegex(speaker);
+  if (!escaped) return false;
+
+  const actionWords = '(?:says?|speaks?|replies?|answers?|asks?|whispers?|shouts?|calls?|mutters?|murmurs?|declares?|insists?|interrupts?|articulates?|speaking|talks?|talking)';
+
+  /* The active speaker must be named in the actual speaking clause. Merely
+   * mentioning the character somewhere earlier in the shot is not enough. */
+  const patterns = [
+    new RegExp(`\\b${escaped}\\b[^.!?]{0,360}\\b${actionWords}\\b[^.!?]{0,220}$`, 'i'),
+    new RegExp(`\\b${escaped}\\b\\s*,[^.!?]{0,220}\\b${actionWords}\\b[^.!?]{0,220}$`, 'i'),
+    new RegExp(`\\b${escaped}\\b\\s*:\\s*[^\\n]{0,320}$`, 'i'),
+  ];
+
+  return patterns.some(re => re.test(before));
+}
+
+function _strictSpeakerPositionNear(description, speaker, quoteIndex) {
+  const before = String(description || '')
+    .slice(Math.max(0, Number(quoteIndex) - 1100), Number(quoteIndex))
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  for (const alias of _speakerAliases(speaker)) {
+    const escaped = _escapeRegex(alias);
+    if (!escaped) continue;
+
+    const position = new RegExp(
+      `\\b(?:screen[-\\s]?(?:left|right|center|centre)|left|right|center|centre)\\b(?:\\s+|,\\s*)\\b(?:foreground|midground|background)\\b|\\b(?:foreground|midground|background)\\b(?:\\s+|,\\s*)\\b(?:screen[-\\s]?(?:left|right|center|centre)|left|right|center|centre)\\b`,
+      'i'
+    );
+
+    const idx = before.search(new RegExp(`\\b${escaped}\\b`, 'i'));
+    if (idx < 0) continue;
+
+    const local = before.slice(idx, Math.min(before.length, idx + 420));
+    if (position.test(local)) return true;
+  }
+
+  return false;
+}
+
+function _hardDialogueSubmissionAudit(description, sourceLines, dialogueBeats = [], visibleCharacters = []) {
+  const required = _dedupePreserveOrder(sourceLines || []);
+  const spans = _strictQuotedDialogueSpans(description);
+
+  if (!required.length) {
+    return {
+      valid: true,
+      required: 0,
+      quoted: spans.length,
+      missingQuoted: [],
+      duplicateQuoted: [],
+      outOfOrder: [],
+      speakerFailures: [],
+      unownedQuotedSpeech: [],
+    };
+  }
+
+  const speakerByLine = new Map(
+    (dialogueBeats || [])
+      .filter(beat => beat?.line)
+      .map(beat => [
+        _normalizeDialogueForMatch(beat.line),
+        _cleanText(beat.speaker || ''),
+      ])
+  );
+
+  const matched = [];
+  const missingQuoted = [];
+  const duplicateQuoted = [];
+  const outOfOrder = [];
+  const speakerFailures = [];
+  const usedSpanIndexes = new Set();
+
+  for (let r = 0; r < required.length; r++) {
+    const line = _canonicalDialogueLine(required[r]);
+    const normalized = _normalizeDialogueForMatch(line);
+    const candidates = spans
+      .map((span, index) => ({ span, index }))
+      .filter(({ span }) => span.strictNormalized === normalized);
+
+    if (candidates.length === 0) {
+      missingQuoted.push(line);
+      continue;
+    }
+
+    if (candidates.length > 1) {
+      duplicateQuoted.push(line);
+    }
+
+    const chosen = candidates.find(({ index }) => !usedSpanIndexes.has(index)) || candidates[0];
+    usedSpanIndexes.add(chosen.index);
+    matched.push({ source: line, span: chosen.span, index: chosen.index });
+
+    const beat = (dialogueBeats || []).find(item =>
+      _normalizeDialogueForMatch(item?.line || '') === normalized
+    );
+    const speaker = _cleanText(beat?.speaker || speakerByLine.get(normalized) || '');
+
+    if (!speaker) {
+      speakerFailures.push({
+        line,
+        reason: 'missing_named_speaker',
+        quoteIndex: chosen.span.index,
+      });
+      continue;
+    }
+
+    if (!_strictSpeakerPerformanceNear(description, speaker, chosen.span.index)) {
+      speakerFailures.push({
+        line,
+        speaker,
+        reason: 'speaker_not_explicitly_bound_to_quote',
+        quoteIndex: chosen.span.index,
+      });
+      continue;
+    }
+
+    if (!_strictSpeakerPositionNear(description, speaker, chosen.span.index)) {
+      speakerFailures.push({
+        line,
+        speaker,
+        reason: 'speaker_position_not_bound_to_quote',
+        quoteIndex: chosen.span.index,
+      });
+    }
+  }
+
+  let previousIndex = -1;
+  for (const match of matched) {
+    if (match.index < previousIndex) {
+      outOfOrder.push(match.source);
+    }
+    previousIndex = match.index;
+  }
+
+  const unownedQuotedSpeech = spans.filter((span, index) => {
+    if (usedSpanIndexes.has(index)) return false;
+    return required.every(line =>
+      _normalizeDialogueForMatch(line) !== span.strictNormalized
+    );
+  }).map(span => span.text);
+
+  return {
+    valid:
+      missingQuoted.length === 0 &&
+      duplicateQuoted.length === 0 &&
+      outOfOrder.length === 0 &&
+      speakerFailures.length === 0,
+    required: required.length,
+    quoted: spans.length,
+    missingQuoted: _dedupePreserveOrder(missingQuoted),
+    duplicateQuoted: _dedupePreserveOrder(duplicateQuoted),
+    outOfOrder: _dedupePreserveOrder(outOfOrder),
+    speakerFailures,
+    unownedQuotedSpeech: _dedupePreserveOrder(unownedQuotedSpeech),
+    matched,
+  };
+}
+
+function _buildHardDialogueRepairInstruction(audit) {
+  if (!audit || audit.valid) return '';
+
+  const missing = audit.missingQuoted?.length
+    ? `MISSING QUOTED LINES: ${audit.missingQuoted.map(line => `"${line}"`).join(' ')}`
+    : '';
+  const duplicate = audit.duplicateQuoted?.length
+    ? `DUPLICATE QUOTED LINES: ${audit.duplicateQuoted.map(line => `"${line}"`).join(' ')}`
+    : '';
+  const order = audit.outOfOrder?.length
+    ? `OUT-OF-ORDER LINES: ${audit.outOfOrder.map(line => `"${line}"`).join(' ')}`
+    : '';
+  const speakerFailures = audit.speakerFailures?.length
+    ? `SPEAKER-BINDING FAILURES: ${audit.speakerFailures.map(item => {
+        const speaker = item.speaker ? ` assigned speaker=${item.speaker};` : '';
+        return `line="${item.line}"${speaker} reason=${item.reason}`;
+      }).join(' | ')}`
+    : '';
+
+  return [
+    'HARD DIALOGUE SUBMISSION GATE FAILED.',
+    'The shot MUST NOT be considered complete until every authoritative dialogue line is present as its own exact quoted utterance.',
+    'Quotation marks are mandatory around every authored spoken line. Do not rely on semantic recovery for submission.',
+    'Every authored line must occur exactly once in straight double quotes in the final ltx_shot_description.',
+    'Every authored line must be explicitly owned by its named speaker in the same speaking clause; include the speaker position before the speaking verb.',
+    'Do not use pronouns or unnamed voices for authored dialogue.',
+    'Do not put narration, actions, labels, written text, sound effects, ambience or internal thoughts inside quotation marks.',
+    'Do not append a dialogue block. Integrate the quoted line into the chronological action.',
+    missing,
+    duplicate,
+    order,
+    speakerFailures,
+    'REWRITE THE COMPLETE ltx_shot_description and return only that field.',
+  ].filter(Boolean).join(' ');
+}
+
 function _dialogueIntegrity(sourceLines, description, dialogueBeats = [], visibleCharacters = []) {
   const required = (sourceLines || [])
     .map(_canonicalDialogueLine)
@@ -3789,6 +4024,49 @@ async function describeForLTX({
           visibleCharacterNames
         );
 
+        const hardDialogueAudit = _hardDialogueSubmissionAudit(
+          description,
+          sourceLines,
+          dialogueBeats,
+          visibleCharacterNames
+        );
+
+        _safeLog(
+          '[LTXVision] HARD DIALOGUE SUBMISSION AUDIT:',
+          hardDialogueAudit
+        );
+
+        if (!hardDialogueAudit.valid) {
+          const hardRepairInstruction = _buildHardDialogueRepairInstruction(
+            hardDialogueAudit
+          );
+
+          previousDescription = description;
+          currentRepairInstruction = [
+            currentRepairInstruction,
+            hardRepairInstruction,
+          ].filter(Boolean).join(' ');
+
+          console.warn(
+            '[LTXVision] HARD dialogue submission gate failed | ' +
+            `missingQuoted=${hardDialogueAudit.missingQuoted.length} ` +
+            `duplicateQuoted=${hardDialogueAudit.duplicateQuoted.length} ` +
+            `speakerFailures=${hardDialogueAudit.speakerFailures.length}`
+          );
+
+          if (repairAttempt < MAX_TARGETED_REPAIRS_PER_KEY) {
+            continue;
+          }
+
+          const hardError = new Error(
+            '[LTXVision] HARD_DIALOGUE_SUBMISSION_GATE_FAILED: generated LTX prompt did not contain every authoritative dialogue line as a properly quoted, explicitly speaker-bound utterance.'
+          );
+          hardError.code = 'LTX_HARD_DIALOGUE_SUBMISSION_GATE';
+          hardError.audit = hardDialogueAudit;
+          hardError.previousDescription = description;
+          throw hardError;
+        }
+
         _safeLog(
           '[LTXVision] FINAL CANDIDATE AFTER DIALOGUE NORMALIZATION:',
           description
@@ -3881,15 +4159,24 @@ async function describeForLTX({
           }
 
           /*
-           * Speaker attribution remains a quality/retry condition rather than a
-           * fatal validation error. We have exhausted targeted repair for this
-           * key, so preserve the complete multi-speaker description instead of
-           * collapsing the scene or failing the pipeline.
+           * HARD FAIL: speaker attribution is part of the LTX dialogue contract.
+           * Never submit a dialogue-bearing prompt when the active performer is
+           * ambiguous.
            */
-          console.warn(
-            '[LTXVision] speaker attribution retry budget exhausted; accepting semantically complete multi-speaker description'
+          const hardAudit = _hardDialogueSubmissionAudit(
+            description,
+            sourceLines,
+            dialogueBeats,
+            visibleCharacterNames
           );
-          return description;
+          const hardError = new Error(
+            '[LTXVision] HARD_DIALOGUE_SUBMISSION_GATE_FAILED: authored dialogue is not fully quoted and speaker-bound.'
+          );
+          hardError.code = 'LTX_HARD_DIALOGUE_SUBMISSION_GATE';
+          hardError.audit = hardAudit;
+          hardError.previousDescription = description;
+          lastError = hardError;
+          throw hardError;
         }
 
         if (
@@ -4044,6 +4331,13 @@ async function describeForLTX({
 
       if (
         err?.code ===
+        'LTX_HARD_DIALOGUE_SUBMISSION_GATE'
+      ) {
+        throw err;
+      }
+
+      if (
+        err?.code ===
         'LTX_VISION_INVALID_STRUCTURED_OUTPUT'
       ) {
         throw err;
@@ -4096,6 +4390,8 @@ module.exports = {
   _bestSemanticDialogueOccurrence,
   _findDialogueOccurrence,
   _dialogueIntegrity,
+  _hardDialogueSubmissionAudit,
+  _buildHardDialogueRepairInstruction,
   _dialogueBeatRegistry,
   _speakerAttributionDiagnostics,
   _speakerAttributionRepairInstruction,
