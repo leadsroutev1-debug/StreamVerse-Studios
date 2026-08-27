@@ -3015,14 +3015,20 @@ async function _runPipeline() {
     );
   }
 
-  // ── Enforce scene speech coverage before any downstream rendering layers ──
-  // Every character-led scene must contain meaningful audible speech: spoken
-  // dialogue when the scene naturally supports it, otherwise a contextual
-  // internal voice-over. Characterless establishing scenes remain ambient.
-  episodeScript = await scriptWriter.ensureSceneSpeechCoverage(episodeScript, {
-    storyline,
-    characters: characterList,
-  });
+  // ── Enforce scene speech coverage before downstream rendering ───────────────
+  // This is required when authoring/processing a fresh or incomplete script.
+  // IMPORTANT: a media_generation_ready checkpoint is already a production-
+  // ready persisted artifact. Do NOT re-run speech authoring/normalization on
+  // media-only resume; doing so can reinterpret valid persisted multi-turn
+  // dialogue and crash before the media loop even starts.
+  if (!mediaResumeStage) {
+    episodeScript = await scriptWriter.ensureSceneSpeechCoverage(episodeScript, {
+      storyline,
+      characters: characterList,
+    });
+  } else {
+    console.log('[Pipeline] ↺ Media-only resume: preserved persisted speech/dialogue metadata; scene speech coverage pass skipped');
+  }
   if (episodeSimulation && !isResuming) {
     episodeScript.episode_trajectory = currentEpisodeTrajectory;
     episodeScript.narrative_simulation = episodeSimulation;
