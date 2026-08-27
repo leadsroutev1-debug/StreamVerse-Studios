@@ -2817,6 +2817,16 @@ function _inferShotSpeakers(shot, scene, characters) {
   return ordered;
 }
 
+function _getAuthoritativeConversationTurnSpeakers(shot, characters = []) {
+  const turns = Array.isArray(shot?._conversation_plan?.turns)
+    ? shot._conversation_plan.turns
+    : [];
+  const names = turns
+    .map(turn => _canonicalCharacterName(turn?.speaker, characters))
+    .filter(Boolean);
+  return names;
+}
+
 function _enforceShotSpeechMetadata(shot, scene, characters = [], { hardFail = true } = {}) {
   const out = { ...(shot || {}) };
   const mode = String(out.tts_mode || '').trim().toLowerCase();
@@ -2851,44 +2861,50 @@ function _enforceShotSpeechMetadata(shot, scene, characters = [], { hardFail = t
 
   const quotedCount =
     (mode === 'spoken' || mode === 'phone_vo')
-      ? (text.match(/[\"“”]\s*[^\"“”]{1,}\s*[\"“”]/g) || []).length
+      ? (text.match(/["“”]\s*[^"“”]{1,}\s*["“”]/g) || []).length
       : 0;
 
-  if ((mode === 'spoken' || mode === 'phone_vo') && quotedCount > 1) {
-    // A single authoritative speaker may legitimately deliver several quoted
-    // utterances in one shot. Only require one speaker label per utterance when
-    // the text actually contains multiple distinct speaker identities.
-    const deterministicSpeakerCount = new Set(
-      speakers.map(name => String(name).trim().toLowerCase()).filter(Boolean)
-    ).size;
-    const labelledSpeakerCount = new Set(
-      labelledTurns.map(name => String(name).trim().toLowerCase()).filter(Boolean)
-    ).size;
+  // Prefer the already-built conversation turn plan. It is the authoritative
+  // chronological speaker registry and is more reliable than counting textual
+  // NAME: prefixes in a persisted natural-language dialogue field.
+  const plannedTurnSpeakers = _getAuthoritativeConversationTurnSpeakers(out, characters);
 
-    const singleSpeakerMultiTurn =
-      deterministicSpeakerCount === 1 && labelledSpeakerCount <= 1;
-
-    const clearlyMultiSpeaker =
-      deterministicSpeakerCount > 1 || labelledSpeakerCount > 1;
-
-    if (clearlyMultiSpeaker && labelledTurns.length !== quotedCount) {
-      const reason =
-        `multi-turn spoken shot has ${quotedCount} quoted utterances but ${labelledTurns.length} ` +
-        `speaker-label occurrences across multiple speakers; every turn must identify its speaker`;
-      if (hardFail) throw new Error(`[ScriptWriter] SPEAKER_TURN_CONTRACT_FAILED: ${reason}`);
-      return { valid: false, shot: out, speakers, reason };
+  let turnSpeakers = [];
+  if ((mode === 'spoken' || mode === 'phone_vo') && quotedCount > 0) {
+    if (plannedTurnSpeakers.length === quotedCount) {
+      turnSpeakers = plannedTurnSpeakers.slice();
+    } else if (Array.isArray(out.speakers_in_shot) && out.speakers_in_shot.length === quotedCount) {
+      const canonicalRegistry = out.speakers_in_shot
+        .map(name => _canonicalCharacterName(name, characters))
+        .filter(Boolean);
+      if (canonicalRegistry.length === quotedCount) turnSpeakers = canonicalRegistry;
+    } else if (labelledTurns.length === quotedCount) {
+      turnSpeakers = labelledTurns.slice();
+    } else if (speakers.length === 1) {
+      // One deterministic speaker may legitimately own several consecutive
+      // quoted utterances. Repeat that speaker for each authored utterance.
+      turnSpeakers = Array.from({ length: quotedCount }, () => speakers[0]);
+    } else if (labelledTurns.length > 0) {
+      // We have multiple known speakers but the natural-language field has an
+      // incomplete label sequence. Do not manufacture an alternating pattern.
+      // However, an ordered conversation plan may still establish ownership from
+      // the per-turn metadata; if it did not, this shot is genuinely ambiguous.
+      turnSpeakers = [];
     }
 
-    if (!singleSpeakerMultiTurn && !clearlyMultiSpeaker && labelledTurns.length !== quotedCount) {
+    if (!turnSpeakers.length) {
       const reason =
-        `multi-turn spoken shot has ${quotedCount} quoted utterances but speaker ownership could not be ` +
-        `deterministically established for every turn`;
+        `multi-turn spoken shot has ${quotedCount} quoted utterances but speaker ownership ` +
+        `could not be deterministically established from the persisted turn plan, speaker registry, ` +
+        `or explicit labels; known speakers=${JSON.stringify(speakers)}`;
       if (hardFail) throw new Error(`[ScriptWriter] SPEAKER_TURN_CONTRACT_FAILED: ${reason}`);
       return { valid: false, shot: out, speakers, reason };
     }
   }
 
-  const finalSpeakers = labelled.length ? labelled : speakers;
+  const finalSpeakers = turnSpeakers.length
+    ? [...new Map(turnSpeakers.map(name => [String(name).trim().toLowerCase(), String(name).trim()])).values()]
+    : (labelled.length ? labelled : speakers);
 
   out.speaker = finalSpeakers[0];
   out.speaker_name = finalSpeakers[0];
@@ -2914,21 +2930,17 @@ function _enforceShotSpeechMetadata(shot, scene, characters = [], { hardFail = t
       : `${finalSpeakers[0]} (PHONE): ${text}`;
   }
 
-  // When one speaker owns several quoted turns but the model supplied only one
-  // speaker label, make the ownership explicit on every turn before the shot is
-  // handed downstream. This avoids ambiguity without inventing another speaker.
+  // Make turn ownership explicit before downstream LTX authoring whenever
+  // a deterministic chronological speaker registry is available. This is a
+  // normalization step only; the quoted words themselves are never changed.
   if ((mode === 'spoken' || mode === 'phone_vo') &&
-      finalSpeakers.length === 1 &&
-      quotedCount > 1 &&
-      labelledTurns.length === 1) {
-    const soleSpeaker = finalSpeakers[0];
+      quotedCount > 0 &&
+      turnSpeakers.length === quotedCount) {
     const quotedParts = text.match(/["“”]\s*[^"“”]+\s*["“”]/g) || [];
     if (quotedParts.length === quotedCount) {
-      const withoutFirstSpeakerPrefix = text.replace(/^\s*[^:\n]{1,100}:\s*(?=["“])/, '');
-      const rebuilt = withoutFirstSpeakerPrefix.replace(
-        /["“”]\s*[^"“”]+\s*["“”]/g,
-        part => `${soleSpeaker}: ${part}`
-      );
+      const rebuilt = quotedParts.map((part, index) =>
+        `${turnSpeakers[index]}: ${part}`
+      ).join('\n');
       out.dialogue_or_action = rebuilt;
     }
   }
@@ -3279,6 +3291,17 @@ Return JSON ONLY: {"tts_mode":"spoken | internal_monologue","speaker":"${speaker
  */
 async function ensureSceneSpeechCoverage(script, { storyline, characters } = {}) {
   if (!script || !Array.isArray(script.scenes)) return script;
+
+  // A media-generation resume is consuming an already-locked production script.
+  // Do NOT run speech insertion/rewriting again: that can mutate a persisted
+  // multi-turn conversation or reject a valid historical formatting shape before
+  // the media loop even starts. Fresh/script-processing runs still receive the
+  // full speech coverage gate below.
+  const checkpointStage = String(script?.checkpoint_state?.stage || '').trim().toLowerCase();
+  if (['media_generation_ready', 'media_generation', 'media_complete'].includes(checkpointStage)) {
+    console.log(`[ScriptWriter] ↺ Preserved persisted speech/dialogue metadata during ${checkpointStage} media resume`);
+    return script;
+  }
   for (const scene of script.scenes) {
     if (IS_AGNES_PROVIDER) {
       await _ensureAgnesConversationalScene(scene, { storyline, characters });
