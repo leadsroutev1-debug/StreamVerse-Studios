@@ -1944,7 +1944,7 @@ Return exactly:
       "start_state": "...",
       "action_arc": "...",
       "dialogue_intent": "spoken|internal_monologue|ambient|phone_vo",
-      "speaker": "character name or empty",
+      "speaker": "Exact character name from CAST; REQUIRED and NON-EMPTY for spoken, phone_vo, or internal_monologue shots; empty ONLY for ambient/action-only shots",
       "dialogue_purpose": "what must be said/heard, without inventing exact final wording",
       "character_state_change": "...",
       "environment_state_change": "...",
@@ -1968,6 +1968,11 @@ HARD REQUIREMENTS:
 - Do NOT skip or duplicate a local index.
 - Do NOT change scene number.
 - Do NOT introduce new characters, locations, props, time jumps, or costume changes unsupported by the locked scene.
+- SPEAKER CONTRACT: when dialogue_intent is spoken, phone_vo, or internal_monologue, speaker MUST be a specific named character from CAST and MUST NOT be empty.
+- NEVER output speaker="" for an audible shot.
+- If multiple characters are present, determine the intended speaker from the locked scene context, character staging, and dialogue_purpose; do not guess an unrelated character.
+- speakers_in_shot must list every speaker in chronological order when a shot contains multiple dialogue turns.
+- An audible shot with missing/ambiguous speaker metadata is INVALID and must be repaired before it can be checkpointed.
 - If the scene moves between locations, the first shot must begin at the true origin state, intermediate shots must depict physical transit, and the destination must appear only at the appropriate arrival stage.
 - A destination may not be used as the opening image of a departure or transit shot.
 - Preserve the emotional and causal progression.
@@ -2027,7 +2032,17 @@ HARD REQUIREMENTS:
       }
     }
 
-    const sceneShots = result.shots.map(shot => ({ ...shot }));
+    const sceneShots = result.shots.map((shot, shotPos) => {
+      const targetScene = plannedScenes.find(sc => Number(sc.scene_number) === sceneNo) || null;
+      const validated = _validateShotSimulationSpeech(shot, targetScene, characters);
+      if (!validated.valid) {
+        throw new Error(
+          `[ScriptWriter] SHOT_SIMULATION_SPEAKER_REQUIRED S${sceneNo}/${shotPos + 1}: ${validated.reason}`
+        );
+      }
+      return validated.shot;
+    });
+
     const shotSimulationScenes = plannedScenes.map(sc => ({
       ...sc,
       ...(simulatedScenes.find(ss => Number(ss.scene_number) === Number(sc.scene_number)) || {}),
@@ -2044,7 +2059,15 @@ HARD REQUIREMENTS:
       shotSimulationScenes,
       working.episode
     );
-    working.shots = previewSimulation.shots;
+    working.shots = previewSimulation.shots.map(shot => {
+      const targetScene = plannedScenes.find(sc => Number(sc.scene_number) === Number(shot.scene_number)) || null;
+      return _enforceShotSpeechMetadata(
+        shot,
+        targetScene,
+        characters,
+        { hardFail: true }
+      ).shot;
+    });
     working.shots.sort((a, b) => Number(a.scene_number) - Number(b.scene_number) || Number(a.shot_index) - Number(b.shot_index));
 
     if (typeof checkpoint === 'function') {
@@ -2484,6 +2507,7 @@ The compiled episode MUST run at minimum 2 minutes. The final scene's last shot 
   const scenesWithShots = await _writeSceneShotsSequential({
     scenes: blueprint.scenes,
     characterBlock,
+    characters,
     shotSimulation,
     existingScenes,
     checkpoint: async ({ sceneNumber, completedSceneNumbers, scenes: partialScenes }) => {
@@ -2661,6 +2685,254 @@ const SHOT_SCHEMA = `{
  * Build a one-line memory digest for a scene that has already been written.
  * Purely local — no LLM call — derived from the shots already returned.
  */
+
+/**
+ * HARD SPEAKER / DIALOGUE CONTRACT
+ *
+ * Audible dialogue and speaker identity are one semantic unit. A shot is never
+ * considered production/LTX-ready when it contains audible speech without a
+ * deterministic named speaker.
+ */
+function _canonicalCharacterName(value, characters = []) {
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+
+  const normalize = candidate =>
+    String(candidate || '').trim().toLowerCase().replace(/\s+/g, ' ');
+
+  const catalog = Array.isArray(characters) ? characters : [];
+  const exact = catalog.find(c => normalize(c?.name) === normalize(raw));
+  if (exact?.name) return String(exact.name).trim();
+
+  const partial = catalog.find(c => {
+    const a = normalize(c?.name);
+    const b = normalize(raw);
+    return a && b && (a.includes(b) || b.includes(a));
+  });
+  if (partial?.name) return String(partial.name).trim();
+
+  // When a cast catalog is supplied, an unknown speaker is invalid.
+  // When no catalog is available (runtime repair fallback), preserve the
+  // explicit metadata so the caller can still validate the structure.
+  return catalog.length ? null : raw;
+}
+
+function _extractQuotedSpeakerLabels(text) {
+  const source = String(text || '');
+  const labels = [];
+  const patterns = [
+    /(?:^|\n|\r)\s*([^:\n\r]{1,100}):\s*[\"“]/g,
+    /(?:^|\s)([A-Za-z][A-Za-z0-9 .,'’'_-]{0,99}):\s*[\"“]/g,
+  ];
+
+  for (const re of patterns) {
+    let match;
+    while ((match = re.exec(source))) {
+      const name = String(match[1] || '').trim();
+      if (name && !labels.some(existing => existing.toLowerCase() === name.toLowerCase())) {
+        labels.push(name);
+      }
+    }
+  }
+
+  return labels;
+}
+
+function _shotVisibleCharacters(shot, scene, characters) {
+  // characters_in_shot is the actual frame-level authority. Only fall back to
+  // scene.characters_present when the shot did not provide a frame-level list.
+  const shotNames = Array.isArray(shot?.characters_in_shot)
+    ? shot.characters_in_shot.filter(Boolean)
+    : [];
+  const raw = shotNames.length
+    ? shotNames
+    : (Array.isArray(scene?.characters_present) ? scene.characters_present : []);
+
+  const names = raw
+    .map(value => _canonicalCharacterName(value, characters))
+    .filter(Boolean);
+
+  return [...new Map(
+    names.map(name => [String(name).trim().toLowerCase(), String(name).trim()])
+  ).values()];
+}
+
+function _inferShotSpeakers(shot, scene, characters) {
+  const explicit = [
+    shot?.speaker_name,
+    shot?.speaker,
+    ...(Array.isArray(shot?.speakers_in_shot) ? shot.speakers_in_shot : []),
+  ]
+    .filter(Boolean)
+    .map(value => _canonicalCharacterName(value, characters))
+    .filter(Boolean);
+
+  const labelled = _extractQuotedSpeakerLabels(shot?.dialogue_or_action)
+    .map(value => _canonicalCharacterName(value, characters))
+    .filter(Boolean);
+
+  const stagingSpeakers = (Array.isArray(shot?.character_staging) ? shot.character_staging : [])
+    .filter(row => row && row.speaking === true)
+    .map(row => _canonicalCharacterName(row.name, characters))
+    .filter(Boolean);
+
+  const visible = _shotVisibleCharacters(shot, scene, characters);
+  const ordered = [];
+
+  for (const candidate of [...explicit, ...labelled, ...stagingSpeakers]) {
+    const canonical = _canonicalCharacterName(candidate, characters);
+    const key = String(canonical || '').trim().toLowerCase();
+    if (key && !ordered.some(existing => existing.toLowerCase() === key)) {
+      ordered.push(String(canonical).trim());
+    }
+  }
+
+  // Deterministic fallback is safe only when exactly one visible/declared
+  // character exists. Never guess between multiple characters.
+  if (!ordered.length && visible.length === 1) {
+    ordered.push(visible[0]);
+  }
+
+  if (!ordered.length && visible.length > 1) {
+    const contextText = String(shot?.dialogue_purpose || '').toLowerCase();
+    const mentioned = visible.filter(name =>
+      contextText.includes(String(name).toLowerCase())
+    );
+    if (mentioned.length === 1) ordered.push(mentioned[0]);
+  }
+
+  if (!ordered.length) {
+    const declared = (Array.isArray(scene?.characters_present) ? scene.characters_present : [])
+      .map(value => _canonicalCharacterName(value, characters))
+      .filter(Boolean);
+    const uniqueDeclared = [...new Map(
+      declared.map(name => [String(name).trim().toLowerCase(), String(name).trim()])
+    ).values()];
+    if (uniqueDeclared.length === 1) ordered.push(uniqueDeclared[0]);
+  }
+
+  return ordered;
+}
+
+function _enforceShotSpeechMetadata(shot, scene, characters = [], { hardFail = true } = {}) {
+  const out = { ...(shot || {}) };
+  const mode = String(out.tts_mode || '').trim().toLowerCase();
+  const text = String(out.dialogue_or_action || '').trim();
+  const audible = ['spoken', 'phone_vo', 'internal_monologue'].includes(mode);
+
+  if (!audible) return { valid: true, shot: out, speakers: [], reason: '' };
+
+  if ((mode === 'spoken' || mode === 'phone_vo') &&
+      !/[\"“”]\s*[^\"“”]{1,}\s*[\"“”]/.test(text)) {
+    const reason = `tts_mode=${mode} but dialogue_or_action contains no quoted audible words`;
+    if (hardFail) throw new Error(`[ScriptWriter] SPEECH_CONTRACT_FAILED: ${reason}`);
+    return { valid: false, shot: out, speakers: [], reason };
+  }
+
+  const speakers = _inferShotSpeakers(out, scene, characters);
+
+  if (!speakers.length) {
+    const reason =
+      `audible dialogue exists but no deterministic named speaker can be resolved; ` +
+      `visible=${JSON.stringify(_shotVisibleCharacters(out, scene, characters))}`;
+    if (hardFail) throw new Error(`[ScriptWriter] SPEECH_SPEAKER_REQUIRED: ${reason}`);
+    return { valid: false, shot: out, speakers: [], reason };
+  }
+
+  const labelled = _extractQuotedSpeakerLabels(text)
+    .map(value => _canonicalCharacterName(value, characters))
+    .filter(Boolean);
+
+  const quotedCount =
+    (mode === 'spoken' || mode === 'phone_vo')
+      ? (text.match(/[\"“”]\s*[^\"“”]{1,}\s*[\"“”]/g) || []).length
+      : 0;
+
+  if ((mode === 'spoken' || mode === 'phone_vo') &&
+      quotedCount > 1 &&
+      labelled.length !== quotedCount) {
+    const reason =
+      `multi-turn spoken shot has ${quotedCount} quoted utterances but ${labelled.length} ` +
+      `explicit speaker labels; every turn must name its speaker`;
+    if (hardFail) throw new Error(`[ScriptWriter] SPEAKER_TURN_CONTRACT_FAILED: ${reason}`);
+    return { valid: false, shot: out, speakers, reason };
+  }
+
+  const finalSpeakers = labelled.length ? labelled : speakers;
+
+  out.speaker = finalSpeakers[0];
+  out.speaker_name = finalSpeakers[0];
+  out.speakers_in_shot = finalSpeakers.slice();
+
+  out.characters_in_shot = [...new Map(
+    [
+      ...(Array.isArray(out.characters_in_shot) ? out.characters_in_shot : []),
+      ...finalSpeakers,
+    ]
+      .map(value => _canonicalCharacterName(value, characters))
+      .filter(Boolean)
+      .map(name => [String(name).trim().toLowerCase(), String(name).trim()])
+  ).values()];
+
+  // If quoted speech has no explicit speaker prefix but the speaker is
+  // unambiguous, insert the prefix deterministically.
+  if ((mode === 'spoken' || mode === 'phone_vo') &&
+      finalSpeakers.length === 1 &&
+      labelled.length === 0) {
+    out.dialogue_or_action = mode === 'spoken'
+      ? `${finalSpeakers[0]}: ${text}`
+      : `${finalSpeakers[0]} (PHONE): ${text}`;
+  }
+
+  if (Array.isArray(out.character_staging) && out.character_staging.length) {
+    out.character_staging = out.character_staging.map(row => {
+      if (!row || typeof row !== 'object') return row;
+      const rowName = _canonicalCharacterName(row.name, characters);
+      return {
+        ...row,
+        speaking: finalSpeakers.some(name =>
+          String(name).trim().toLowerCase() === String(rowName || '').trim().toLowerCase()
+        ),
+      };
+    });
+  }
+
+  return { valid: true, shot: out, speakers: finalSpeakers, reason: '' };
+}
+
+function _validateShotSimulationSpeech(shot, scene, characters = []) {
+  const mode = String(shot?.dialogue_intent || '').trim().toLowerCase();
+  if (!['spoken', 'phone_vo', 'internal_monologue'].includes(mode)) {
+    return { valid: true, shot: { ...(shot || {}) }, reason: '' };
+  }
+
+  const out = { ...(shot || {}) };
+  const inferred = _inferShotSpeakers(
+    {
+      ...out,
+      tts_mode: mode,
+      dialogue_or_action: out.dialogue_purpose || '',
+    },
+    scene,
+    characters
+  );
+
+  if (!inferred.length) {
+    return {
+      valid: false,
+      shot: out,
+      reason:
+        `dialogue_intent=${mode} requires a named speaker; model returned an empty speaker ` +
+        `and the speaker cannot be deterministically resolved from the locked scene/cast`,
+    };
+  }
+
+  out.speaker = inferred[0];
+  out.speaker_name = inferred[0];
+  out.speakers_in_shot = inferred.slice();
+  return { valid: true, shot: out, reason: '' };
+}
+
 function _summarizeSceneForMemory(scene) {
   const shots = scene.shots || [];
   const lastLine = [...shots].reverse().find(s => s.dialogue_or_action)?.dialogue_or_action;
@@ -2918,7 +3190,7 @@ Return JSON ONLY: {"tts_mode":"spoken | internal_monologue","speaker":"${speaker
       `${DIRECTOR_PERSONA}\nSPEECH COVERAGE GUARD: use contextually necessary human speech; never invent filler.`,
       prompt,
       500,
-      { useStream: false }
+      { useStream: false, temperature: 0.20 }
     );
     const mode = String(repair?.tts_mode || '').toLowerCase() === 'spoken' ? 'spoken' : 'internal_monologue';
     const spokenText = String(repair?.text || '').trim().replace(/^['"“”]+|['"“”]+$/g, '');
@@ -2964,8 +3236,15 @@ async function ensureSceneSpeechCoverage(script, { storyline, characters } = {})
     } else {
       await _ensureSpeechForSceneSingle(scene, { storyline, characters });
     }
-    for (const shot of scene.shots || []) {
+    for (let shotIndex = 0; shotIndex < (scene.shots || []).length; shotIndex++) {
+      const shot = scene.shots[shotIndex];
       _sanitizeDialogueOrActionSemantics(shot);
+      scene.shots[shotIndex] = _enforceShotSpeechMetadata(
+        shot,
+        scene,
+        characters,
+        { hardFail: true }
+      ).shot;
     }
   }
   return script;
@@ -3054,6 +3333,7 @@ function _fallbackSceneShots(scene) {
 async function _writeSceneShotsSequential({
   scenes,
   characterBlock,
+  characters = [],
   shotSimulation,
   existingScenes = [],
   checkpoint = null,
@@ -3066,10 +3346,21 @@ async function _writeSceneShotsSequential({
 
   const isPersistedSceneValid = (sceneNumber, persistedShots, lockedShots) => {
     if (!Array.isArray(persistedShots) || persistedShots.length !== lockedShots.length) return false;
-    return persistedShots.every((shot, i) =>
-      Number(shot?.scene_number) === Number(lockedShots[i]?.scene_number) &&
-      Number(shot?.shot_index) === Number(lockedShots[i]?.shot_index)
-    );
+    const sceneRow = scenes.find(s => Number(s.scene_number) === Number(sceneNumber)) || null;
+
+    return persistedShots.every((shot, i) => {
+      if (
+        Number(shot?.scene_number) !== Number(lockedShots[i]?.scene_number) ||
+        Number(shot?.shot_index) !== Number(lockedShots[i]?.shot_index)
+      ) return false;
+
+      try {
+        _enforceShotSpeechMetadata(shot, sceneRow, characters, { hardFail: true });
+        return true;
+      } catch (_) {
+        return false;
+      }
+    });
   };
 
   // Resume only completed scene checkpoints, in strict scene order, without renumbering them.
@@ -3146,6 +3437,9 @@ SHOT-TO-SHOT CONTINUITY:
 - Every following shot begins from the immediately preceding shot's terminal state.
 - Preserve the persisted order. Do not merge, skip, split, or reorder the locked shots.
 - Dialogue belongs in dialogue_or_action with quotation marks only for exact words actually spoken.
+- SPEAKER CONTRACT: every spoken or phone dialogue line MUST be assigned to a named character from CAST. The corresponding speaker/speaker_name and speakers_in_shot metadata MUST NOT be empty.
+- If dialogue_or_action is spoken and contains a single unlabelled quoted utterance, its speaker must be deterministic from the locked shot staging; prefix it with NAME: before returning the shot.
+- For multiple turns, every quoted utterance must have an explicit NAME: prefix in chronological order.
 - image_prompt is the exact frozen opening frame for the still-image stage; do not put motion, speaking, camera movement, audio, or temporal instructions into it. For travel, the image must show the TRUE opening state of that travel stage, never the final destination by anticipation.
 - ltx_shot_description is the natural chronological image-to-video prompt for the selected provider. Its length must match the complexity of the shot; there is no hard word cap.
 
@@ -3155,7 +3449,7 @@ ${SHOT_SCHEMA}`;
       SHOT_SYSTEM_PROMPT,
       scenePrompt,
       undefined,
-      { useStream: false, temperature: 0.35 }
+      { useStream: false, temperature: 0.25 }
     );
 
     let repairAttempt = 0;
@@ -3228,15 +3522,39 @@ ${SHOT_SCHEMA}`;
       );
 
       const sanitizedShot = _sanitizeDialogueOrActionSemantics({ ...shot });
-      if (typeof sanitizedShot.image_prompt === 'string') {
-        sanitizedShot.image_prompt = _sanitizeStillImagePromptText(sanitizedShot.image_prompt);
+      const speechEnforced = _enforceShotSpeechMetadata(
+        sanitizedShot,
+        scene,
+        characters,
+        { hardFail: true }
+      ).shot;
+
+      if (speechEnforced.speaker_name) {
+        console.log(
+          `[ScriptWriter] Speech contract locked | S${sceneNo}/idx${Number(speechEnforced.shot_index || 0)} ` +
+          `mode=${speechEnforced.tts_mode || 'n/a'} speaker=${speechEnforced.speaker_name} ` +
+          `speakers=${(speechEnforced.speakers_in_shot || []).join(',')}`
+        );
       }
-      const normalizedStaging = shotStaging.getShotCharacterStaging(sanitizedShot, []);
-      sanitizedShot.character_staging = normalizedStaging;
-      sanitizedShot.character_positions = normalizedStaging.length
+
+      if (typeof speechEnforced.image_prompt === 'string') {
+        speechEnforced.image_prompt = _sanitizeStillImagePromptText(speechEnforced.image_prompt);
+      }
+
+      const normalizedStaging = shotStaging.getShotCharacterStaging(speechEnforced, []);
+      speechEnforced.character_staging = normalizedStaging;
+      speechEnforced.character_positions = normalizedStaging.length
         ? shotStaging.formatCharacterStagingBlock(normalizedStaging)
-        : (sanitizedShot.character_positions || '');
-      return sanitizedShot;
+        : (speechEnforced.character_positions || '');
+
+      // Re-check after staging normalization so no later transformation can
+      // checkpoint a spoken shot with an empty speaker.
+      return _enforceShotSpeechMetadata(
+        speechEnforced,
+        scene,
+        characters,
+        { hardFail: true }
+      ).shot;
     });
 
     const sceneWithShots = { ...scene, shots: orderedShots };
@@ -3438,6 +3756,9 @@ or should change to make the shot safely retryable. Preserve valid existing valu
   "image_prompt": "A vivid frozen-frame description for the still-image model only.",
   "dialogue_or_action": "Plain descriptive action, OR spoken dialogue with quoted spoken words, OR NAME (V.O.): unquoted internal voice-over thought.",
   "tts_mode": "spoken | ambient | phone_vo | internal_monologue",
+  "speaker": "REQUIRED exact named cast member for spoken, phone_vo, or internal_monologue; empty ONLY for ambient/action-only shots.",
+  "speaker_name": "Same required named speaker as speaker.",
+  "speakers_in_shot": ["Every named speaker in chronological order for multi-turn dialogue."],
   "duration": ${_SCRIPT_MAX_DURATION},
   "temporal_arc": "A complete visual micro-arc from beginning state through development to end state.",
   "environmental_story_beat": "A concrete environmental event that matters to the scene.",
@@ -3456,7 +3777,7 @@ Do not add keys outside this patch schema.`;
     `${systemPrompt}\n${MULTI_SPEAKER_LTX_RULES}`,
     userPrompt,
     1400,
-    { useStream: false }
+    { useStream: false, temperature: 0.20 }
   );
 
   if (!repaired || typeof repaired !== 'object') {
@@ -3481,7 +3802,18 @@ Do not add keys outside this patch schema.`;
     sanitized.image_prompt = _sanitizeStillImagePromptText(sanitized.image_prompt);
   }
 
-  return sanitized;
+  const speechRepair = _enforceShotSpeechMetadata(
+    sanitized,
+    null,
+    [],
+    { hardFail: false }
+  );
+
+  if (!speechRepair.valid) {
+    throw new Error(`[ScriptWriter] Retry repair produced an LTX-unsafe speech shot: ${speechRepair.reason}`);
+  }
+
+  return speechRepair.shot;
 }
 
 module.exports = {
@@ -3503,6 +3835,11 @@ module.exports = {
   writeEngagementPost,
   repairShotForRetry,
   ensureSceneSpeechCoverage,
+  _canonicalCharacterName,
+  _extractQuotedSpeakerLabels,
+  _inferShotSpeakers,
+  _enforceShotSpeechMetadata,
+  _validateShotSimulationSpeech,
   assignVoiceForCharacter,
   assignSeedForCharacter,
   assignShotSeed,
