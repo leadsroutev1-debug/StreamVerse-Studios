@@ -2494,7 +2494,7 @@ function _speakerPerformanceNear(description, speaker, quoteIndex) {
     .trim();
 
   const aliases = _speakerAliases(speaker);
-  const actionWords = '(?:says?|speaks?|replies?|answers?|asks?|whispers?|shouts?|calls?|mutters?|murmurs?|declares?|insists?|interrupts?|articulates?|speaking|talks?|talking)';
+  const actionWords = '(?:says?|speaks?|replies?|responds?|answers?|asks?|whispers?|shouts?|calls?|mutters?|murmurs?|declares?|insists?|interrupts?|articulates?|speaking|talks?|talking|retorts?|snaps?|demands?|argues?|admits?|warns?|pleads?|insists?|continues?)';
   for (const alias of aliases) {
     const escaped = _escapeRegex(alias);
     const patterns = [
@@ -2818,7 +2818,7 @@ function _strictSpeakerPerformanceNear(description, speaker, quoteIndex) {
   const escaped = _escapeRegex(speaker);
   if (!escaped) return false;
 
-  const actionWords = '(?:says?|speaks?|replies?|answers?|asks?|whispers?|shouts?|calls?|mutters?|murmurs?|declares?|insists?|interrupts?|articulates?|speaking|talks?|talking)';
+  const actionWords = '(?:says?|speaks?|replies?|responds?|answers?|asks?|whispers?|shouts?|calls?|mutters?|murmurs?|declares?|insists?|interrupts?|articulates?|speaking|talks?|talking|retorts?|snaps?|demands?|argues?|admits?|warns?|pleads?|insists?|continues?)';
 
   /* The active speaker must be named in the actual speaking clause. Merely
    * mentioning the character somewhere earlier in the shot is not enough. */
