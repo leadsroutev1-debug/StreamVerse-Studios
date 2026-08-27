@@ -2717,24 +2717,27 @@ function _canonicalCharacterName(value, characters = []) {
   return catalog.length ? null : raw;
 }
 
-function _extractQuotedSpeakerLabels(text) {
+function _extractQuotedSpeakerLabels(text, { unique = true } = {}) {
   const source = String(text || '');
-  const labels = [];
-  const patterns = [
-    /(?:^|\n|\r)\s*([^:\n\r]{1,100}):\s*[\"“]/g,
-    /(?:^|\s)([A-Za-z][A-Za-z0-9 .,'’'_-]{0,99}):\s*[\"“]/g,
-  ];
-
-  for (const re of patterns) {
-    let match;
-    while ((match = re.exec(source))) {
-      const name = String(match[1] || '').trim();
-      if (name && !labels.some(existing => existing.toLowerCase() === name.toLowerCase())) {
-        labels.push(name);
-      }
-    }
+  const occurrences = [];
+  // Capture EVERY speaker-label occurrence immediately before an opening quote.
+  // This intentionally does NOT deduplicate turns: A: "one" A: "two" is two
+  // speaker-labelled turns even though the speaker roster contains one person.
+  const re = /(?:^|[\n\r]|\s)([^:\n\r]{1,100}):\s*[\"“]/g;
+  let match;
+  while ((match = re.exec(source))) {
+    const name = String(match[1] || '').trim();
+    if (name) occurrences.push(name);
   }
 
+  if (!unique) return occurrences;
+
+  const labels = [];
+  for (const name of occurrences) {
+    if (!labels.some(existing => existing.toLowerCase() === name.toLowerCase())) {
+      labels.push(name);
+    }
+  }
   return labels;
 }
 
@@ -2839,23 +2842,29 @@ function _enforceShotSpeechMetadata(shot, scene, characters = [], { hardFail = t
     return { valid: false, shot: out, speakers: [], reason };
   }
 
-  const labelled = _extractQuotedSpeakerLabels(text)
+  const labelledTurns = _extractQuotedSpeakerLabels(text, { unique: false })
     .map(value => _canonicalCharacterName(value, characters))
     .filter(Boolean);
+  const labelled = [...new Map(
+    labelledTurns.map(name => [String(name).trim().toLowerCase(), String(name).trim()])
+  ).values()];
 
   const quotedCount =
     (mode === 'spoken' || mode === 'phone_vo')
       ? (text.match(/[\"“”]\s*[^\"“”]{1,}\s*[\"“”]/g) || []).length
       : 0;
 
-  if ((mode === 'spoken' || mode === 'phone_vo') &&
-      quotedCount > 1 &&
-      labelled.length !== quotedCount) {
-    const reason =
-      `multi-turn spoken shot has ${quotedCount} quoted utterances but ${labelled.length} ` +
-      `explicit speaker labels; every turn must name its speaker`;
-    if (hardFail) throw new Error(`[ScriptWriter] SPEAKER_TURN_CONTRACT_FAILED: ${reason}`);
-    return { valid: false, shot: out, speakers, reason };
+  if ((mode === 'spoken' || mode === 'phone_vo') && quotedCount > 1) {
+    // Count speaker-label OCCURRENCES, not unique speaker names. A single speaker
+    // can legitimately deliver several consecutive turns, but every quoted turn
+    // must still carry its own explicit speaker label.
+    if (labelledTurns.length !== quotedCount) {
+      const reason =
+        `multi-turn spoken shot has ${quotedCount} quoted utterances but ${labelledTurns.length} ` +
+        `speaker-label occurrences; every turn must name its speaker`;
+      if (hardFail) throw new Error(`[ScriptWriter] SPEAKER_TURN_CONTRACT_FAILED: ${reason}`);
+      return { valid: false, shot: out, speakers, reason };
+    }
   }
 
   const finalSpeakers = labelled.length ? labelled : speakers;
