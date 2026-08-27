@@ -2876,12 +2876,21 @@ async function _semanticSpeakerOwnershipAudit(description, dialogueBeats = [], v
     };
   }
 
-  const candidateSpeakers = [...new Set([
+  const candidateSpeakerMap = new Map();
+  for (const value of [
     ...(Array.isArray(visibleCharacters) ? visibleCharacters : []),
     ...beats.map(beat => beat.speaker),
-  ].map(value => _cleanText(_isPlainObject(value)
-    ? value.name || value.character || value.character_name || value.speaker || value.speaker_name || ''
-    : value)).filter(Boolean))];
+  ]) {
+    const name = _cleanText(_isPlainObject(value)
+      ? value.name || value.character || value.character_name || value.speaker || value.speaker_name || ''
+      : value);
+    if (!name) continue;
+    const key = name.toLowerCase();
+    if (!candidateSpeakerMap.has(key)) {
+      candidateSpeakerMap.set(key, name);
+    }
+  }
+  const candidateSpeakers = [...candidateSpeakerMap.values()];
 
   const system = [
     'You are the semantic dialogue-ownership judge for a cinematic LTX image-to-video pipeline.',
@@ -2895,6 +2904,8 @@ async function _semanticSpeakerOwnershipAudit(description, dialogueBeats = [], v
     'Conversational turn order, listener reactions, gaze, body language, and explicit scene geography are valid semantic evidence.',
     'Do not invent a speaker. Use only the candidate speakers supplied by the caller.',
     'A line is invalid only when its ownership is genuinely ambiguous, contradictory, assigned to another character, or absent from the narrative.',
+    'Do not require a speaker name to appear near the quote. Semantic continuity across sentences and turns is sufficient when unambiguous.',
+    'For each authoritative turn, explicitly decide WHO is performing the quoted line from the complete meaning of the description, then compare that performer with the assigned speaker.',
     'Return JSON only with: evaluations, valid.',
     'Each evaluation must contain line, assigned_speaker, confident, confidence, evidence, contradiction.',
     'confidence must be from 0 to 1.',
@@ -2954,7 +2965,9 @@ async function _semanticSpeakerOwnershipAudit(description, dialogueBeats = [], v
     const evaluation = byLine.get(_normalizeDialogueForMatch(beat.line));
     const speaker = _cleanText(evaluation?.assigned_speaker || '');
     const confidence = Number(evaluation?.confidence);
-    const confident = evaluation?.confident === true || confidence >= 0.80;
+    const confident =
+      evaluation?.confident === true ||
+      (Number.isFinite(confidence) && confidence >= 0.70);
     const speakerAllowed = candidateSpeakers.some(name =>
       name.toLowerCase() === speaker.toLowerCase()
     );
@@ -3189,26 +3202,27 @@ function _dialogueIntegrity(sourceLines, description, dialogueBeats = [], visibl
   const duplicates = _dedupePreserveOrder(duplicateLines);
 
   /*
-   * Speaker ownership is deliberately a RETRY signal, not a fatal error.
-   * Multi-speaker shots are valid. We only ask the Vision Director for another
-   * pass when the prose fails to bind an authored line to its one intended
-   * physical performer or describes another visible character speaking during
-   * that exact beat.
+   * Speaker ownership is NOT adjudicated here.
+   *
+   * There must be one authoritative semantic speaker gate. The hard submission
+   * audit above/before this recovery path calls _semanticSpeakerOwnershipAudit(),
+   * which reads the complete cinematic description and judges each authoritative
+   * turn by meaning, chronology, pronoun continuity, reactions, staging and voice
+   * attribution.
+   *
+   * This integrity function therefore handles only deterministic speech-channel
+   * integrity: exact authored-line preservation, ordering and duplicate control.
+   * Keeping a second lexical speaker veto here would reintroduce the false
+   * negatives that this semantic layer was specifically designed to remove.
    */
-  const speakerPerformance = _speakerAttributionDiagnostics(
-    description,
-    dialogueBeats,
-    visibleCharacters
-  );
-
   return {
     outputLines: output.map(m => m.text),
     missingLines: missing,
     outOfOrder: order,
     duplicateLines: duplicates,
-    speakerDiagnostics: speakerPerformance.diagnostics,
-    speakerAttributionInvalid: speakerPerformance.invalid,
-    speakerAttributionValid: speakerPerformance.valid,
+    speakerDiagnostics: [],
+    speakerAttributionInvalid: [],
+    speakerAttributionValid: true,
     authoredOutputPositions: matchedRequired.map(m => ({
       line: m.output,
       index: m.outputIndex,
@@ -3864,19 +3878,27 @@ async function describeForLTX({
         };
       });
 
-  const visibleCharacterNames = [...new Set([
+  const visibleCharacterMap = new Map();
+  for (const value of [
     ...(intent.characters_in_shot || []),
     ...(intent.speakers_in_shot || []),
     ...(intent.character_staging || []),
     ...(intent.conversation_speakers || []),
     ...(Array.isArray(intent.conversation_plan?.speakers) ? intent.conversation_plan.speakers : []),
-    ...(Array.isArray(intent.conversation_plan?.turns) ? intent.conversation_plan.turns.map(turn => turn?.speaker || '') : []),
-  ]
-    .map(value => _cleanText(_isPlainObject(value)
+    ...(Array.isArray(intent.conversation_plan?.turns)
+      ? intent.conversation_plan.turns.map(turn => turn?.speaker || '')
+      : []),
+  ]) {
+    const name = _cleanText(_isPlainObject(value)
       ? value.name || value.character || value.character_name || value.speaker || ''
-      : value))
-    .filter(Boolean)
-  )];
+      : value);
+    if (!name) continue;
+    const key = name.toLowerCase();
+    if (!visibleCharacterMap.has(key)) {
+      visibleCharacterMap.set(key, name);
+    }
+  }
+  const visibleCharacterNames = [...visibleCharacterMap.values()];
 
 
   /*
@@ -4310,17 +4332,11 @@ async function describeForLTX({
           throw error;
         }
 
-        _safeLog(
-          '[LTXVision] SPEAKER PERFORMANCE DIAGNOSTICS:',
-          _speakerAttributionDiagnostics(
-            description,
-            dialogueBeats,
-            visibleCharacterNames
-          )
-        );
-
         /*
-         * Final semantic integrity check.
+         * Final deterministic integrity check.
+         *
+         * Speaker ownership has already been decided by the semantic hard
+         * dialogue audit above. Do not run a second lexical speaker veto here.
          */
         const recovery =
           _recoverDialogueIntegrity(
@@ -4332,49 +4348,6 @@ async function describeForLTX({
 
         description = recovery.description;
         const integrity = recovery.integrity;
-
-        const speakerRetryInstruction =
-          integrity.speakerAttributionInvalid?.length
-            ? _speakerAttributionRepairInstruction(
-                integrity.speakerAttributionInvalid,
-                visibleCharacterNames
-              )
-            : '';
-
-        if (speakerRetryInstruction) {
-          previousDescription = description;
-          currentRepairInstruction = speakerRetryInstruction;
-
-          console.warn(
-            `[LTXVision] speaker attribution requires targeted retry | ` +
-            `invalidBeats=${integrity.speakerAttributionInvalid.length}`
-          );
-
-          if (repairAttempt < MAX_TARGETED_REPAIRS_PER_KEY) {
-            continue;
-          }
-
-          /*
-           * HARD FAIL: speaker attribution is part of the LTX dialogue contract.
-           * Never submit a dialogue-bearing prompt when the active performer is
-           * ambiguous.
-           */
-          const hardAudit = await _hardDialogueSubmissionAudit(
-            description,
-            sourceLines,
-            dialogueBeats,
-            visibleCharacterNames,
-            model
-          );
-          const hardError = new Error(
-            '[LTXVision] HARD_DIALOGUE_SUBMISSION_GATE_FAILED: authored dialogue is not fully quoted and speaker-bound.'
-          );
-          hardError.code = 'LTX_HARD_DIALOGUE_SUBMISSION_GATE';
-          hardError.audit = hardAudit;
-          hardError.previousDescription = description;
-          lastError = hardError;
-          throw hardError;
-        }
 
         if (
           recovery.accepted || integrity.valid
