@@ -197,17 +197,193 @@ function _safeDiagnosticValue(value) {
   }
 }
 
+function _normalizeName(value) {
+  return String(value || '')
+    .trim()
+    .replace(/\\s+/g, ' ')
+    .toLowerCase();
+}
+
+function _cleanAuthoritativeLine(value) {
+  return String(value || '')
+    .replace(/[“”]/g, '"')
+    .trim()
+    .replace(/^['"]+|['"]+$/g, '')
+    .replace(/\\s+/g, ' ')
+    .trim();
+}
+
+function _speakerNameFromValue(value) {
+  if (!value) return '';
+  if (typeof value === 'string') return value.trim();
+  return String(
+    value.name ||
+    value.character ||
+    value.character_name ||
+    value.characterName ||
+    value.speaker ||
+    value.speaker_name ||
+    value.speakerName ||
+    ''
+  ).trim();
+}
+
+function _normalizeAuthoritativeBeat(value) {
+  if (!value) return null;
+
+  if (typeof value === 'string') {
+    const match = value.match(
+      /^\\s*(.+?)\\s*:\\s*["“](.*?)["”]\\s*$/
+    );
+    if (match) {
+      const speaker = _speakerNameFromValue(match[1]);
+      const line = _cleanAuthoritativeLine(match[2]);
+      return line ? { speaker, line } : null;
+    }
+
+    const line = _cleanAuthoritativeLine(value);
+    return line ? { speaker: '', line } : null;
+  }
+
+  const speaker = _speakerNameFromValue(value);
+  const line = _cleanAuthoritativeLine(
+    value.line ||
+    value.dialogue ||
+    value.utterance ||
+    value.text ||
+    value.spoken_line ||
+    value.spokenLine ||
+    ''
+  );
+
+  return line ? { speaker, line } : null;
+}
+
+function _extractQuotedTurns(value) {
+  if (value == null) return [];
+
+  if (Array.isArray(value)) {
+    return value
+      .flatMap(item => _extractQuotedTurns(item))
+      .filter(Boolean);
+  }
+
+  if (typeof value === 'object') {
+    const beat = _normalizeAuthoritativeBeat(value);
+    return beat ? [beat] : [];
+  }
+
+  const raw = String(value || '').trim();
+  if (!raw) return [];
+
+  const labelled = [];
+  const labelledRegex =
+    /(?:^|[\\r\\n.;])\\s*([^:]{1,120}?)\\s*:\\s*["“]([^"”]+)["”]/g;
+  let match;
+  while ((match = labelledRegex.exec(raw)) !== null) {
+    const line = _cleanAuthoritativeLine(match[2]);
+    if (line) {
+      labelled.push({
+        speaker: _speakerNameFromValue(match[1]),
+        line,
+      });
+    }
+  }
+
+  if (labelled.length) return labelled;
+
+  return [...raw.matchAll(/["“]([^"”]+)["”]/g)]
+    .map(match => ({
+      speaker: '',
+      line: _cleanAuthoritativeLine(match[1]),
+    }))
+    .filter(beat => beat.line);
+}
+
+function _dedupeAuthoritativeBeats(beats) {
+  const out = [];
+  const seen = new Set();
+
+  for (const beat of beats || []) {
+    if (!beat?.line) continue;
+    const line = _cleanAuthoritativeLine(beat.line);
+    if (!line) continue;
+
+    // Preserve chronological turns. The same line is only one authored turn.
+    const key = `${_normalizeName(beat.speaker)}::${line.toLowerCase()}`;
+    if (seen.has(key)) continue;
+
+    seen.add(key);
+    out.push({
+      speaker: _speakerNameFromValue(beat.speaker),
+      line,
+    });
+  }
+
+  return out;
+}
+
+/**
+ * Build the authoritative dialogue registry BEFORE the vision director is called.
+ *
+ * IMPORTANT:
+ * `videoPrompt` is a rendered prompt/input string, not the source of truth.
+ * The authoritative registry must come from structured shot metadata and the
+ * persisted conversation plan. This prevents the downstream core from
+ * silently collapsing a 3-turn conversation into one quoted line.
+ */
+function _buildAuthoritativeDialogueRegistry(shotMeta = {}, visionContext = {}, visionShot = {}) {
+  const candidateSources = [
+    shotMeta.authoritativeDialogueBeats,
+    shotMeta.authoritative_dialogue_beats,
+    visionContext.authoritativeDialogueBeats,
+    visionContext.authoritative_dialogue_beats,
+    visionShot.authoritativeDialogueBeats,
+    visionShot.authoritative_dialogue_beats,
+    visionShot._conversation_plan?.turns,
+    visionShot.conversation_plan?.turns,
+    visionShot.dialogue_beats,
+    visionShot.dialogueBeats,
+    visionShot.speaker_turns,
+    visionShot.speakerTurns,
+  ];
+
+  for (const source of candidateSources) {
+    const beats = _dedupeAuthoritativeBeats(_extractQuotedTurns(source));
+    if (beats.length) return beats;
+  }
+
+  const structuredDialogueSources = [
+    visionShot.dialogue_or_action,
+    visionShot.dialogue,
+    visionShot.conversation,
+    shotMeta.dialogue_or_action,
+    shotMeta.dialogue,
+    shotMeta.conversation,
+  ];
+
+  for (const source of structuredDialogueSources) {
+    const beats = _dedupeAuthoritativeBeats(_extractQuotedTurns(source));
+    if (beats.length) return beats;
+  }
+
+  const authoredIntent =
+    typeof shotMeta.videoPrompt === 'string'
+      ? shotMeta.videoPrompt.trim()
+      : '';
+
+  return _dedupeAuthoritativeBeats(_extractQuotedTurns(authoredIntent));
+}
+
 function _extractVisionResult(result) {
   // Backward compatible with the current director, which returns a string.
-  // Also supports a richer future director result:
-  // {
-  //   description / ltx_shot_description: "...",
-  //   response / rawResponse / visionResponse: ...
-  // }
+  // Also supports a richer result carrying the resolved dialogue registry.
   if (typeof result === 'string') {
     return {
       description: result,
       visionResponse: result,
+      authoritativeDialogueBeats: [],
+      semanticSpeakerOwnership: null,
     };
   }
 
@@ -224,9 +400,24 @@ function _extractVisionResult(result) {
     result?.response ??
     result;
 
+  const authoritativeDialogueBeats = _dedupeAuthoritativeBeats(
+    result?.authoritativeDialogueBeats ||
+    result?.authoritative_dialogue_beats ||
+    result?.dialogueBeats ||
+    result?.dialogue_beats ||
+    []
+  );
+
   return {
     description,
     visionResponse,
+    authoritativeDialogueBeats,
+    semanticSpeakerOwnership:
+      result?.semanticSpeakerOwnership ??
+      result?.semantic_speaker_ownership ??
+      result?.speakerAudit ??
+      result?.speaker_audit ??
+      null,
   };
 }
 
@@ -252,21 +443,58 @@ async function _resolvePrompt(imageBuffer, shotMeta) {
       : '';
 
   const visionShot = { ...(visionContext.shot || {}) };
-  const sourceLines = _quotedDialogue(authoredIntent);
+
+  /*
+   * AUTHORITATIVE DIALOGUE REGISTRY
+   *
+   * This is the single source of truth for downstream LTX validation.
+   * Never reconstruct it from the rendered `videoPrompt`, because that field
+   * can legitimately contain only a partial/legacy rendering of a conversation.
+   */
+  let authoritativeDialogueBeats =
+    _buildAuthoritativeDialogueRegistry(
+      shotMeta,
+      visionContext,
+      visionShot
+    );
+
+  const sourceLines = authoritativeDialogueBeats
+    .map(beat => beat.line)
+    .filter(Boolean);
+
+  if (authoritativeDialogueBeats.length) {
+    visionShot.authoritativeDialogueBeats = authoritativeDialogueBeats;
+    visionShot.authoritative_dialogue_beats = authoritativeDialogueBeats;
+    visionShot.conversation_turn_speakers = authoritativeDialogueBeats
+      .map(beat => beat.speaker)
+      .filter(Boolean);
+    visionShot.conversation_plan = {
+      ...(visionShot.conversation_plan || {}),
+      turns: authoritativeDialogueBeats,
+      speakers: [...new Set(
+        authoritativeDialogueBeats
+          .map(beat => _speakerNameFromValue(beat.speaker))
+          .filter(Boolean)
+      )],
+    };
+    visionShot.dialogue = sourceLines
+      .map(line => `"${line}"`)
+      .join(' ');
+    visionShot.conversation_reason =
+      visionShot.conversation_reason ||
+      'Authoritative authored dialogue registry supplied by the production shot contract; preserve every turn verbatim and in order.';
+  }
 
   if (authoredIntent) {
     visionShot.shot_description = authoredIntent;
     visionShot.authored_ltx_intent = authoredIntent;
-
-    if (sourceLines.length) {
-      visionShot.dialogue = sourceLines
-        .map(line => `"${line}"`)
-        .join(' ');
-      visionShot.conversation_reason =
-        visionShot.conversation_reason ||
-        'Authored shot contains explicit spoken dialogue; preserve it verbatim.';
-    }
   }
+
+  console.log(
+    `[LTXVideoGen] AUTHORITATIVE DIALOGUE REGISTRY ` +
+    `turns=${authoritativeDialogueBeats.length} ` +
+    `speakers=${[...new Set(authoritativeDialogueBeats.map(beat => beat.speaker).filter(Boolean))].join(', ')}`
+  );
 
   let repairInstruction = '';
 
@@ -293,7 +521,27 @@ async function _resolvePrompt(imageBuffer, shotMeta) {
       const {
         description,
         visionResponse,
+        authoritativeDialogueBeats: directorDialogueBeats,
+        semanticSpeakerOwnership,
       } = _extractVisionResult(visionResult);
+
+      /*
+       * If the Vision Director returns its own structured authoritative beat
+       * registry, it becomes the canonical downstream registry — but only when
+       * it contains at least as many turns as the source registry. Otherwise
+       * retain the production shot registry and do not let a renderer collapse
+       * a conversation.
+       */
+      if (
+        directorDialogueBeats.length >= authoritativeDialogueBeats.length &&
+        directorDialogueBeats.length > 0
+      ) {
+        authoritativeDialogueBeats = directorDialogueBeats;
+      }
+
+      const finalSourceLines = authoritativeDialogueBeats
+        .map(beat => beat.line)
+        .filter(Boolean);
 
       // Requested diagnostic: the vision-director response/result.
       console.log(
@@ -325,17 +573,28 @@ async function _resolvePrompt(imageBuffer, shotMeta) {
       );
       console.log(finalPrompt);
 
-      const validation = _validateAuthoredDialogue(sourceLines, finalPrompt);
+      const validation = _validateAuthoredDialogue(
+        finalSourceLines,
+        finalPrompt
+      );
 
       console.log(
         `[LTXVideoGen] Vision-authored LTX prompt generated ` +
         `(attempt=${visionAttempt} ` +
         `words=${finalPrompt.split(/\s+/).filter(Boolean).length} ` +
-        `quotedDialogue=${validation.outputLines.length}/${sourceLines.length} ` +
-        `preserved=${sourceLines.length - validation.missingLines.length}/${sourceLines.length}).`
+        `quotedDialogue=${validation.outputLines.length}/${finalSourceLines.length} ` +
+        `preserved=${finalSourceLines.length - validation.missingLines.length}/${finalSourceLines.length}).`
       );
 
-      if (validation.valid) return finalPrompt;
+      if (validation.valid) {
+        if (semanticSpeakerOwnership) {
+          console.log(
+            '[LTXVideoGen] Inherited Vision Director semantic speaker ownership ' +
+            'without re-evaluating it in the transport layer.'
+          );
+        }
+        return finalPrompt;
+      }
 
       const missingText = validation.missingLines
         .map(line => `"${line}"`)
