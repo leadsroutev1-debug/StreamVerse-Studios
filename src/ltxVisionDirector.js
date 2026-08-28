@@ -14,6 +14,352 @@ const DIALOGUE_STRONG_SEMANTIC_SIMILARITY = 0.86;
 const DIALOGUE_SHORT_EXACT_THRESHOLD = 0.99;
 
 /* ============================================================================
+ * STILL-FRAME AUTHORING + CONTINUITY AUDIT
+ * ========================================================================== */
+
+function _buildStillAuthoringSystem() {
+  return [
+    'You are the multimodal still-frame continuity director for a feature-film production pipeline.',
+    'Your job is to author the EXACT prompt for generating the current shot opening still.',
+    'The current still must be one frozen cinematic frame, never a video prompt.',
+    'IMAGE 1, when supplied, is the exact terminal frame of the immediately preceding shot and is the primary continuity bridge.',
+    'SCENE ANCHOR IMAGE, when supplied, is the first shot still of the current scene and is the scene visual baseline for identity, wardrobe, environment, props, palette, geography and persistent spatial facts.',
+    'For every authoring pass after a failed continuity audit, re-inspect BOTH continuity anchors before rewriting the prompt: IMAGE 1 is the exact previous-shot terminal frame, and the SCENE ANCHOR IMAGE is the exact first still of the current scene.',
+    'Inspect the actual pixels of every supplied image. Do not rely on textual assumptions when the pixels contradict them.',
+    'Preserve immutable character identity, age, face, hair, body proportions and established signature traits.',
+    'Preserve wardrobe exactly unless the shot explicitly contains a physically visible wardrobe-change action.',
+    'A wardrobe change is NOT allowed to appear as a silent costume jump. The opening frame of the change shot must show the FROM wardrobe; only a visible changing/dressing action may lead to the TO wardrobe later in the video.',
+    'Preserve environment architecture, spatial geometry, fixed props and persistent objects unless the shot context explicitly requires a real environmental change.',
+    'Do not invent props, remove persistent props, redesign the location or silently relocate characters.',
+    'The output must be a static opening composition: no motion verbs, no temporal progression, no dialogue, no sound, no camera movement.',
+    'Return JSON with exactly one field: image_prompt.',
+  ].join('\n');
+}
+
+function _buildStillAuthoringUser({
+  shot = {},
+  scene = {},
+  characters = [],
+  previousShot = null,
+  previousEndFrameAvailable = false,
+  sceneAnchorAvailable = false,
+  hardWardrobeDirective = '',
+  hardWorldDirective = '',
+  priorStillDescription = '',
+  continuityRepairInstruction = '',
+}) {
+  const visible = Array.isArray(shot.characters_in_shot)
+    ? shot.characters_in_shot
+    : [];
+
+  return [
+    'CURRENT SHOT TARGET:',
+    JSON.stringify({
+      scene_number: shot.scene_number || scene.scene_number || null,
+      shot_index: shot.shot_index || null,
+      shot_type: shot.shot_type || '',
+      purpose: shot.shot_purpose || shot.purpose || '',
+      image_prompt_intent: shot.image_prompt || '',
+      framing: shot.framing || '',
+      start_frame_state: shot.start_frame_state || shot._start_frame_handoff || '',
+      environment_change: shot.environment_change || shot.scene_transition || '',
+      props: shot.active_props || shot.props || shot.carried_props || [],
+      visible_characters: visible,
+    }, null, 2),
+
+    'SCENE CONTEXT:',
+    JSON.stringify({
+      location: scene.location || shot._scene_location || '',
+      scene_description: scene.scene_description || shot._scene_description || '',
+      lighting_design: scene.lighting_design || shot._lighting_design || '',
+      emotional_beat: scene.emotional_beat || shot._scene_emotion || '',
+    }, null, 2),
+
+    'LOCKED CHARACTERS:',
+    JSON.stringify(
+      (characters || []).filter(c => {
+        const name = String(c?.name || '').toLowerCase();
+        return visible.some(v =>
+          String(typeof v === 'object' ? v?.name || v?.character || '' : v || '').toLowerCase() === name
+        );
+      }).map(c => ({
+        name: c.name,
+        visual_profile: c.visual_profile || '',
+        wardrobe: c.wardrobe || c.wardrobe_state || c.costume || c.clothing || '',
+        signature_clothing: c.signature_clothing || '',
+      })),
+      null,
+      2
+    ),
+
+    'HARD WARDROBE STATE:',
+    hardWardrobeDirective || 'No separate wardrobe directive supplied; preserve what is visible and canonically established.',
+
+    'HARD WORLD / ENVIRONMENT / PROP STATE:',
+    hardWorldDirective || 'Preserve the established environment and persistent props unless explicitly changed.',
+
+    previousShot
+      ? `PREVIOUS SHOT TEXTUAL END STATE:\n${JSON.stringify({
+          end_frame_state: previousShot.end_frame_state || '',
+          end_frame_transition: previousShot.end_frame_transition || '',
+          next_shot_continuity: previousShot.next_shot_continuity || '',
+        }, null, 2)}`
+      : '',
+
+    priorStillDescription
+      ? `PREVIOUSLY AUTHORED STILL PROMPT FOR THIS SHOT (reference only; repair rather than blindly copy): ${priorStillDescription}`
+      : '',
+
+    continuityRepairInstruction
+      ? `TARGETED CONTINUITY REPAIR FROM THE PREVIOUS FAILED STILL AUDIT (apply only the identified correction; preserve everything else already correct): ${continuityRepairInstruction}`
+      : '',
+
+    previousEndFrameAvailable
+      ? 'IMAGE 1 — PREVIOUS SHOT TERMINAL FRAME. Determine the smallest physically plausible continuity bridge from this exact endpoint into the requested current opening state.'
+      : 'No predecessor frame is available. Establish the current shot opening from the authored shot state and scene baseline.',
+
+    sceneAnchorAvailable
+      ? 'SCENE ANCHOR IMAGE — FIRST SHOT STILL OF THIS SCENE. Use it as the visual baseline for wardrobe, environment, persistent props, identity, lighting language and spatial facts unless an explicit story event changes them.'
+      : 'No scene anchor still is available; rely on the locked structured continuity state.',
+
+    'AUTHORING RULE:',
+    'Write one complete frozen still-image prompt that a diffusion image model can use directly.',
+    'The generated image MUST depict the requested CURRENT opening state, not a transition between frames.',
+    'When the predecessor frame conflicts with an explicitly authored current state, preserve the current authored state while making the difference physically explainable in the subsequent video rather than creating an impossible hybrid frame.',
+    'Never silently change a character wardrobe. Never silently change the scene environment. Never silently remove or invent a persistent prop.',
+    'State each visible character separately with identity, wardrobe, screen position, depth, pose, facing, eyeline and relevant prop contact.',
+  ].filter(Boolean).join('\n\n');
+}
+
+async function _requestVisionJson({
+  key,
+  model,
+  system,
+  userText,
+  images = [],
+  attemptLabel,
+}) {
+  const content = [{ type: 'text', text: userText }];
+  for (const image of images) {
+    if (!image?.buffer) continue;
+    content.push({
+      type: 'text',
+      text: image.label || 'REFERENCE IMAGE',
+    });
+    content.push({
+      type: 'image_url',
+      image_url: _imageDataUrl(image.buffer, image.mime || 'image/png'),
+    });
+  }
+
+  const response = await axios.post(
+    'https://api.mistral.ai/v1/chat/completions',
+    {
+      model,
+      messages: [
+        { role: 'system', content: system },
+        { role: 'user', content },
+      ],
+      temperature: 0.15,
+      response_format: { type: 'json_object' },
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${key}`,
+        'Content-Type': 'application/json',
+      },
+      timeout: REQUEST_TIMEOUT_MS,
+    }
+  );
+
+  const rawContent = response?.data?.choices?.[0]?.message?.content;
+  const parsed = _parseStructuredContent(rawContent);
+  if (!parsed || typeof parsed !== 'object') {
+    throw new Error(`[LTXVision] Invalid structured still-authoring response ${attemptLabel}`);
+  }
+  return {
+    response,
+    rawContent,
+    parsed,
+  };
+}
+
+async function authorStillPrompt({
+  shot = {},
+  scene = {},
+  characters = [],
+  previousShot = null,
+  previousEndFrameUrl = '',
+  sceneAnchorStillUrl = '',
+  hardWardrobeDirective = '',
+  hardWorldDirective = '',
+  priorStillDescription = '',
+  continuityRepairInstruction = '',
+}) {
+  const keys = _keys();
+  if (!keys.length) throw new Error('[LTXVision] No Mistral keys configured');
+
+  const images = [];
+  if (previousEndFrameUrl) {
+    const previous = await _downloadImageBuffer(previousEndFrameUrl, 'previous shot end frame');
+    images.push({
+      label: 'IMAGE 1 — PREVIOUS SHOT TERMINAL / END FRAME',
+      ...previous,
+    });
+  }
+  if (sceneAnchorStillUrl) {
+    const anchor = await _downloadImageBuffer(sceneAnchorStillUrl, 'scene anchor still');
+    images.push({
+      label: 'SCENE ANCHOR IMAGE — FIRST SHOT STILL OF THIS SCENE',
+      ...anchor,
+    });
+  }
+
+  const userText = _buildStillAuthoringUser({
+    shot,
+    scene,
+    characters,
+    previousShot,
+    previousEndFrameAvailable: Boolean(previousEndFrameUrl),
+    sceneAnchorAvailable: Boolean(sceneAnchorStillUrl),
+    hardWardrobeDirective,
+    hardWorldDirective,
+    priorStillDescription,
+    continuityRepairInstruction,
+  });
+
+  let lastError = null;
+  for (let i = 0; i < keys.length; i++) {
+    try {
+      const key = keys[i];
+      const result = await _requestVisionJson({
+        key,
+        model: DEFAULT_MODEL,
+        system: _buildStillAuthoringSystem(),
+        userText,
+        images,
+        attemptLabel: `still-authoring attempt=${i + 1}/${keys.length} S${shot.scene_number || 0}/idx${shot.shot_index || 0}`,
+      });
+      const prompt = String(
+        result.parsed?.image_prompt ||
+        result.parsed?.still_prompt ||
+        result.parsed?.prompt ||
+        ''
+      ).trim();
+      if (!prompt) throw new Error('[LTXVision] Still-authoring response contained no image_prompt');
+      console.log(`[LTXVision] STILL IMAGE PROMPT authored S${shot.scene_number || 0}/idx${shot.shot_index || 0} chars=${prompt.length}`);
+      console.log(prompt);
+      return {
+        prompt,
+        rawContent: result.rawContent,
+        parsed: result.parsed,
+        response: result.response,
+      };
+    } catch (err) {
+      lastError = err;
+      console.warn(`[LTXVision] Still-authoring attempt ${i + 1}/${keys.length} failed: ${err.message}`);
+    }
+  }
+  throw lastError || new Error('[LTXVision] Still-authoring failed');
+}
+
+async function auditGeneratedStillContinuity({
+  shot = {},
+  scene = {},
+  characters = [],
+  currentStillUrl = '',
+  previousEndFrameUrl = '',
+  sceneAnchorStillUrl = '',
+  hardWardrobeDirective = '',
+  hardWorldDirective = '',
+}) {
+  const keys = _keys();
+  if (!keys.length) throw new Error('[LTXVision] No Mistral keys configured');
+  if (!currentStillUrl) throw new Error('[LTXVision] Generated still URL is required for continuity audit');
+
+  const images = [];
+  const current = await _downloadImageBuffer(currentStillUrl, 'generated current still');
+  images.push({ label: 'CURRENT SHOT STILL — AUDIT TARGET', ...current });
+
+  if (sceneAnchorStillUrl) {
+    const anchor = await _downloadImageBuffer(sceneAnchorStillUrl, 'scene anchor still');
+    images.push({ label: 'SCENE ANCHOR IMAGE — FIRST SHOT STILL OF THIS SCENE', ...anchor });
+  }
+
+  if (previousEndFrameUrl) {
+    const previous = await _downloadImageBuffer(previousEndFrameUrl, 'previous shot end frame');
+    images.push({ label: 'PREVIOUS SHOT TERMINAL FRAME', ...previous });
+  }
+
+  const userText = [
+    'Audit the generated CURRENT SHOT STILL against the locked production state.',
+    'Do not judge artistic quality. Judge continuity only.',
+    'Return JSON with exactly: valid, wardrobe, environment, props, identity, reasons, corrected_prompt.',
+    'valid is true only when every visible character has the expected wardrobe and identity, the environment is consistent with the scene anchor or explicitly authorized change, and persistent props are preserved.',
+    'Wardrobe may differ from the scene anchor only when the current shot is an explicitly authorized live wardrobe-change shot; such a shot must still open in the FROM wardrobe, so the generated opening still itself must show FROM wardrobe.',
+    'Never treat a scene anchor difference as an approved change merely because the generated still differs.',
+    'The previous terminal frame is the immediate continuity predecessor; the scene anchor is the scene-level baseline.',
+    JSON.stringify({
+      scene: {
+        scene_number: scene.scene_number || shot.scene_number || null,
+        location: scene.location || shot._scene_location || '',
+        description: scene.scene_description || shot._scene_description || '',
+      },
+      shot: {
+        shot_index: shot.shot_index || null,
+        characters_in_shot: shot.characters_in_shot || [],
+        wardrobe_change: shot.wardrobe_change || shot.wardrobeChange || shot.wardrobe_transition || null,
+      },
+      hardWardrobeDirective,
+      hardWorldDirective,
+      characters: (characters || []).map(c => ({
+        name: c?.name,
+        wardrobe: c?.wardrobe || c?.wardrobe_state || c?.costume || c?.clothing || '',
+        visual_profile: c?.visual_profile || '',
+      })),
+    }, null, 2),
+  ].join('\n\n');
+
+  let lastError = null;
+  for (let i = 0; i < keys.length; i++) {
+    try {
+      const result = await _requestVisionJson({
+        key: keys[i],
+        model: DEFAULT_MODEL,
+        system: [
+          'You are a strict continuity auditor for a film production pipeline.',
+          'Inspect actual pixels, not just text.',
+          'Wardrobe, environment, props and identity are hard continuity constraints.',
+          'Do not excuse unexplained changes.',
+          'A valid result must be conservative and evidence-based.',
+          'When invalid, corrected_prompt is REQUIRED and must be a targeted repair that explicitly fixes only the failed continuity dimensions while preserving all dimensions that already pass.',
+        ].join('\n'),
+        userText,
+        images,
+        attemptLabel: `still-audit attempt=${i + 1}/${keys.length} S${shot.scene_number || 0}/idx${shot.shot_index || 0}`,
+      });
+      const p = result.parsed || {};
+      const valid = p.valid === true &&
+        p.wardrobe === true &&
+        p.environment === true &&
+        p.props === true &&
+        p.identity === true;
+      return {
+        valid,
+        parsed: p,
+        response: result.response,
+        rawContent: result.rawContent,
+      };
+    } catch (err) {
+      lastError = err;
+      console.warn(`[LTXVision] Still continuity audit attempt ${i + 1}/${keys.length} failed: ${err.message}`);
+    }
+  }
+  throw lastError || new Error('[LTXVision] Still continuity audit failed');
+}
+
+
+/* ============================================================================
  * CONFIG / KEYS
  * ========================================================================== */
 
@@ -4552,6 +4898,8 @@ async function describeForLTX({
 
 module.exports = {
   describeForLTX,
+  authorStillPrompt,
+  auditGeneratedStillContinuity,
 
   // Regression-testable dialogue validation helpers.
   _normalizeDialogueForMatch,

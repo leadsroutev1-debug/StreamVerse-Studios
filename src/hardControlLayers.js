@@ -180,9 +180,18 @@ function validateFaceLock(shot, registry) {
     results.push({ character: charName, similarity, passed, threshold: FACE_LOCK_THRESHOLD });
 
     if (!passed) {
+      const wardrobeChangeApproved = Boolean(
+        shot.wardrobe_change || shot.wardrobeChange ||
+        shot.wardrobe_transition || shot.wardrobeTransition ||
+        shot.wardrobe_change_shot || shot.wardrobeChangeShot ||
+        shot.changing_clothes || shot.changingClothes
+      );
       corrections.push(
         `FACE-LOCK VIOLATION for ${charName}: identity similarity ${similarity.toFixed(3)} below threshold ${FACE_LOCK_THRESHOLD}. ` +
-        `CRITICAL: ${charName} MUST have the same face, hair, skin tone, and clothing as the reference portrait. ` +
+        (wardrobeChangeApproved
+          ? `CRITICAL: ${charName} MUST retain the same face, hair, skin tone and body identity as the reference portrait; the approved wardrobe-change action may alter clothing only. `
+          : `CRITICAL: ${charName} MUST have the same face, hair, skin tone, and clothing as the reference portrait. `
+        ) +
         `This is the SAME PERSON — do not generate a different face. Use the reference image.`
       );
     }

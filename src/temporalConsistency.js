@@ -140,7 +140,14 @@ function _detectVisualResets(scene) {
     const shotCostume = costumeKeywords.filter(k => shotEnv.includes(k));
     const prevCostume = costumeKeywords.filter(k => prevEnv.includes(k));
 
-    if (shotCostume.length > 0 && prevCostume.length > 0) {
+    const explicitWardrobeChange = Boolean(
+      shot.wardrobe_change || shot.wardrobeChange ||
+      shot.wardrobe_transition || shot.wardrobeTransition ||
+      shot.wardrobe_change_shot || shot.wardrobeChangeShot ||
+      shot.changing_clothes || shot.changingClothes
+    );
+
+    if (!explicitWardrobeChange && shotCostume.length > 0 && prevCostume.length > 0) {
       const shotColors = _extractColorWords(shotEnv);
       const prevColors = _extractColorWords(prevEnv);
       const colorDiff = shotColors.filter(c => !prevColors.includes(c));

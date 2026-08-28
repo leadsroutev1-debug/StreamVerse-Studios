@@ -66,7 +66,7 @@ function buildGlobalContinuityState(script) {
           pose: _clean(canonical.pose),
           action: _clean(canonical.action),
           eyeline: _clean(canonical.gaze || shot.character_positions),
-          wardrobe: _clean(canonical.wardrobe),
+          wardrobe: _clean(shot._hard_wardrobe_state?.after_characters?.[name] || shot._hard_wardrobe_state?.characters?.[name] || canonical.wardrobe),
           injuries: _clean(canonical.injuries),
           carriedProps: Array.isArray(canonical.carried_props) ? canonical.carried_props.slice() : [],
           knowledgeDelta: Array.isArray(canonical.knowledge_delta) ? canonical.knowledge_delta.slice() : [],
@@ -203,7 +203,7 @@ function applyGlobalContinuity(script) {
           pose: _clean(canonical.pose),
           action: _clean(canonical.action),
           eyeline: _clean(canonical.gaze || shot.character_positions),
-          wardrobe: _clean(canonical.wardrobe),
+          wardrobe: _clean(shot._hard_wardrobe_state?.after_characters?.[name] || shot._hard_wardrobe_state?.characters?.[name] || canonical.wardrobe),
           injuries: _clean(canonical.injuries),
           carriedProps: Array.isArray(canonical.carried_props) ? canonical.carried_props.slice() : [],
         };

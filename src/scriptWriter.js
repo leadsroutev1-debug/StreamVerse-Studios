@@ -1574,6 +1574,8 @@ Return exactly this object shape and keep every supplied valid value:
   "character_state_changes": ["..."],
   "environment_state_changes": ["..."],
   "dialogue_intent": "...",
+  "wardrobe_context": {"Character Name":"exact wardrobe context for this scene"},
+  "wardrobe_change_plan": [],
   "location_transition": "none | within_location | departure | transit | arrival",
   "origin_location": "...",
   "destination_location": "...",
@@ -1636,6 +1638,8 @@ Return exactly:
   "character_state_changes": ["..."],
   "environment_state_changes": ["..."],
   "dialogue_intent": "...",
+  "wardrobe_context": {"Character Name":"exact wardrobe context for this scene"},
+  "wardrobe_change_plan": [],
   "location_transition": "none | within_location | departure | transit | arrival",
   "origin_location": "...",
   "destination_location": "...",
@@ -1650,10 +1654,15 @@ Rules:
 - opening_state must inherit the supplied prior state
 - closing_state must be a concrete state, not a vague promise
 - handoff_to_next_scene must state exactly what the next scene inherits
+- WARDROBE: wardrobe_context must carry the scene's intended worn state for each relevant character.
+- wardrobe_change_plan may contain only changes that are narratively required; every planned change must identify character, from, to, and the fact that the change must be shown live in a dedicated shot.
+- A wardrobe change must never be expressed as an unexplained instant jump between scene states.
 - location_transition must identify whether this scene is stationary, departure, transit, or arrival
 - if the destination differs from the prior scene/location, do not skip the physical travel process
 - route_beats must contain concrete visible travel beats when movement between locations matters
 - preserve character, location, prop, costume, time and causal continuity
+- WARDROBE CONTINUITY: inherit each character's current wardrobe from the previous scene/shot unless the story explicitly requires a change.
+- Any required wardrobe change must be planned as a visible live clothing-change event in the scene, never as an unexplained instant replacement between shots.
 - if this scene begins or ends in a different location, explicitly plan departure/transit/arrival
 - do not use a bare location change as a substitute for travel
 - route_beats must describe visible physical movement when travel is narratively relevant
@@ -1877,6 +1886,8 @@ async function simulateEpisodeShots({
       environment_state_changes: Array.isArray(rawSim.environment_state_changes)
         ? rawSim.environment_state_changes.slice(0, 6).map(x => _compactLLMText(x, 300)) : [],
       dialogue_intent: _compactLLMText(rawSim.dialogue_intent || '', 600),
+      wardrobe_context: rawSim.wardrobe_context || {},
+      wardrobe_change_plan: Array.isArray(rawSim.wardrobe_change_plan) ? rawSim.wardrobe_change_plan.slice(0, 8) : [],
       location_transition: String(rawSim.location_transition || 'none').trim().toLowerCase(),
       origin_location: _compactLLMText(rawSim.origin_location || scene.location || '', 500),
       destination_location: _compactLLMText(rawSim.destination_location || scene.location || '', 500),
@@ -1915,6 +1926,7 @@ ${JSON.stringify({
       camera_language: _compactLLMText(scene.camera_language || '', 500),
       characters_present: scene.characters_present || [],
       shot_count_target: target,
+      wardrobe_context: scene.wardrobe_context || scene.wardrobe_states || scene.character_wardrobe || {},
     })}
 
 LOCKED SCENE SIMULATION:
@@ -1948,6 +1960,8 @@ Return exactly:
       "dialogue_purpose": "what must be said/heard, without inventing exact final wording",
       "character_state_change": "...",
       "environment_state_change": "...",
+      "wardrobe_states": {"Character Name":"exact wardrobe state currently worn"},
+      "wardrobe_change": null,
       "location_transition": "none | departure | transit | arrival",
       "travel_stage": "none | prepare | depart | in_transit | approach | arrive",
       "origin_location": "...",
@@ -1968,6 +1982,11 @@ HARD REQUIREMENTS:
 - Do NOT skip or duplicate a local index.
 - Do NOT change scene number.
 - Do NOT introduce new characters, locations, props, time jumps, or costume changes unsupported by the locked scene.
+- WARDROBE CONTRACT: every shot inherits the prior shot's wardrobe for every character unless a change is explicitly authorized.
+- A wardrobe change is NEVER a silent jump between two stills. It must be represented by a dedicated shot whose wardrobe_change names every changing character and contains a visible live action showing that character removing/donning/changing clothing.
+- Each changing character must have an explicit from wardrobe, to wardrobe, and visible change action. Do not mark a wardrobe change for a character who is not visibly present and actively changing in that shot.
+- Once the dedicated change shot completes, all following shots inherit the new wardrobe until another explicitly authorized live change occurs.
+- Never alter wardrobe merely because the shot type, location, lighting, dialogue, action, or camera angle changes.
 - SPEAKER CONTRACT: when dialogue_intent is spoken, phone_vo, or internal_monologue, speaker MUST be a specific named character from CAST and MUST NOT be empty.
 - NEVER output speaker="" for an audible shot.
 - If multiple characters are present, determine the intended speaker from the locked scene context, character staging, and dialogue_purpose; do not guess an unrelated character.

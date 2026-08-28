@@ -34,6 +34,8 @@ const semanticTransitionDirector = require('./semanticTransitionDirector');
 const constraintEnforcer = require('./constraintEnforcer');
 const directorialOrchestrator = require('./directorialOrchestrator');
 const hardControl       = require('./hardControlLayers');
+const hardWardrobeState = require('./hardWardrobeState');
+const hardSceneWorldState = require('./hardSceneWorldState');
 const { safeJsonParse } = require('./util');
 const os             = require('os');
 const fs             = require('fs');
@@ -1500,6 +1502,72 @@ function _storedShotImageUrl(imageValue) {
   return /^https?:\/\//i.test(value) ? value : cloudinary.imageDeliveryUrl(value);
 }
 
+async function _resolveSceneFirstStillUrl({ episodeId, sceneNumber } = {}) {
+  if (!episodeId || !Number.isFinite(Number(sceneNumber))) return null;
+  try {
+    const row = await db.queryOne(
+      `SELECT image_url
+         FROM shots
+        WHERE episode_id = ?
+          AND scene_number = ?
+          AND image_url IS NOT NULL
+          AND TRIM(image_url) <> ''
+        ORDER BY shot_index ASC
+        LIMIT 1`,
+      [episodeId, Number(sceneNumber)]
+    );
+    return _storedShotImageUrl(row?.image_url);
+  } catch (err) {
+    console.warn(
+      `[Pipeline] Scene anchor still lookup failed | S${sceneNumber}: ${err.message}`
+    );
+    return null;
+  }
+}
+
+async function _ensureContextualSceneBackground({
+  episodeId,
+  storyline,
+  globalEpisodeNumber,
+  scene,
+  previousScene = null,
+  savedState,
+}) {
+  const key = String(scene.scene_number);
+  if (savedState[key]) return savedState[key];
+
+  const previousKey = previousScene ? String(previousScene.scene_number) : '';
+  const previousUrl = previousKey ? String(savedState[previousKey] || '').trim() : '';
+  const context = hardSceneWorldState.resolveSceneBackgroundContext({
+    scene,
+    previousScene,
+    previousBackgroundUrl: previousUrl || null,
+  });
+
+  if (context.reusePrevious && context.backgroundUrl) {
+    savedState[key] = context.backgroundUrl;
+    if (episodeId) {
+      await db.execute(
+        `UPDATE episodes SET scene_background_state=? WHERE id=?`,
+        [JSON.stringify(savedState), episodeId]
+      );
+    }
+    console.log(
+      `[Pipeline] Scene ${scene.scene_number} reusing contextual environment background ` +
+      `from Scene ${previousScene?.scene_number || '?'} (${context.reason})`
+    );
+    return savedState[key];
+  }
+
+  return _ensureSceneBackground({
+    episodeId,
+    storyline,
+    globalEpisodeNumber,
+    scene,
+    savedState,
+  });
+}
+
 /**
  * Resolve the exact terminal frame URL of the immediately preceding completed
  * shot. Agnes persists these frames in shot_continuity_frames; the pipeline
@@ -1652,6 +1720,10 @@ async function generateShot(shot, storyline, characterList, globalEpisodeNumber,
   // computed right before the previous attempt threw — so the retry sent the
   // exact same prompt back to the CF Worker and failed the same way again.
   let   pendingCorrectedPrompt = null;
+  // Continuity-audit failures must force a fresh FLUX still. The audit's
+  // targeted repair is re-authored through the multimodal continuity director
+  // using the exact same predecessor terminal frame + scene anchor.
+  let   pendingContinuityRepair = null;
   // Keep the exact last image prompt outside the per-attempt try scope so
   // catch/retry handling can always surface it without a ReferenceError.
   let   lastAttemptImagePrompt = null;
@@ -1706,6 +1778,22 @@ async function generateShot(shot, storyline, characterList, globalEpisodeNumber,
       `current=S${shot.scene_number}/idx${shot.shot_index} ` +
       `previous=S${prevShot.scene_number}/idx${prevShot.shot_index} ` +
       `previousEndFrame=${previousEndFrameUrl ? 'resolved' : 'not-resolved'}`
+    );
+  }
+
+  // The first generated still of the current scene is the scene-level visual
+  // baseline. Every later shot is audited against it for wardrobe, environment,
+  // props and identity in addition to immediate predecessor continuity.
+  let sceneAnchorStillUrl = null;
+  try {
+    sceneAnchorStillUrl = await _resolveSceneFirstStillUrl({
+      episodeId: resolvedEpisodeId,
+      sceneNumber: shot.scene_number,
+    });
+  } catch (_) {}
+  if (sceneAnchorStillUrl) {
+    console.log(
+      `[Pipeline] Scene anchor still resolved | S${shot.scene_number}/idx${shot.shot_index}`
     );
   }
 
@@ -1889,8 +1977,54 @@ async function generateShot(shot, storyline, characterList, globalEpisodeNumber,
       // (hard-control / lighting / face-lock corrections) instead of rebuilding
       // a fresh, uncorrected prompt every retry.
       const promptSource = pendingCorrectedPrompt || null;
-      let imagePrompt = promptSource
-        || _buildShotImagePrompt(currentShot, storyline, charsInShot, prevShot, continuityReanchorMode ? null : sceneBgImageUrl, focusChar, charRefSlots, _speakerOnlyMode, continuityReanchorMode ? previousEndFrameUrl : null, semanticTransitionPlan);
+      const continuityRepair = pendingContinuityRepair || '';
+      let imagePrompt;
+      if (promptSource && !continuityRepair) {
+        imagePrompt = promptSource;
+      } else {
+        const deterministicStillContext = _buildShotImagePrompt(
+          currentShot,
+          storyline,
+          charsInShot,
+          prevShot,
+          continuityReanchorMode ? null : sceneBgImageUrl,
+          focusChar,
+          charRefSlots,
+          _speakerOnlyMode,
+          continuityReanchorMode ? previousEndFrameUrl : null,
+          semanticTransitionPlan
+        );
+
+        // The Vision Director now owns current-shot still authoring. It receives
+        // the exact predecessor terminal frame plus the first still of the
+        // current scene when available, so FLUX gets a continuity-aware frozen
+        // opening target rather than an LLM-only textual reconstruction.
+        const stillAuthoring = await ltxVisionDirector.authorStillPrompt({
+          shot: {
+            ...currentShot,
+            image_prompt: deterministicStillContext,
+          },
+          scene: {
+            scene_number: currentShot.scene_number,
+            location: currentShot._scene_location || '',
+            scene_description: currentShot._scene_description || '',
+            emotional_beat: currentShot._scene_emotion || '',
+            lighting_design: currentShot._lighting_design || '',
+          },
+          characters: charsInShot,
+          previousShot: prevShot,
+          previousEndFrameUrl,
+          sceneAnchorStillUrl,
+          hardWardrobeDirective: currentShot._hard_wardrobe_directive || '',
+          hardWorldDirective: currentShot._hard_world_directive || '',
+          priorStillDescription: promptSource || '',
+          continuityRepairInstruction: continuityRepair,
+        });
+        imagePrompt = stillAuthoring.prompt;
+        currentShot._vision_still_prompt = imagePrompt;
+        pendingContinuityRepair = null;
+        if (promptSource) pendingCorrectedPrompt = null;
+      }
       lastAttemptImagePrompt = imagePrompt;
       pendingCorrectedPrompt = null;
       if (promptSource) {
@@ -2107,9 +2241,65 @@ async function generateShot(shot, storyline, characterList, globalEpisodeNumber,
 
       }
 
-      // 1a. Notify caller immediately after image generation — BEFORE Magic Hour submission.
-      //     This is the earliest safe point to establish a scene background reference; doing
-      //     it here ensures the reference persists even if MH submission or polling fails.
+      // 1a.5 Strict multimodal continuity audit. Every still is checked by the
+      // same Vision Director against the current scene's first still plus the
+      // immediate predecessor frame. First-shot stills use themselves as the
+      // scene baseline; later shots must agree with the baseline unless an
+      // explicit hard wardrobe/environment change permits otherwise.
+      if (imageReuseUrl) {
+        const auditAnchorUrl = sceneAnchorStillUrl || imageReuseUrl;
+        const audit = await ltxVisionDirector.auditGeneratedStillContinuity({
+          shot: currentShot,
+          scene: {
+            scene_number: currentShot.scene_number,
+            location: currentShot._scene_location || '',
+            scene_description: currentShot._scene_description || '',
+          },
+          characters: charsInShot,
+          currentStillUrl: imageReuseUrl,
+          previousEndFrameUrl,
+          sceneAnchorStillUrl: auditAnchorUrl,
+          hardWardrobeDirective: currentShot._hard_wardrobe_directive || '',
+          hardWorldDirective: currentShot._hard_world_directive || '',
+        });
+        currentShot._still_continuity_audit = audit.parsed || {};
+        if (!audit.valid) {
+          const reasons = Array.isArray(audit.parsed?.reasons)
+            ? audit.parsed.reasons.join('; ')
+            : String(audit.parsed?.reasons || 'Vision continuity audit failed');
+          const corrected = String(audit.parsed?.corrected_prompt || '').trim();
+          console.warn(
+            `[Pipeline] Still continuity audit FAILED on S${currentShot.scene_number}/idx${currentShot.shot_index}: ${reasons} — forcing fresh FLUX still regeneration`
+          );
+          const auditErr = new Error(
+            `Still continuity audit failed: ${reasons}`
+          );
+          auditErr.constraintViolation = true;
+          auditErr.failureReason = 'still_continuity_audit';
+          // CRITICAL: the audited still is known-bad for wardrobe/environment/
+          // props/identity continuity and must NEVER become the retry canvas.
+          // Drop the reuse lock so the next attempt calls FLUX again.
+          imageReuseUrl = null;
+
+          // Keep the failed audit's correction targeted, but force it back through
+          // multimodal still authoring so the rewrite re-checks BOTH exact anchors
+          // before FLUX renders the replacement.
+          pendingCorrectedPrompt = null;
+          pendingContinuityRepair = corrected || reasons;
+          auditErr.lastPrompt = corrected || lastAttemptImagePrompt || imagePrompt;
+          throw auditErr;
+        }
+        console.log(
+          `[Pipeline] Still continuity audit PASSED | ` +
+          `S${currentShot.scene_number}/idx${currentShot.shot_index}`
+        );
+      }
+
+      // Persist the current still only AFTER continuity passes. A continuity-
+      // rejected frame must never become the stored scene-first anchor or the
+      // reusable image for the next retry. Keeping persistence here preserves
+      // the existing retry/resume behavior while preventing a known-bad still
+      // from poisoning the continuity ledger.
       if (onImageGenerated) {
         try {
           const persistedImageUrl = await onImageGenerated(imageBuffer, imageReuseUrl);
@@ -2387,7 +2577,12 @@ async function generateShot(shot, storyline, characterList, globalEpisodeNumber,
       // The enforcer already replaced imagePrompt with the corrected version before
       // throwing, so we just continue to the next attempt without back-off.
       if (err.constraintViolation) {
-        console.warn(`[Pipeline] Constraint violation on S${shot.scene_number}/idx${shot.shot_index} (attempt ${attempt}/${maxRetries}) — routing through director repair before retry`);
+        const continuityAuditRetry = err.failureReason === 'still_continuity_audit';
+        console.warn(
+          `[Pipeline] Constraint violation on S${shot.scene_number}/idx${shot.shot_index} ` +
+          `(attempt ${attempt}/${maxRetries}) — ` +
+          `${continuityAuditRetry ? 'FORCING FRESH STILL REGENERATION through multimodal continuity authoring' : 'routing through director repair'} before retry`
+        );
       }
 
       // ── Director-driven retry repair ─────────────────────────────────────
@@ -3106,6 +3301,11 @@ async function _runPipeline() {
     episodeScript = _normalizeMultiSpeakerShots(episodeScript);
     // Speaker splitting can insert reaction shots; recalculate their semantic durations too.
     episodeScript = _enforcePacingRules(episodeScript);
+    // Hard wardrobe state runs after shot structure is final and before any downstream
+    // state/prompt engine, preventing silent attire drift while preserving shot order.
+    episodeScript = hardWardrobeState.applyHardWardrobeState(episodeScript, characterList);
+    // Hard scene world state: contextual environment reuse + strict persistent prop locks.
+    episodeScript = hardSceneWorldState.applyHardSceneWorldState(episodeScript);
     // ── Apply cinematic shot-reverse-shot grammar ────────────────────────────────
     episodeScript = _applyCinematicShotSelection(episodeScript);
     // ── Scene State Engine: track positions, lighting, camera angle history ──────
@@ -3147,6 +3347,8 @@ async function _runPipeline() {
     episodeScript = cameraSim.applyCameraSimulation(episodeScript);
     episodeScript = motionSystem.applyMotionSystem(episodeScript);
     episodeScript = _applyShotFrameHandoffs(episodeScript);
+    episodeScript = hardWardrobeState.applyHardWardrobeState(episodeScript, characterList);
+    episodeScript = hardSceneWorldState.applyHardSceneWorldState(episodeScript);
     episodeScript.processing_state = {
       complete: true,
       completed_at: new Date().toISOString(),
@@ -3161,6 +3363,9 @@ async function _runPipeline() {
     // Still (re)attach music direction — idempotent, and covers episodes saved
     // before this field existed on the shot objects.
     episodeScript = _attachMusicDirection(episodeScript);
+    // Rebuild hard wardrobe authority on resumed/persisted drafts before rendering.
+    episodeScript = hardWardrobeState.applyHardWardrobeState(episodeScript, characterList);
+    episodeScript = hardSceneWorldState.applyHardSceneWorldState(episodeScript);
     // Rehydrate canonical directorial state on resume without changing shot order/count.
     episodeScript = directorialOrchestrator.applyToScript(episodeScript, {
       seasonNumber: currentSeason,
@@ -3237,6 +3442,7 @@ async function _runPipeline() {
       episodeScript = _normalizeMultiSpeakerShots(episodeScript);
       // Re-run semantic pacing after any inserted/split shots.
       episodeScript = _enforcePacingRules(episodeScript);
+      episodeScript = hardWardrobeState.applyHardWardrobeState(episodeScript, characterList);
       episodeScript = _applyCinematicShotSelection(episodeScript);
       episodeScript = sceneState.applySceneState(episodeScript);
       episodeScript = globalContinuity.applyGlobalContinuity(episodeScript);
@@ -3427,9 +3633,17 @@ async function _runPipeline() {
   // [scene background, character refs...] through generateShot.
   const sceneBackgroundStateRow = await db.queryOne(`SELECT scene_background_state FROM episodes WHERE id = ?`, [draftEpisodeId]);
   const sceneBackgroundState = safeJsonParse(sceneBackgroundStateRow?.scene_background_state, {});
-  for (const scene of scenes) {
+  for (let sceneIndex = 0; sceneIndex < scenes.length; sceneIndex++) {
+    const scene = scenes[sceneIndex];
     try {
-      await _ensureSceneBackground({ episodeId: draftEpisodeId, storyline, globalEpisodeNumber, scene, savedState: sceneBackgroundState });
+      await _ensureContextualSceneBackground({
+        episodeId: draftEpisodeId,
+        storyline,
+        globalEpisodeNumber,
+        scene,
+        previousScene: sceneIndex > 0 ? scenes[sceneIndex - 1] : null,
+        savedState: sceneBackgroundState,
+      });
     } catch (bgErr) {
       console.warn(`[Pipeline] Scene ${scene.scene_number} background generation failed: ${bgErr.message}`);
       if (!sceneBackgroundState[String(scene.scene_number)]) throw bgErr;
@@ -4752,6 +4966,8 @@ function _buildShotImagePrompt(shot, storyline, charsInShot, prevShot = null, sc
     : '';
   const semanticAgnesMode = Boolean(semanticTransitionPlan);
   const refs = charRefSlots.map(x => `input_image_${x.slotIndex} = ${x.char.name} character reference`).join('; ');
+  const hardWardrobeDirective = shot._hard_wardrobe_directive || '';
+  const hardWorldDirective = shot._hard_world_directive || '';
   const continuityBase = previousEndFrameUrl
     ? 'input_image_0 is the EXACT terminal frame of the immediately preceding completed shot and is the authoritative visual canvas for the current opening frame. Preserve its environment, composition, lighting, wardrobe, props, character identity, screen geography, body positions, gaze and hand/prop contact unless the current frozen opening state explicitly changes them.'
     : '';
@@ -4802,6 +5018,7 @@ function _buildShotImagePrompt(shot, storyline, charsInShot, prevShot = null, sc
       ? 'ENVIRONMENT-FIRST COMPOSITING CONTRACT: input_image_0 is the scene environment. Build the shot on that image first. Only after the environment geometry is established may character references be layered into their authoritative positions, depths, poses and roles. Never allow a character reference to become the environment, and never synthesize a new background from a character portrait.'
       : '',
     refs ? `REFERENCE MAP: ${refs}. Each reference supplies identity only for the matching character; preserve the same identity, screen position and depth.` : '',
+    hardWardrobeDirective,
     `COMPOSITION SUMMARY: ${staging.map(row => `${row.name} at ${row.screen_position}, ${row.depth}`).join('; ')}.`,
     `VISIBLE OPENING STATE: ${_staticCharacterState(staging[0], shot.pose_state)}.`,
     staticContinuity,
@@ -4809,7 +5026,8 @@ function _buildShotImagePrompt(shot, storyline, charsInShot, prevShot = null, sc
       ? 'CONTINUITY RE-ANCHOR RULE: treat the predecessor frame as the scene canvas. Character references correct identity only; do not redesign the scene, swap identities, mirror positions, change wardrobe, invent props, or create a new composition.'
       : '',
     focus,
-    'Do not invent extra people, characters, props, wardrobe changes, locations, weather changes, time shifts, written text, logos or watermarks.',
+    hardWardrobeDirective ? 'WARDROBE AUTHORITY: the hard wardrobe state above is authoritative. A wardrobe change is valid only when this shot is the dedicated visible live-change shot for the named character; otherwise keep wardrobe locked throughout the clip.' : '',
+    'Do not invent extra people, characters, wardrobe changes, locations, weather changes, time shifts, written text, logos or watermarks.',
     `STATIC-IMAGE NEGATIVE CONSTRAINTS: ${STILL_IMAGE_NEGATIVE_CONSTRAINTS}.`,
     'Absolutely no animation instructions, no movement instructions, no camera movement, no temporal progression, no dialogue, no speaking, no lip-sync, no audio, no motion blur, no transitional pose.',
   ];
@@ -5611,7 +5829,14 @@ async function _regenerateSceneBackground(ctx, sceneNumber, sceneObj, shots) {
     const { faceLockRegistry } = hardControl.applyHardControlLayers(script, characters);
 
     const sceneBackgroundState = safeJsonParse(draft.scene_background_state, {});
-    await _ensureSceneBackground({ episodeId: draft.id, storyline, globalEpisodeNumber, scene: sceneObj, savedState: sceneBackgroundState });
+    await _ensureContextualSceneBackground({
+      episodeId: draft.id,
+      storyline,
+      globalEpisodeNumber,
+      scene: sceneObj,
+      previousScene: (script.scenes || []).find(sc => Number(sc.scene_number) === Number(sceneNumber) - 1) || null,
+      savedState: sceneBackgroundState,
+    });
     const sceneFirstImageUrls = new Map([[sceneNumber, sceneBackgroundState[String(sceneNumber)]]]);
     let successes = 0;
     const failures = [];
@@ -5754,8 +5979,16 @@ async function regenerateEpisodeVideos(episodeId) {
     const { faceLockRegistry } = hardControl.applyHardControlLayers(script, characterList);
     const shotRowMap = await getShotRowMap(episodeId);
     const sceneBackgroundState = safeJsonParse(episode.scene_background_state, {});
-    for (const scene of scenes) {
-      await _ensureSceneBackground({ episodeId, storyline, globalEpisodeNumber, scene, savedState: sceneBackgroundState });
+    for (let sceneIndex = 0; sceneIndex < scenes.length; sceneIndex++) {
+      const scene = scenes[sceneIndex];
+      await _ensureContextualSceneBackground({
+        episodeId,
+        storyline,
+        globalEpisodeNumber,
+        scene,
+        previousScene: sceneIndex > 0 ? scenes[sceneIndex - 1] : null,
+        savedState: sceneBackgroundState,
+      });
     }
     const sceneFirstImageUrls = new Map(Object.entries(sceneBackgroundState).map(([k,v]) => [Number(k), v]));
     let successes = 0, skipped = 0, failures = 0;

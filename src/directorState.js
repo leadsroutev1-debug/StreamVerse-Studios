@@ -210,7 +210,12 @@ function buildCharacterState(name, shot = {}, prior = {}) {
     gaze: firstNonEmpty(staging?.gaze, staging?.eyeline, shot.character_positions, prior.gaze),
     emotional_state: firstNonEmpty(shot.emotional_subtext, shot.emotional_state, prior.emotional_state),
     physical_state: firstNonEmpty(shot.physical_state, shot.pose_state, prior.physical_state),
-    wardrobe: firstNonEmpty(shot.wardrobe_state, prior.wardrobe),
+    wardrobe: firstNonEmpty(
+      shot._hard_wardrobe_state?.characters?.[name],
+      typeof shot.wardrobe_state === 'string' ? shot.wardrobe_state : '',
+      typeof shot.wardrobe_state === 'object' ? shot.wardrobe_state?.[name] : '',
+      prior.wardrobe
+    ),
     injuries: firstNonEmpty(shot.injury_state, prior.injuries),
     carried_props: normalizeList(shot.carried_props?.[name] || prior.carried_props),
     knowledge_delta: normalizeList(shot.character_knowledge_changes?.[name] || prior.knowledge_delta),
@@ -227,7 +232,7 @@ function createDirectorState({ episode = {}, scene = {}, shot = {}, previousStat
     shot.characters_in_shot || staging.map(row => row.name)
   );
 
-  const previousCharacters = previous.characters || {};
+  const previousCharacters = previous.after_wardrobe || previous.characters || {};
   const characters = {};
 
   for (const name of visibleCharacters) {
@@ -343,6 +348,11 @@ function createDirectorState({ episode = {}, scene = {}, shot = {}, previousStat
       route_beat: firstNonEmpty(shot.route_beat, shot.action_arc),
       must_change_position: ['depart', 'in_transit', 'approach', 'arrive'].includes(travelStage),
     },
+    // Wardrobe after-state is distinct from the current opening wardrobe because
+    // a dedicated change shot begins in the old outfit and ends in the new one.
+    after_wardrobe: shot._hard_wardrobe_state?.after_characters || Object.fromEntries(
+      Object.entries(characters).map(([name, value]) => [name, value.wardrobe])
+    ),
     invariants: [
       'no-teleportation',
       'previous-terminal-state-drives-next-opening-state',
