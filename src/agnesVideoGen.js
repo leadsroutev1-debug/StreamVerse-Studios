@@ -360,6 +360,7 @@ async function submitVideoJob(imageBuffer, shotMeta = {}) {
       negativePrompt,
       randomizeSeed: false,
       enhancePrompt: false,
+      generationContract: shotMeta.generationContract || null,
     });
     console.log(
       startingImage.usedContinuityFrame

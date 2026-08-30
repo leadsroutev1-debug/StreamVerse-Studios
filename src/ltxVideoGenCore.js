@@ -683,6 +683,7 @@ async function submitVideoJob(imageBuffer, shotMeta = {}) {
       seed,
       randomizeSeed,
       enhancePrompt,
+      generationContract: shotMeta.generationContract || null,
     });
 
     return { jobId, apiKey: 'video-engine-managed' };

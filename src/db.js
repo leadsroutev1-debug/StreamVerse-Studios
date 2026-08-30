@@ -120,6 +120,10 @@ async function initSchema() {
       mh_job_id      VARCHAR(100)   NULL     COMMENT 'Video-gen job/event ID — Magic Hour job ID or LTX event_id depending on VIDEO_PROVIDER; set before polling begins',
       mh_api_key     VARCHAR(256)   NULL     COMMENT 'Auth credential used for this job — Magic Hour API key or HF token depending on VIDEO_PROVIDER',
       clip_url       VARCHAR(1024)  NULL     COMMENT 'Final Cloudinary clip URL',
+      provider_video_url VARCHAR(1024) NULL  COMMENT 'Provider-completed base video URL before cinematic finishing',
+      refinement_stage VARCHAR(40)    NULL     COMMENT 'Cinematic finishing state',
+      generation_contract JSON        NULL     COMMENT 'Deterministic seed/resolution/continuity handoff contract',
+      refinement_manifest JSON         NULL     COMMENT 'Completed cinematic finishing manifest',
       clip_duration  FLOAT          NULL     COMMENT 'Effective clip duration in seconds for FFmpeg',
       error_count    INT            NOT NULL DEFAULT 0,
       last_error     TEXT           NULL,
@@ -157,6 +161,11 @@ async function initSchema() {
     [`episodes`,    `scene_background_state`, `ALTER TABLE episodes ADD COLUMN scene_background_state JSON NULL COMMENT 'scene number → dedicated empty-set background reference URL'`],
     [`episodes`,    `paused_reason`,       `ALTER TABLE episodes ADD COLUMN paused_reason VARCHAR(512) NULL COMMENT 'Why this draft is paused'`],
     [`episodes`,    `ready_at`,            `ALTER TABLE episodes ADD COLUMN ready_at DATETIME NULL COMMENT 'Final compilation completed; waiting for manual review/publish'`],
+    // shots table — base provider checkpoint + cinematic finishing state.
+    [`shots`,       `provider_video_url`,   `ALTER TABLE shots ADD COLUMN provider_video_url VARCHAR(1024) NULL COMMENT 'Provider-completed base video URL before cinematic finishing'`],
+    [`shots`,       `refinement_stage`,     `ALTER TABLE shots ADD COLUMN refinement_stage VARCHAR(40) NULL COMMENT 'Cinematic finishing stage'`],
+    [`shots`,       `generation_contract`,  `ALTER TABLE shots ADD COLUMN generation_contract JSON NULL COMMENT 'Deterministic seed/resolution/continuity handoff contract'`],
+    [`shots`,       `refinement_manifest`,  `ALTER TABLE shots ADD COLUMN refinement_manifest JSON NULL COMMENT 'Cinematic finishing manifest'`],
     // shots table — structured motion parameters from the Motion System Upgrade
     [`shots`,       `motion_params`,        `ALTER TABLE shots ADD COLUMN motion_params JSON NULL COMMENT 'Structured motion control params from Motion System Upgrade'`],
     // shots table — constraint enforcement results

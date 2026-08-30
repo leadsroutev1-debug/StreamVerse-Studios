@@ -307,25 +307,47 @@ async function mergeScenes(clips, { introBumperUrl, outroBumperUrl, ...mergeEffe
  * Returns the final video URL on success.
  */
 async function pollFFmpegJob(jobId) {
-  const maxAttempts = config.ffmpegMaxPollAttempts;
-  const intervalMs  = config.ffmpegPollIntervalMs;
+  const maxAttempts = Number.isFinite(Number(config.ffmpegMaxPollAttempts))
+    ? Number(config.ffmpegMaxPollAttempts)
+    : 360;
+  const initialIntervalMs = Number.isFinite(Number(config.ffmpegPollIntervalMs))
+    ? Number(config.ffmpegPollIntervalMs)
+    : 10000;
+  const maxElapsedMs = Number.isFinite(Number(config.ffmpegMaxPollElapsedMs))
+    ? Number(config.ffmpegMaxPollElapsedMs)
+    : 45 * 60 * 1000;
+  const startedAt = Date.now();
+  let intervalMs = initialIntervalMs;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (Date.now() - startedAt > maxElapsedMs) {
+      throw new Error(`[Compiler] FFmpeg job ${jobId} exceeded ${maxElapsedMs}ms elapsed limit`);
+    }
+
     await sleep(intervalMs);
-    const resp = await axios.get(
-      `${config.ffmpegServiceUrl}/status/${jobId}`,
-      { headers: _ffmpegHeaders(), timeout: 20000 }
-    );
-    const job = resp.data;
-    if (job.status === 'complete' || job.status === 'done') {
-      const url = job.url || job.output_url || job.download_url;
-      if (!url) throw new Error(`[Compiler] FFmpeg job complete but no URL: ${JSON.stringify(job)}`);
-      return url;
+    try {
+      const resp = await axios.get(
+        `${config.ffmpegServiceUrl}/status/${jobId}`,
+        { headers: _ffmpegHeaders(), timeout: 20000 }
+      );
+      const job = resp.data;
+      if (job.status === 'complete' || job.status === 'done') {
+        const url = job.url || job.output_url || job.download_url;
+        if (!url) throw new Error(`[Compiler] FFmpeg job complete but no URL: ${JSON.stringify(job)}`);
+        return url;
+      }
+      if (['error', 'failed', 'cancelled'].includes(job.status)) {
+        throw new Error(`[Compiler] FFmpeg job ${jobId} failed: ${job.error || JSON.stringify(job)}`);
+      }
+      intervalMs = Math.min(Math.max(initialIntervalMs, Math.floor(intervalMs * 1.15)), 30000);
+      console.log(`[Compiler] FFmpeg job ${jobId} status=${job.status} (${attempt}/${maxAttempts})`);
+    } catch (err) {
+      const status = err.response?.status;
+      const transient = !status || [408, 425, 429, 500, 502, 503, 504].includes(status);
+      if (!transient) throw err;
+      intervalMs = Math.min(Math.max(initialIntervalMs, Math.floor(intervalMs * 1.35)), 30000);
+      console.warn(`[Compiler] transient FFmpeg status check failure for ${jobId}; retrying: ${err.message}`);
     }
-    if (['error', 'failed'].includes(job.status)) {
-      throw new Error(`[Compiler] FFmpeg job ${jobId} failed: ${job.error || JSON.stringify(job)}`);
-    }
-    console.log(`[Compiler] FFmpeg job ${jobId} status=${job.status} (${attempt}/${maxAttempts})`);
   }
   throw new Error(`[Compiler] FFmpeg job ${jobId} timed out after ${maxAttempts} polling attempts`);
 }

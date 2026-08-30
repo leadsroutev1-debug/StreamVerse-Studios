@@ -1,0 +1,1 @@
+- [Deployment runtime constraints](deployment-runtime.md) — keep Python startup offline-safe and explicitly route public traffic to Node port 5000.

@@ -7,7 +7,10 @@ long synchronous HTTP request.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import sqlite3
 import threading
 import time
 import uuid
@@ -33,8 +36,9 @@ _PROVIDERS = {
 }
 
 
+_MAX_WORKERS = max(1, int(os.environ.get("VIDEO_ENGINE_MAX_WORKERS", "2")))
 _executor = ThreadPoolExecutor(
-    max_workers=4,
+    max_workers=_MAX_WORKERS,
     thread_name_prefix="video-job",
 )
 
@@ -54,6 +58,8 @@ class Job:
     progress: Optional[float] = None
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
+    params: dict = field(default_factory=dict, repr=False)
+    recovery_count: int = field(default=0, repr=False)
     _cancel: bool = field(default=False, repr=False)
 
     def public_dict(self) -> dict:
@@ -80,8 +86,144 @@ class Job:
 
 class JobStore:
     def __init__(self):
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._jobs: dict[str, Job] = {}
+        self._db_path = os.environ.get(
+            "VIDEO_JOB_DB_PATH",
+            os.path.join(os.path.dirname(__file__), "video_jobs.sqlite3"),
+        )
+        self._init_db()
+        self._load_persisted_jobs()
+
+    def _connect(self):
+        conn = sqlite3.connect(self._db_path, timeout=30)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
+
+    def _init_db(self):
+        directory = os.path.dirname(os.path.abspath(self._db_path))
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with self._connect() as conn:
+            conn.execute(
+                '''
+                CREATE TABLE IF NOT EXISTS video_jobs (
+                    job_id TEXT PRIMARY KEY,
+                    provider TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    video_url TEXT,
+                    seed INTEGER,
+                    error_json TEXT,
+                    progress REAL,
+                    params_json TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    recovery_count INTEGER NOT NULL DEFAULT 0
+                )
+                '''
+            )
+            conn.commit()
+
+    def _persist(self, job: Job) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                '''
+                INSERT INTO video_jobs (
+                    job_id, provider, status, video_url, seed, error_json,
+                    progress, params_json, created_at, updated_at, recovery_count
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(job_id) DO UPDATE SET
+                    provider=excluded.provider,
+                    status=excluded.status,
+                    video_url=excluded.video_url,
+                    seed=excluded.seed,
+                    error_json=excluded.error_json,
+                    progress=excluded.progress,
+                    params_json=excluded.params_json,
+                    updated_at=excluded.updated_at,
+                    recovery_count=excluded.recovery_count
+                ''',
+                (
+                    job.job_id,
+                    job.provider,
+                    job.status,
+                    job.video_url,
+                    job.seed,
+                    json.dumps(job.error) if job.error is not None else None,
+                    job.progress,
+                    json.dumps(job.params),
+                    job.created_at,
+                    job.updated_at,
+                    job.recovery_count,
+                ),
+            )
+            conn.commit()
+
+    def _load_persisted_jobs(self) -> None:
+        with self._connect() as conn:
+            rows = conn.execute(
+                '''
+                SELECT job_id, provider, status, video_url, seed, error_json,
+                       progress, params_json, created_at, updated_at, recovery_count
+                FROM video_jobs
+                ORDER BY created_at ASC
+                '''
+            ).fetchall()
+
+        for row in rows:
+            (
+                jid, provider, status, video_url, seed, error_json,
+                progress, params_json, created_at, updated_at, recovery_count,
+            ) = row
+            try:
+                params = json.loads(params_json or "{}")
+            except json.JSONDecodeError:
+                params = {}
+
+            error = None
+            if error_json:
+                try:
+                    error = json.loads(error_json)
+                except json.JSONDecodeError:
+                    error = {"message": error_json, "category": "unknown"}
+
+            job = Job(
+                job_id=jid,
+                provider=provider,
+                status=status,
+                video_url=video_url,
+                seed=seed,
+                error=error,
+                progress=progress,
+                created_at=created_at,
+                updated_at=updated_at,
+                params=params,
+                recovery_count=int(recovery_count or 0),
+            )
+            self._jobs[jid] = job
+
+        # A process restart cannot resume Python's call stack, but queued and
+        # previously active jobs must never disappear. Requeue them with the
+        # exact original deterministic payload and same job_id. Agnes/LTX may
+        # create a duplicate provider-side job only if the old process died after
+        # remote submission but before checkpointing completion; deterministic seed
+        # makes the retry reproducible and the Node shot ledger remains the source
+        # of truth for final asset selection.
+        recover = []
+        with self._lock:
+            for job in self._jobs.values():
+                if job.status in {"queued", "submitting", "running"}:
+                    job.status = "queued"
+                    job.recovery_count += 1
+                    job.updated_at = time.time()
+                    self._persist(job)
+                    recover.append((job.job_id, dict(job.params)))
+
+        for jid, params in recover:
+            _executor.submit(self._run, jid, params)
+        if recover:
+            logger.warning("[Jobs] Recovered %s durable video job(s) after process restart", len(recover))
 
     # ------------------------------------------------------------------------
     # CREATE
@@ -111,9 +253,11 @@ class JobStore:
             job = Job(
                 job_id=jid,
                 provider=provider,
+                params=dict(params or {}),
             )
 
             self._jobs[jid] = job
+            self._persist(job)
 
         _executor.submit(self._run, jid, params)
 
@@ -143,6 +287,7 @@ class JobStore:
                 job._cancel = True
                 job.status = "cancelled"
                 job.updated_at = time.time()
+                self._persist(job)
 
             return job
 
@@ -165,6 +310,7 @@ class JobStore:
                 setattr(job, key, value)
 
             job.updated_at = time.time()
+            self._persist(job)
 
     # ------------------------------------------------------------------------
     # RUN

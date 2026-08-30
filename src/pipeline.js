@@ -20,6 +20,7 @@ const videoGen        = config.videoProvider === 'magichour'
   : config.videoProvider === 'agnes'
     ? require('./agnesVideoGen')
     : require('./ltxVideoGen');
+const ltxVisionDirector = require('./ltxVisionDirector');
 const compiler       = require('./compiler');
 const discord        = require('./discord');
 const scriptWriter   = require('./scriptWriter');
@@ -36,6 +37,7 @@ const directorialOrchestrator = require('./directorialOrchestrator');
 const hardControl       = require('./hardControlLayers');
 const hardWardrobeState = require('./hardWardrobeState');
 const hardSceneWorldState = require('./hardSceneWorldState');
+const continuityGapBridge = require('./continuityGapBridge');
 const { safeJsonParse } = require('./util');
 const os             = require('os');
 const fs             = require('fs');
@@ -121,6 +123,53 @@ function _combinedSeed(chars) {
     })
     .join('||') || 'empty-roster';
   return _charSeed(roster);
+}
+
+/**
+ * Deterministic per-shot seed. Character identity remains part of the seed,
+ * while episode/scene/shot coordinates keep distinct shots from collapsing onto
+ * one identical stochastic trajectory. Visual continuity is enforced separately
+ * by exact predecessor terminal-frame conditioning and the scene anchor.
+ */
+function _shotSeed(episodeId, shot, chars) {
+  const rosterSeed = _combinedSeed(chars);
+  return _charSeed([
+    String(episodeId || 'episode'),
+    String(shot?.scene_number ?? 'scene'),
+    String(shot?.shot_index ?? 'shot'),
+    String(rosterSeed),
+  ].join('|'));
+}
+
+function _generationContract({
+  provider,
+  episodeId,
+  shot,
+  seed,
+  previousEndFrameUrl,
+  sceneAnchorStillUrl,
+  width,
+  height,
+  motionParams,
+}) {
+  return {
+    version: 2,
+    provider,
+    deterministic: true,
+    episodeId: episodeId || null,
+    sceneNumber: Number(shot?.scene_number),
+    shotIndex: Number(shot?.shot_index),
+    seed,
+    randomizeSeed: false,
+    resolution: { width: Number(width), height: Number(height) },
+    continuity: {
+      previousEndFrameUrl: previousEndFrameUrl || null,
+      sceneAnchorStillUrl: sceneAnchorStillUrl || null,
+      currentStillIsAuthoritative: true,
+    },
+    motion: motionParams || {},
+    generatedAt: new Date().toISOString(),
+  };
 }
 
 /**
@@ -1963,7 +2012,7 @@ async function generateShot(shot, storyline, characterList, globalEpisodeNumber,
         );
       }
 
-      const shotSeed = _combinedSeed(orderedChars);
+      const shotSeed = _shotSeed(resolvedEpisodeId, currentShot, orderedChars);
 
       // Dynamic reference→character identity map for the CF Worker's
       // REFERENCE IMAGE N = <name> instructions (see cfImageGen.js /
@@ -2492,6 +2541,21 @@ async function generateShot(shot, storyline, characterList, globalEpisodeNumber,
           },
         };
       }
+
+      // Canonical provider handoff. It records every continuity-critical input
+      // without leaking provider-specific unsupported fields across the seam.
+      submitMeta.generationContract = _generationContract({
+        provider: config.videoProvider,
+        episodeId: currentShot._episode_id || null,
+        shot: currentShot,
+        seed: shotSeed,
+        previousEndFrameUrl,
+        sceneAnchorStillUrl,
+        width: submitMeta.width || config.ltxWidth || process.env.AGNES_WIDTH || 1024,
+        height: submitMeta.height || config.ltxHeight || process.env.AGNES_HEIGHT || 1536,
+        motionParams,
+      });
+
       const { jobId, apiKey, imageTmpPublicId } = await videoGen.submitVideoJob(imageBuffer, submitMeta);
 
       // Persist the in-flight video-generation job immediately so a poll
@@ -2502,14 +2566,58 @@ async function generateShot(shot, storyline, characterList, globalEpisodeNumber,
         catch (cbErr) { console.warn('[Pipeline] onMhSubmitted callback failed (non-fatal):', cbErr.message); }
       }
 
-      // 3. Poll until video is ready
-      const videoUrl = _normalizeVideoUrl(await videoGen.pollVideoJob(jobId, apiKey), `S${shot.scene_number}/idx${shot.shot_index} poll`);
+      // 3. Poll until the provider base-generation artifact is ready.
+      const providerVideoUrl = _normalizeVideoUrl(
+        await videoGen.pollVideoJob(jobId, apiKey),
+        `S${shot.scene_number}/idx${shot.shot_index} poll`
+      );
 
-      // 4. Upload clip to Cloudinary
+      // Checkpoint provider completion before entering expensive local finishing.
+      try {
+        await updateShotRow(currentShot._episode_id || resolvedEpisodeId, shot.scene_number, shot.shot_index, {
+          refinement_stage: 'base_complete',
+          provider_video_url: providerVideoUrl,
+          generation_contract: JSON.stringify(submitMeta.generationContract || {}),
+        });
+      } catch (checkpointErr) {
+        console.warn(`[Pipeline] Provider artifact checkpoint failed (non-fatal): ${checkpointErr.message}`);
+      }
+
+      // 4. Production finishing:
+      //    base -> spatial upscale -> temporal interpolation -> color/grain/metadata.
+      let finalVideoUrl = providerVideoUrl;
+      let refinementArtifactPath = null;
+      try {
+        const refined = await cinematicRefinement.refineVideo(providerVideoUrl, {
+          jobId: `${currentShot._episode_id || 'episode'}-${shot.scene_number}-${shot.shot_index}`,
+          targetFps: config.cinematicTargetFps,
+          upscaleFactor: config.cinematicUpscaleFactor,
+          onStage: async (stage) => {
+            await updateShotRow(currentShot._episode_id || resolvedEpisodeId, shot.scene_number, shot.shot_index, {
+              refinement_stage: stage,
+            }).catch(() => {});
+          },
+        });
+        finalVideoUrl = refined.videoUrl;
+        refinementArtifactPath = finalVideoUrl.startsWith('http') ? null : finalVideoUrl;
+        await updateShotRow(currentShot._episode_id || resolvedEpisodeId, shot.scene_number, shot.shot_index, {
+          refinement_stage: 'complete',
+          refinement_manifest: JSON.stringify(refined.manifest || {}),
+        }).catch(() => {});
+      } catch (refinementErr) {
+        refinementErr.refinementStage = true;
+        throw refinementErr;
+      }
+
+      // 5. Upload the fully refined master to the canonical shot asset.
       const shotPubId = cloudinary.shotPublicId(
         storyline.id, globalEpisodeNumber, shot.scene_number, shot.shot_index
       );
-      const clipUrl = await cloudinary.uploadVideoFromUrl(videoUrl, shotPubId);
+      const clipUrl = await cloudinary.uploadVideoFromUrl(finalVideoUrl, shotPubId);
+
+      if (refinementArtifactPath) {
+        try { require('fs').unlinkSync(refinementArtifactPath); } catch (_) {}
+      }
 
       if (attempt > 1) {
         console.log(`[Pipeline] Shot S${shot.scene_number}/idx${shot.shot_index} succeeded on attempt ${attempt}/${maxRetries}`);
@@ -3844,6 +3952,49 @@ async function _runPipeline() {
           error_count: (shotRow.error_count || 0) + 1, last_error: pollErr.message.slice(0, 500),
         });
         // fall through to normal generation
+      }
+    }
+
+    // ── LTX continuity gap pre-flight ───────────────────────────────────
+    // LTX's public Space contract accepts exactly one conditioning image
+    // (no multi-frame/keyframe input — see continuityGapBridge.js header).
+    // Before generating a NEW shot (never on a resumed/cached one — no
+    // shotRow.clip_url yet, and only once per shot pair) with a real
+    // predecessor frame on disk, ask the vision model whether a single
+    // direct LTX clip can plausibly carry the actual previous terminal
+    // frame into this shot's target. If not, splice in one short silent
+    // connective shot and re-enter the loop so it generates FIRST — the
+    // originally-planned shot then continues from the bridge's own
+    // terminal frame on the next iteration.
+    if (
+      config.videoProvider === 'ltx' &&
+      prevShot &&
+      !shot._is_continuity_bridge_insert &&
+      !(shotRow && shotRow.clip_url) &&
+      String(process.env.LTX_CONTINUITY_BRIDGE_ENABLED ?? 'true').toLowerCase() !== 'false'
+    ) {
+      try {
+        const bridgePrevEndFrameUrl = await _resolvePreviousShotEndFrameUrl({ episodeId: draftEpisodeId, prevShot });
+        if (bridgePrevEndFrameUrl) {
+          const bridgeShot = await continuityGapBridge.maybeInsertContinuityBridgeShot({
+            prevShot,
+            shot,
+            previousEndFrameUrl: bridgePrevEndFrameUrl,
+            scene: { scene_number: shot.scene_number, location: shot._scene_location || '', scene_description: shot._scene_description || '' },
+            characters: characterList,
+          });
+          if (bridgeShot) {
+            allShots.splice(i, 0, bridgeShot);
+            await upsertShotRows(draftEpisodeId, [bridgeShot]);
+            sceneShotTotalCount.set(shot.scene_number, (sceneShotTotalCount.get(shot.scene_number) || 0) + 1);
+            console.log(`[Pipeline] Inserted LTX continuity bridge shot before S${shot.scene_number}/idx${shot.shot_index} (now allShots length ${allShots.length})`);
+            i--; // re-enter loop: for-loop's i++ restores this index, now pointing at the bridge shot
+            continue;
+          }
+        }
+      } catch (bridgeErr) {
+        // Fail open — never let a bridge-evaluation error block real generation.
+        console.warn(`[Pipeline] Continuity gap pre-flight failed (non-fatal), proceeding without bridge: ${bridgeErr.message}`);
       }
     }
 

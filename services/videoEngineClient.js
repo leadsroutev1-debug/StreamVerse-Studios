@@ -91,6 +91,7 @@ async function submitJob({
     randomize_seed: randomizeSeed,
     enhance_prompt: enhancePrompt,
     reference_image_urls: referenceImageUrls,
+    generation_contract: generationContract,
   };
 
   // Agnes-only field. Do not add this to LTX requests at the model boundary.
@@ -128,9 +129,33 @@ async function getTokenStatus() {
   }
 }
 
-async function pollJob(jobId, { intervalMs = 5000, maxAttempts = 180 } = {}) {
+async function pollJob(jobId, {
+  intervalMs = 4000,
+  maxAttempts = 600,
+  maxElapsedMs = 45 * 60 * 1000,
+  maxIntervalMs = 15000,
+} = {}) {
+  const startedAt = Date.now();
+
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const job = await getJob(jobId);
+    let job;
+    try {
+      job = await getJob(jobId);
+    } catch (err) {
+      const status = err?.response?.status;
+      // Treat short-lived transport failures and Python-service 404s during
+      // cold-start/redeploy as transient. A missing in-memory job after a real
+      // engine restart still surfaces at the elapsed-time boundary rather than
+      // dropping immediately into a shot failure.
+      if (![404, 408, 429, 500, 502, 503, 504].includes(status)) throw err;
+      console.warn(`[VideoEngineClient] poll transient HTTP ${status || 'network'} for ${jobId}; retrying`);
+      if (Date.now() - startedAt >= maxElapsedMs) {
+        throw new Error(`[VideoEngine] Job ${jobId} polling window exhausted after ${maxElapsedMs}ms`);
+      }
+      await sleep(Math.min(maxIntervalMs, Math.max(intervalMs, intervalMs * (1.35 ** Math.min(attempt, 8)))));
+      continue;
+    }
+
     if (job.status === 'completed') return job;
     if (job.status === 'failed') {
       const err = new Error(`[VideoEngine] Job ${jobId} failed: ${job.error?.message || 'unknown error'}`);
@@ -141,8 +166,19 @@ async function pollJob(jobId, { intervalMs = 5000, maxAttempts = 180 } = {}) {
     if (job.status === 'cancelled') {
       throw new Error(`[VideoEngine] Job ${jobId} was cancelled`);
     }
-    await sleep(intervalMs);
+
+    if (Date.now() - startedAt >= maxElapsedMs) {
+      throw new Error(`[VideoEngine] Job ${jobId} exceeded polling window of ${maxElapsedMs}ms`);
+    }
+
+    // Adaptive backoff reduces database/network pressure while preserving a
+    // fast first observation for queued/submitting states.
+    const delay = Math.min(maxIntervalMs, Math.round(
+      intervalMs * (1.22 ** Math.min(Math.max(attempt - 1, 0), 12))
+    ));
+    await sleep(delay);
   }
+
   throw new Error(`[VideoEngine] Job ${jobId} did not complete after ${maxAttempts} polling attempts`);
 }
 

@@ -507,6 +507,52 @@ process.env.LTX_MAX_POLL_ATTEMPTS || '80',
   ),
 
 // ==========================================================================
+ // CINEMATIC REFINEMENT PIPELINE
+ // ==========================================================================
+ //
+ // Provider generation is only the base pass. The production clip is finalized
+ // by src/cinematicRefinement.js:
+ //   spatial upscale -> temporal interpolation -> color/grain/metadata.
+ //
+ cinematicRefinementEnabled:
+   (process.env.CINEMATIC_REFINEMENT_ENABLED || 'true').toLowerCase() === 'true',
+
+ cinematicUpscaleFactor:
+   parseFloat(process.env.CINEMATIC_UPSCALE_FACTOR || '1.5'),
+
+ cinematicTargetFps:
+   parseInt(process.env.CINEMATIC_TARGET_FPS || '48', 10),
+
+ cinematicGrainAmount:
+   parseFloat(process.env.CINEMATIC_GRAIN_AMOUNT || '0.006'),
+
+ cinematicGrainSeed:
+   parseInt(process.env.CINEMATIC_GRAIN_SEED || '4242', 10),
+
+ cinematicSaturation:
+   parseFloat(process.env.CINEMATIC_SATURATION || '1.02'),
+
+ cinematicContrast:
+   parseFloat(process.env.CINEMATIC_CONTRAST || '1.015'),
+
+ cinematicGamma:
+   parseFloat(process.env.CINEMATIC_GAMMA || '1.0'),
+
+ cinematicCrf:
+   parseInt(process.env.CINEMATIC_CRF || '15', 10),
+
+ cinematicPreset:
+   process.env.CINEMATIC_PRESET || 'medium',
+
+ // Serialize CPU-heavy refinement passes. Generation can be concurrent at the
+ // provider level, but local ffmpeg finishing should not stampede the worker.
+ cinematicConcurrency:
+   parseInt(process.env.CINEMATIC_CONCURRENCY || '1', 10),
+
+ cinematicTimeoutMs:
+   parseInt(process.env.CINEMATIC_TIMEOUT_MS || String(20 * 60 * 1000), 10),
+
+// ==========================================================================
 // FFMPEG MICROSERVICE
 // ==========================================================================
 
@@ -525,6 +571,12 @@ process.env.FFMPEG_POLL_INTERVAL_MS || '10000',
 ffmpegMaxPollAttempts:
 parseInt(
 process.env.FFMPEG_MAX_POLL_ATTEMPTS || '120',
+10
+),
+
+ffmpegMaxPollElapsedMs:
+parseInt(
+process.env.FFMPEG_MAX_POLL_ELAPSED_MS || String(45 * 60 * 1000),
 10
 ),
 
